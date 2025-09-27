@@ -55,8 +55,8 @@ varstring :=
 
 We will use `WriteBatch` as the actuall format in our `WAL`.
 
-- `sequence` : 8 bytes, the index of operation
-- `count` : 4 bytes, the number of operations
+- `sequence` : 8 bytes, the index of sequence
+- `count` : 4 bytes, the count of operations
 - `record` : the record of `PUT` and `DELETE` opreation
   - kTypeValue varstring(key) varstring(value) (for `PUT`)
   - kTypeDeletion varstring(key) (for `DELETION`)
