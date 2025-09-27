@@ -9,10 +9,7 @@ namespace prism
 
 	DB::~DB() = default;
 
-	std::unique_ptr<DB> DB::Open(const std::string& dbname)
-	{
-		return std::make_unique<DBImpl>(dbname);
-	}
+	std::unique_ptr<DB> DB::Open(const std::string& dbname) { return std::make_unique<DBImpl>(dbname); }
 
 	DBImpl::DBImpl(const std::string& dbname)
 	    : writer_{ dbname }
@@ -27,7 +24,7 @@ namespace prism
 			std::stringstream ss(record.ToString());
 			std::string op, key, value;
 			ss >> op >> key;
-			
+
 			if (op == "PUT")
 			{
 				ss >> value;
