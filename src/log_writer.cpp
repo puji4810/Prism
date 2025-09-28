@@ -7,6 +7,15 @@ namespace prism
 {
 	namespace log
 	{
+		static void InitTypeCrc(uint32_t* type_crc)
+		{
+			for (int i = 0; i <= kMaxRecordType; i++)
+			{
+				char t = static_cast<char>(i);
+				type_crc[i] = crc32c::Crc32c(&t, 1);
+			}
+		}
+
 		static inline uint32_t Mask(uint32_t crc) { return ((crc >> 15) | (crc << 17)) + 0xa282ead8u; }
 
 		Writer::Writer(std::string dest)
@@ -16,6 +25,7 @@ namespace prism
 			{
 				throw std::runtime_error("Failed to open log file: " + dest);
 			}
+			InitTypeCrc(type_crc_);
 		}
 
 		void Writer::AddRecord(const Slice& record)
@@ -25,8 +35,7 @@ namespace prism
 			header.length = record.size();
 
 			// checksum = crc32c(type + record)
-			uint8_t type_byte = static_cast<uint8_t>(header.type);
-			uint32_t crc = crc32c::Crc32c(&type_byte, 1);
+			uint32_t crc = type_crc_[static_cast<int>(header.type)];
 			crc = crc32c::Extend(crc, reinterpret_cast<const uint8_t*>(record.data()), record.size());
 			header.checksum = Mask(crc);
 
