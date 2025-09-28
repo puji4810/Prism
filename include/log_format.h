@@ -2,8 +2,6 @@
 #define LOG_FORMAT_H_
 
 #include <cstdint>
-#include "slice.h"
-#include "crc32c/crc32c.h"
 
 namespace prism
 {
@@ -21,6 +19,8 @@ namespace prism
 			kMiddleType = 3,
 			kLastType = 4
 		};
+
+		const int kMaxRecordType = 4; // kLastType
 
 		struct Header
 		{

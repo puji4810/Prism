@@ -4,6 +4,7 @@
 #include <string>
 #include <fstream>
 #include "slice.h"
+#include "log_format.h"
 
 namespace prism
 {
@@ -20,6 +21,7 @@ namespace prism
 
 		private:
 			std::ofstream dest_;
+			uint32_t type_crc_[kMaxRecordType + 1]; // crc32c values for all supported record types.
 		};
 	} // namespace log
 }
