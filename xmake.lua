@@ -10,6 +10,7 @@ target("prism")
 	add_files("src/*.cpp")
     add_includedirs("include", {public = true})
     add_includedirs("src", {public = true})
+    add_includedirs("util", {public = true})
     add_packages("crc32c")
     
 
@@ -19,3 +20,10 @@ target("prism")
         add_defines("DEBUG")
         add_cflags("-g", "-O0")
     end
+
+target("coding_test")
+    set_kind("binary")
+    add_includedirs("util", {public = true})
+    add_files("util/coding.cpp")
+    add_files("tests/coding_test.cpp")
+    add_includedirs("include")
