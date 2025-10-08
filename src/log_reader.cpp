@@ -1,9 +1,8 @@
 #include "log_reader.h"
 #include "slice.h"
 #include "log_format.h"
-#include <algorithm>
 #include <cstring>
-#include <iterator>
+#include "crc32c/crc32c.h"
 
 namespace prism
 {
