@@ -1,0 +1,60 @@
+#ifndef STATUS_H_
+#define STATUS_H_
+
+#include <expected>
+#include <string>
+
+namespace prism {
+
+enum class ErrorCode {
+    Ok = 0,
+    NotFound,
+    Corruption,
+    NotSupported,
+    InvalidArgument,
+    IOError
+};
+
+struct Error {
+    ErrorCode code;
+    std::string message;
+    
+    Error(ErrorCode c, std::string msg = "") 
+        : code(c), message(std::move(msg)) {}
+    
+    std::string ToString() const {
+        std::string result;
+        switch (code) {
+            case ErrorCode::NotFound: result = "NotFound: "; break;
+            case ErrorCode::Corruption: result = "Corruption: "; break;
+            case ErrorCode::NotSupported: result = "NotSupported: "; break;
+            case ErrorCode::InvalidArgument: result = "InvalidArgument: "; break;
+            case ErrorCode::IOError: result = "IOError: "; break;
+            default: return "OK";
+        }
+        return result + message;
+    }
+};
+
+using Status = std::expected<void, Error>;
+
+inline Status Ok() { return {}; }
+inline Status NotFound(std::string msg = "") { 
+    return std::unexpected(Error{ErrorCode::NotFound, std::move(msg)}); 
+}
+inline Status Corruption(std::string msg = "") { 
+    return std::unexpected(Error{ErrorCode::Corruption, std::move(msg)}); 
+}
+inline Status NotSupported(std::string msg = "") { 
+    return std::unexpected(Error{ErrorCode::NotSupported, std::move(msg)}); 
+}
+inline Status InvalidArgument(std::string msg = "") { 
+    return std::unexpected(Error{ErrorCode::InvalidArgument, std::move(msg)}); 
+}
+inline Status IOError(std::string msg = "") { 
+    return std::unexpected(Error{ErrorCode::IOError, std::move(msg)}); 
+}
+
+} // namespace prism
+
+#endif
