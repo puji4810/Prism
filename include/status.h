@@ -36,23 +36,33 @@ struct Error {
     }
 };
 
+// For functions that return a value
+template<typename T>
+using Result = std::expected<T, Error>;
+
+// For no return functions
 using Status = std::expected<void, Error>;
 
 inline Status Ok() { return {}; }
-inline Status NotFound(std::string msg = "") { 
-    return std::unexpected(Error{ErrorCode::NotFound, std::move(msg)}); 
+
+inline auto NotFound(std::string msg = "") {
+    return std::unexpected(Error{ErrorCode::NotFound, std::move(msg)});
 }
-inline Status Corruption(std::string msg = "") { 
-    return std::unexpected(Error{ErrorCode::Corruption, std::move(msg)}); 
+
+inline auto Corruption(std::string msg = "") {
+    return std::unexpected(Error{ErrorCode::Corruption, std::move(msg)});
 }
-inline Status NotSupported(std::string msg = "") { 
-    return std::unexpected(Error{ErrorCode::NotSupported, std::move(msg)}); 
+
+inline auto NotSupported(std::string msg = "") {
+    return std::unexpected(Error{ErrorCode::NotSupported, std::move(msg)});
 }
-inline Status InvalidArgument(std::string msg = "") { 
-    return std::unexpected(Error{ErrorCode::InvalidArgument, std::move(msg)}); 
+
+inline auto InvalidArgument(std::string msg = "") {
+    return std::unexpected(Error{ErrorCode::InvalidArgument, std::move(msg)});
 }
-inline Status IOError(std::string msg = "") { 
-    return std::unexpected(Error{ErrorCode::IOError, std::move(msg)}); 
+
+inline auto IOError(std::string msg = "") {
+    return std::unexpected(Error{ErrorCode::IOError, std::move(msg)});
 }
 
 } // namespace prism
