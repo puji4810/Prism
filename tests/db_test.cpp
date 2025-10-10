@@ -1,40 +1,34 @@
 #include "db.h"
 #include "write_batch.h"
-#include <iostream>
-#include <cassert>
+
+#include <gtest/gtest.h>
 
 using namespace prism;
 
-void test_basic_operations()
+TEST(DBTest, BasicPutGetDelete)
 {
-    std::cout << "Test 1: Basic Put/Get/Delete\n";
-    
     auto db = DB::Open("test_db");
     
     // Put
     auto s1 = db->Put("key1", "value1");
-    assert(s1.has_value() && "Put should succeed");
+    EXPECT_TRUE(s1.has_value()) << "Put should succeed";
     
     // Get
     auto r1 = db->Get("key1");
-    assert(r1.has_value() && "Get should succeed");
-    assert(*r1 == "value1" && "Value should match");
+    ASSERT_TRUE(r1.has_value()) << "Get should succeed";
+    EXPECT_EQ("value1", *r1) << "Value should match";
     
     // Delete
     auto s2 = db->Delete("key1");
-    assert(s2.has_value() && "Delete should succeed");
+    EXPECT_TRUE(s2.has_value()) << "Delete should succeed";
     
     // Get after delete
     auto r2 = db->Get("key1");
-    assert(!r2.has_value() && "Get should fail after delete");
-    
-    std::cout << "✓ Basic operations passed\n";
+    EXPECT_FALSE(r2.has_value()) << "Get should fail after delete";
 }
 
-void test_batch_write()
+TEST(DBTest, BatchWrite)
 {
-    std::cout << "Test 2: Batch Write\n";
-    
     auto db = DB::Open("test_db");
     
     WriteBatch batch;
@@ -43,21 +37,19 @@ void test_batch_write()
     batch.Delete("key1");
     
     auto s = db->Write(batch);
-    assert(s.has_value() && "Batch write should succeed");
+    EXPECT_TRUE(s.has_value()) << "Batch write should succeed";
     
     auto r1 = db->Get("batch_key1");
-    assert(r1.has_value() && *r1 == "batch_value1");
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ("batch_value1", *r1);
     
     auto r2 = db->Get("batch_key2");
-    assert(r2.has_value() && *r2 == "batch_value2");
-    
-    std::cout << "✓ Batch write passed\n";
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ("batch_value2", *r2);
 }
 
-void test_recovery()
+TEST(DBTest, Recovery)
 {
-    std::cout << "Test 3: Recovery from WAL\n";
-    
     {
         auto db = DB::Open("test_db");
         db->Put("persistent_key", "persistent_value");
@@ -66,19 +58,13 @@ void test_recovery()
     {
         auto db = DB::Open("test_db");
         auto r = db->Get("persistent_key");
-        assert(r.has_value() && "Should recover data");
-        assert(*r == "persistent_value" && "Recovered value should match");
+        ASSERT_TRUE(r.has_value()) << "Should recover data";
+        EXPECT_EQ("persistent_value", *r) << "Recovered value should match";
     }
-    
-    std::cout << "✓ Recovery passed\n";
 }
 
-int main()
+int main(int argc, char** argv)
 {
-    test_basic_operations();
-    test_batch_write();
-    test_recovery();
-    
-    std::cout << "\n✓ All tests passed!\n";
-    return 0;
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }

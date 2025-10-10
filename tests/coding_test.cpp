@@ -1,7 +1,8 @@
-#include <cassert>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 #include "coding.h"
 
@@ -20,7 +21,7 @@ using prism::PutVarint64;
 using prism::Slice;
 using prism::VarintLength;
 
-static void TestFixed32()
+TEST(CodingTest, Fixed32)
 {
 	std::string s;
 	for (uint32_t v = 0; v < 100000; v++)
@@ -31,12 +32,12 @@ static void TestFixed32()
 	for (uint32_t v = 0; v < 100000; v++)
 	{
 		uint32_t actual = DecodeFixed32(p);
-		assert(v == actual);
+		EXPECT_EQ(v, actual);
 		p += sizeof(uint32_t);
 	}
 }
 
-static void TestFixed64()
+TEST(CodingTest, Fixed64)
 {
 	std::string s;
 	for (int power = 0; power <= 63; power++)
@@ -53,43 +54,43 @@ static void TestFixed64()
 		uint64_t v = static_cast<uint64_t>(1) << power;
 		uint64_t actual;
 		actual = DecodeFixed64(p);
-		assert((v - 1) == actual);
+		EXPECT_EQ(v - 1, actual);
 		p += sizeof(uint64_t);
 
 		actual = DecodeFixed64(p);
-		assert((v + 0) == actual);
+		EXPECT_EQ(v + 0, actual);
 		p += sizeof(uint64_t);
 
 		actual = DecodeFixed64(p);
-		assert((v + 1) == actual);
+		EXPECT_EQ(v + 1, actual);
 		p += sizeof(uint64_t);
 	}
 }
 
-static void TestEncodingOutput()
+TEST(CodingTest, EncodingOutput)
 {
 	std::string dst;
 	PutFixed32(dst, 0x04030201);
-	assert(dst.size() == 4);
-	assert(static_cast<int>(dst[0]) == 0x01);
-	assert(static_cast<int>(dst[1]) == 0x02);
-	assert(static_cast<int>(dst[2]) == 0x03);
-	assert(static_cast<int>(dst[3]) == 0x04);
+	EXPECT_EQ(4u, dst.size());
+	EXPECT_EQ(0x01, static_cast<int>(dst[0]));
+	EXPECT_EQ(0x02, static_cast<int>(dst[1]));
+	EXPECT_EQ(0x03, static_cast<int>(dst[2]));
+	EXPECT_EQ(0x04, static_cast<int>(dst[3]));
 
 	dst.clear();
 	PutFixed64(dst, 0x0807060504030201ull);
-	assert(dst.size() == 8);
-	assert(static_cast<int>(dst[0]) == 0x01);
-	assert(static_cast<int>(dst[1]) == 0x02);
-	assert(static_cast<int>(dst[2]) == 0x03);
-	assert(static_cast<int>(dst[3]) == 0x04);
-	assert(static_cast<int>(dst[4]) == 0x05);
-	assert(static_cast<int>(dst[5]) == 0x06);
-	assert(static_cast<int>(dst[6]) == 0x07);
-	assert(static_cast<int>(dst[7]) == 0x08);
+	EXPECT_EQ(8u, dst.size());
+	EXPECT_EQ(0x01, static_cast<int>(dst[0]));
+	EXPECT_EQ(0x02, static_cast<int>(dst[1]));
+	EXPECT_EQ(0x03, static_cast<int>(dst[2]));
+	EXPECT_EQ(0x04, static_cast<int>(dst[3]));
+	EXPECT_EQ(0x05, static_cast<int>(dst[4]));
+	EXPECT_EQ(0x06, static_cast<int>(dst[5]));
+	EXPECT_EQ(0x07, static_cast<int>(dst[6]));
+	EXPECT_EQ(0x08, static_cast<int>(dst[7]));
 }
 
-static void TestVarint32()
+TEST(CodingTest, Varint32)
 {
 	std::string s;
 	for (uint32_t i = 0; i < (32 * 32); i++)
@@ -106,14 +107,14 @@ static void TestVarint32()
 		uint32_t actual;
 		const char* start = p;
 		p = GetVarint32Ptr(p, limit, &actual);
-		assert(p != nullptr);
-		assert(expected == actual);
-		assert(static_cast<int>(VarintLength(actual)) == (p - start));
+		EXPECT_NE(nullptr, p);
+		EXPECT_EQ(expected, actual);
+		EXPECT_EQ(static_cast<int>(VarintLength(actual)), p - start);
 	}
-	assert(p == s.data() + s.size());
+	EXPECT_EQ(s.data() + s.size(), p);
 }
 
-static void TestVarint64()
+TEST(CodingTest, Varint64)
 {
 	std::vector<uint64_t> values;
 	values.push_back(0);
@@ -138,25 +139,25 @@ static void TestVarint64()
 	const char* limit = p + s.size();
 	for (size_t i = 0; i < values.size(); i++)
 	{
-		assert(p < limit);
+		EXPECT_LT(p, limit);
 		uint64_t actual;
 		const char* start = p;
 		p = GetVarint64Ptr(p, limit, &actual);
-		assert(p != nullptr);
-		assert(values[i] == actual);
-		assert(static_cast<int>(VarintLength(actual)) == (p - start));
+		EXPECT_NE(nullptr, p);
+		EXPECT_EQ(values[i], actual);
+		EXPECT_EQ(static_cast<int>(VarintLength(actual)), p - start);
 	}
-	assert(p == limit);
+	EXPECT_EQ(limit, p);
 }
 
-static void TestVarint32Overflow()
+TEST(CodingTest, Varint32Overflow)
 {
 	uint32_t result = 0;
 	std::string input("\x81\x82\x83\x84\x85\x11");
-	assert(GetVarint32Ptr(input.data(), input.data() + input.size(), &result) == nullptr);
+	EXPECT_EQ(nullptr, GetVarint32Ptr(input.data(), input.data() + input.size(), &result));
 }
 
-static void TestVarint32Truncation()
+TEST(CodingTest, Varint32Truncation)
 {
 	uint32_t large_value = (1u << 31) + 100;
 	std::string s;
@@ -164,20 +165,20 @@ static void TestVarint32Truncation()
 	uint32_t result = 0;
 	for (size_t len = 0; len < s.size() - 1; len++)
 	{
-		assert(GetVarint32Ptr(s.data(), s.data() + len, &result) == nullptr);
+		EXPECT_EQ(nullptr, GetVarint32Ptr(s.data(), s.data() + len, &result));
 	}
-	assert(GetVarint32Ptr(s.data(), s.data() + s.size(), &result) != nullptr);
-	assert(result == large_value);
+	EXPECT_NE(nullptr, GetVarint32Ptr(s.data(), s.data() + s.size(), &result));
+	EXPECT_EQ(large_value, result);
 }
 
-static void TestVarint64Overflow()
+TEST(CodingTest, Varint64Overflow)
 {
 	uint64_t result = 0;
 	std::string input("\x81\x82\x83\x84\x85\x81\x82\x83\x84\x85\x11");
-	assert(GetVarint64Ptr(input.data(), input.data() + input.size(), &result) == nullptr);
+	EXPECT_EQ(nullptr, GetVarint64Ptr(input.data(), input.data() + input.size(), &result));
 }
 
-static void TestVarint64Truncation()
+TEST(CodingTest, Varint64Truncation)
 {
 	uint64_t large_value = (1ull << 63) + 100ull;
 	std::string s;
@@ -185,13 +186,13 @@ static void TestVarint64Truncation()
 	uint64_t result = 0;
 	for (size_t len = 0; len < s.size() - 1; len++)
 	{
-		assert(GetVarint64Ptr(s.data(), s.data() + len, &result) == nullptr);
+		EXPECT_EQ(nullptr, GetVarint64Ptr(s.data(), s.data() + len, &result));
 	}
-	assert(GetVarint64Ptr(s.data(), s.data() + s.size(), &result) != nullptr);
-	assert(result == large_value);
+	EXPECT_NE(nullptr, GetVarint64Ptr(s.data(), s.data() + s.size(), &result));
+	EXPECT_EQ(large_value, result);
 }
 
-static void TestStrings()
+TEST(CodingTest, Strings)
 {
 	std::string s;
 	PutLengthPrefixedSlice(s, Slice(""));
@@ -201,28 +202,19 @@ static void TestStrings()
 
 	Slice input(s);
 	Slice v;
-	assert(GetLengthPrefixedSlice(input, v));
-	assert(v.ToString() == "");
-	assert(GetLengthPrefixedSlice(input, v));
-	assert(v.ToString() == "foo");
-	assert(GetLengthPrefixedSlice(input, v));
-	assert(v.ToString() == "bar");
-	assert(GetLengthPrefixedSlice(input, v));
-	assert(v.ToString() == std::string(200, 'x'));
-	assert(input.ToString() == "");
+	EXPECT_TRUE(GetLengthPrefixedSlice(input, v));
+	EXPECT_EQ("", v.ToString());
+	EXPECT_TRUE(GetLengthPrefixedSlice(input, v));
+	EXPECT_EQ("foo", v.ToString());
+	EXPECT_TRUE(GetLengthPrefixedSlice(input, v));
+	EXPECT_EQ("bar", v.ToString());
+	EXPECT_TRUE(GetLengthPrefixedSlice(input, v));
+	EXPECT_EQ(std::string(200, 'x'), v.ToString());
+	EXPECT_EQ("", input.ToString());
 }
 
-int main()
+int main(int argc, char** argv)
 {
-	TestFixed32();
-	TestFixed64();
-	TestEncodingOutput();
-	TestVarint32();
-	TestVarint64();
-	TestVarint32Overflow();
-	TestVarint32Truncation();
-	TestVarint64Overflow();
-	TestVarint64Truncation();
-	TestStrings();
-	return 0;
+	::testing::InitGoogleTest(&argc, argv);
+	return RUN_ALL_TESTS();
 }
