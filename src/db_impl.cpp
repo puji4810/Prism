@@ -1,11 +1,34 @@
 #include "db_impl.h"
+#include "dbformat.h"
 #include "slice.h"
+#include "write_batch.h"
+#include "write_batch_internal.h"
 #include <sstream>
 #include <memory>
 
 namespace prism
 {
 	class DBImpl;
+
+	class DBImpl::RecoveryHandler : public WriteBatch::Handler
+    {
+    public:
+        RecoveryHandler(std::unordered_map<std::string, std::string>& store)
+            : store_(store) {}
+        
+        void Put(const Slice& key, const Slice& value) override
+        {
+            store_[key.ToString()] = value.ToString();
+        }
+        
+        void Delete(const Slice& key) override
+        {
+            store_.erase(key.ToString());
+        }
+        
+    private:
+        std::unordered_map<std::string, std::string>& store_;
+    };
 
 	DB::~DB() = default;
 
@@ -15,49 +38,77 @@ namespace prism
 	    : writer_{ dbname }
 	    , reader_{ dbname }
 	{
+		RecoveryHandler handler(store_);
 		Slice record;
-		while (reader_.ReadRecord(record))
-		{
+
+		while(reader_.ReadRecord(record)){
 			if (record.empty())
-				continue;
+                continue;
 
-			std::stringstream ss(record.ToString());
-			std::string op, key, value;
-			ss >> op >> key;
-
-			if (op == "PUT")
-			{
-				ss >> value;
-				store_[key] = value;
-			}
-			else if (op == "DELETE")
-			{
-				store_.erase(key);
-			}
+            WriteBatch batch;
+            WriteBatchInternal::SetContents(&batch, record);
+            
+            auto batch_seq = WriteBatchInternal::Sequence(&batch);
+            auto batch_count = WriteBatchInternal::Count(&batch);
+            if (batch_seq + batch_count > sequence_) {
+                sequence_ = batch_seq + batch_count;
+            }
+            
+            auto status = batch.Iterate(&handler);
+            if (!status) {
+            }
 		}
 	}
 
 	DBImpl::~DBImpl() = default;
 
-	void DBImpl::Put(const std::string& key, const std::string& value)
-	{
-		writer_.AddRecord("PUT " + key + " " + value);
-		store_[key] = value;
+	Status DBImpl::ApplyBatch(WriteBatch& batch)
+    {
+        RecoveryHandler handler(store_);
+        return batch.Iterate(&handler);
+    }
+
+	// Default implementation of Put
+	Status DB::Put(const Slice& key, const Slice& value) {
+		WriteBatch batch;
+		batch.Put(key, value);
+		return Write(batch);
 	}
 
-	std::optional<std::string> DBImpl::Get(const std::string& key)
+	// Default implementation of Delete
+	Status DB::Delete(const Slice& key) {
+		WriteBatch batch;
+		batch.Delete(key);
+		return Write(batch);
+	}
+
+	Status DBImpl::Put(const Slice& key, const Slice& value)
 	{
-		auto it = store_.find(key);
+		return DB::Put(key, value);
+	}
+
+	Result<std::string> DBImpl::Get(const Slice& key)
+	{
+		auto it = store_.find(key.ToString());
 		if (it != store_.end())
 		{
 			return it->second;
 		}
-		return std::nullopt;
+		return NotFound("Key not found: " + key.ToString());
 	}
 
-	void DBImpl::Delete(const std::string& key)
+	Status DBImpl::Delete(const Slice& key)
 	{
-		writer_.AddRecord("DELETE " + key);
-		store_.erase(key);
+		return DB::Delete(key);
+	}
+
+	Status DBImpl::Write(WriteBatch& batch){
+		WriteBatchInternal::SetSequence(&batch, sequence_);
+        sequence_ += WriteBatchInternal::Count(&batch);
+        
+        Slice record = WriteBatchInternal::Contents(&batch);
+        writer_.AddRecord(record);
+        
+        return ApplyBatch(batch);
 	}
 }

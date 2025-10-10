@@ -32,6 +32,7 @@ namespace prism
 		// If the database contains a mapping for "key", erase it.  Else do nothing.
 		void Delete(const Slice& key);
 
+		// Iterate through the batch and call the handler for each operation.
 		Status Iterate(Handler* handler) const;
 
 		void Append(const WriteBatch& source);

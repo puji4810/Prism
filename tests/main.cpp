@@ -4,7 +4,7 @@
 int main()
 {
 	auto db = prism::DB::Open("my_database");
-	db->Put("key2", "value2\n");
+	// db->Put("key2", "value2");
 	auto value = db->Get("key2");
 	if (value)
 	{
