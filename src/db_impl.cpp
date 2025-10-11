@@ -10,12 +10,19 @@ namespace prism
 {
 	class DBImpl;
 
+	// https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#c12-dont-make-data-members-const-or-references-in-a-copyable-or-movable-type
+	// Data members that are not const or references should not be made copyable or movable.
+	// Here we make sure that the store_ is not copyable or movable.
 	class DBImpl::RecoveryHandler : public WriteBatch::Handler
     {
     public:
         RecoveryHandler(std::unordered_map<std::string, std::string>& store)
             : store_(store) {}
-        
+		RecoveryHandler(const RecoveryHandler&) = delete;
+		RecoveryHandler& operator=(const RecoveryHandler&) = delete;
+		RecoveryHandler(RecoveryHandler&&) = delete;
+		RecoveryHandler& operator=(RecoveryHandler&&) = delete;
+
         void Put(const Slice& key, const Slice& value) override
         {
             store_[key.ToString()] = value.ToString();
