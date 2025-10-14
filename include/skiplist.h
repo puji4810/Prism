@@ -31,6 +31,7 @@ namespace prism
 		class Iterator;
 		struct Node;
 
+		// Iterator for the skip list.
 		class Iterator
 		{
 		public:
@@ -70,8 +71,68 @@ namespace prism
 			// Intentionally copyable
 		};
 
+		// Standard iterator for STL
+		class iterator
+		{
+		public:
+			using iterator_category = std::bidirectional_iterator_tag;
+			using value_type = Key;
+			using difference_type = std::ptrdiff_t;
+			using pointer = const Key*;
+			using reference = const Key&;
+
+		iterator()
+		    : node_(nullptr)
+		    , list_(nullptr)
+		{
+		}
+		
+		iterator(const SkipList* list, Node* n)
+		    : node_(n)
+		    , list_(list)
+		{
+		}
+
+			reference operator*() const
+			{
+				assert(node_ != nullptr);
+				return node_->key;
+			}
+			pointer operator->() const { return &node_->key; }
+
+			iterator& operator++()
+			{
+				assert(node_ != nullptr);
+				node_ = node_->Next(0);
+				return *this;
+			}
+			iterator operator++(int)
+			{
+				iterator tmp = *this;
+				++(*this);
+				return tmp;
+			}
+
+			iterator& operator--();
+
+		bool operator==(const iterator& other) const { return node_ == other.node_; }
+		bool operator!=(const iterator& other) const { return node_ != other.node_; }
+
 	private:
-		std::vector<char*> blocks_;
+		Node* node_;
+		const SkipList* list_;
+	};
+
+	using const_iterator = iterator;
+	using reverse_iterator = std::reverse_iterator<iterator>;
+	
+	iterator begin() const { return iterator(this, head_->Next(0)); }
+	iterator end() const { return iterator(this, nullptr); }
+	reverse_iterator rbegin() const { return reverse_iterator(end()); }
+	reverse_iterator rend() const { return reverse_iterator(begin()); }
+
+private:
+	std::vector<char*> blocks_;
 		Node* const head_;
 		static const int kMaxHeight = 12;
 		std::atomic<int> max_height_; // Used by Insert()
@@ -92,9 +153,9 @@ namespace prism
 		Node* GetLastNode() const;
 		// Return true if key is greater than the node's key.
 		bool KeyIsAfterNode(const Key& key, Node* n) const;
-		// Return a random height for a new node.
-		int RandomHeight();
-	};
+	// Return a random height for a new node.
+	int RandomHeight();
+};
 
 	template <typename Key, class Comparator>
 	inline SkipList<Key, Comparator>::Iterator::Iterator(const SkipList* list)
@@ -132,6 +193,26 @@ namespace prism
 		{
 			node_ = nullptr;
 		}
+	}
+
+	template <typename Key, class Comparator>
+	inline typename SkipList<Key, Comparator>::iterator& SkipList<Key, Comparator>::iterator::operator--()
+	{
+		assert(list_ != nullptr);
+		if (node_ == nullptr)
+		{
+			// From end() to the last element.
+			node_ = list_->GetLastNode();
+			if (node_ == list_->head_)
+				node_ = nullptr;
+		}
+		else
+		{
+			node_ = list_->GetNodeLessThan(node_->key);
+			if (node_ == list_->head_)
+				node_ = nullptr;
+		}
+		return *this;
 	}
 
 	template <typename Key, class Comparator>

@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 #include <set>
 #include <random>
+#include <algorithm>
+#include <vector>
 
 namespace prism {
 
@@ -231,6 +233,149 @@ TEST(SkipListTest, LargeDataset) {
     }
     EXPECT_FALSE(iter.Valid());
     EXPECT_EQ(set_iter, inserted.end());
+}
+
+TEST(SkipListTest, STLIterator_RangeBasedFor) {
+    Comparator cmp;
+    SkipList<Key, Comparator> list(cmp);
+    
+    std::vector<Key> keys = {1, 3, 5, 7, 9};
+    for (Key k : keys) {
+        list.Insert(k);
+    }
+    
+    // range-based for loop
+    std::vector<Key> result;
+    for (const auto& k : list) {
+        result.push_back(k);
+    }
+    
+    EXPECT_EQ(keys, result);
+}
+
+// Test: Basic operations of standard library iterator
+TEST(SkipListTest, STLIterator_BasicOps) {
+    Comparator cmp;
+    SkipList<Key, Comparator> list(cmp);
+    
+    for (int i = 0; i < 10; i++) {
+        list.Insert(i * 10);
+    }
+    
+    // begin/end
+    auto it = list.begin();
+    ASSERT_NE(it, list.end());
+    EXPECT_EQ(0, *it);
+    
+    // operator*
+    EXPECT_EQ(0, *it);
+    
+    // operator++
+    ++it;
+    EXPECT_EQ(10, *it);
+    
+    // operator++(int)
+    auto it2 = it++;
+    EXPECT_EQ(10, *it2);
+    EXPECT_EQ(20, *it);
+    
+    // operator!=
+    EXPECT_NE(it, list.end());
+}
+
+// Test: STL iterator backward traversal
+TEST(SkipListTest, STLIterator_Backward) {
+    Comparator cmp;
+    SkipList<Key, Comparator> list(cmp);
+    
+    std::vector<Key> keys = {1, 3, 5, 7, 9};
+    for (Key k : keys) {
+        list.Insert(k);
+    }
+    
+    // From last to first
+    auto it = list.end();
+    --it;  // Point to the last element
+    EXPECT_EQ(9, *it);
+    
+    --it;
+    EXPECT_EQ(7, *it);
+    
+    --it;
+    EXPECT_EQ(5, *it);
+}
+
+// Test: STL algorithm compatibility
+TEST(SkipListTest, STLIterator_Algorithms) {
+    Comparator cmp;
+    SkipList<Key, Comparator> list(cmp);
+    
+    for (int i = 0; i < 10; i++) {
+        list.Insert(i * 2);  // 0, 2, 4, 6, 8, 10, 12, 14, 16, 18
+    }
+    
+    // std::find
+    auto it = std::find(list.begin(), list.end(), 8);
+    ASSERT_NE(it, list.end());
+    EXPECT_EQ(8, *it);
+    
+    // std::count
+    auto count = std::count(list.begin(), list.end(), 8);
+    EXPECT_EQ(1, count);
+    
+    // std::distance
+    auto dist = std::distance(list.begin(), list.end());
+    EXPECT_EQ(10, dist);
+    
+    // std::find_if
+    auto it2 = std::find_if(list.begin(), list.end(), 
+                            [](Key k) { return k > 10; });
+    ASSERT_NE(it2, list.end());
+    EXPECT_EQ(12, *it2);
+}
+
+// Test: Reverse iterator
+TEST(SkipListTest, STLIterator_ReverseIterator) {
+    Comparator cmp;
+    SkipList<Key, Comparator> list(cmp);
+    
+    std::vector<Key> keys = {1, 3, 5, 7, 9};
+    for (Key k : keys) {
+        list.Insert(k);
+    }
+    
+    // Use reverse iterator
+    std::vector<Key> reversed;
+    for (auto it = list.rbegin(); it != list.rend(); ++it) {
+        reversed.push_back(*it);
+    }
+    
+    std::vector<Key> expected = {9, 7, 5, 3, 1};
+    EXPECT_EQ(expected, reversed);
+}
+
+// Test: iterator and Iterator coexist
+TEST(SkipListTest, BothIteratorStyles) {
+    Comparator cmp;
+    SkipList<Key, Comparator> list(cmp);
+    
+    for (int i = 1; i <= 5; i++) {
+        list.Insert(i * 10);
+    }
+    
+    // Use leveldb style Iterator
+    SkipList<Key, Comparator>::Iterator ldb_iter(&list);
+    ldb_iter.Seek(25);
+    ASSERT_TRUE(ldb_iter.Valid());
+    EXPECT_EQ(30, ldb_iter.key());
+    
+    // Use standard library style iterator
+    auto stl_it = std::find(list.begin(), list.end(), 30);
+    ASSERT_NE(stl_it, list.end());
+    EXPECT_EQ(30, *stl_it);
+    
+    // Both styles should see the same data
+    EXPECT_EQ(ldb_iter.key(), *stl_it);
 }
 
 }  // namespace prism
