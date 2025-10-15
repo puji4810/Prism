@@ -46,7 +46,7 @@ target("db_test")
 
 target("skiplist_test")
     set_kind("binary")
-    add_files("tests/skiplist_test.cpp")
+    add_files("tests/skiplist_test.cpp", "util/arena.cpp")
     add_packages("gtest")
     add_includedirs("include", "util")
     add_tests("default")
