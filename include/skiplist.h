@@ -3,8 +3,8 @@
 
 #include <atomic>
 #include <cassert>
-#include <vector>
 #include "random.h"
+#include "arena.h"
 
 namespace prism
 {
@@ -12,18 +12,15 @@ namespace prism
 	struct SkipList
 	{
 	public:
-		explicit SkipList(Comparator cmp);
+		// Create a new SkipList that will use "cmp" for comparing keys,
+		// and will allocate memory using "*arena". Objects allocated in the arena
+		// must remain allocated for the lifetime of the skiplist object.
+		explicit SkipList(Comparator cmp, Arena* arena);
 		SkipList(const SkipList&) = delete;
 		SkipList& operator=(const SkipList&) = delete;
 		SkipList(SkipList&&) = delete;
 		SkipList& operator=(SkipList&&) = delete;
-		~SkipList()
-		{
-			for (char* block : blocks_)
-			{
-				delete[] block;
-			}
-		}
+		~SkipList() = default;
 
 		void Insert(const Key& key);
 		bool Contains(const Key& key) const;
@@ -132,11 +129,11 @@ namespace prism
 	reverse_iterator rend() const { return reverse_iterator(begin()); }
 
 private:
-	std::vector<char*> blocks_;
+		Comparator const compare_;
+		Arena* const arena_;  // Arena used for allocations of nodes
 		Node* const head_;
 		static const int kMaxHeight = 12;
 		std::atomic<int> max_height_; // Used by Insert()
-		Comparator const compare_;
 		Random rnd_;
 
 		Node* NewNode(const Key& key, int height);
@@ -275,10 +272,11 @@ private:
 	};
 
 	template <typename Key, class Comparator>
-	SkipList<Key, Comparator>::SkipList(Comparator cmp)
-	    : head_(NewNode(Key{}, kMaxHeight))
+	SkipList<Key, Comparator>::SkipList(Comparator cmp, Arena* arena)
+	    : compare_(cmp)
+	    , arena_(arena)
+	    , head_(NewNode(Key{}, kMaxHeight))
 	    , max_height_(1)
-	    , compare_(cmp)
 	    , rnd_(0xdeadbeef)
 	{
 		for (int i = 0; i < kMaxHeight; i++)
@@ -290,8 +288,8 @@ private:
 	template <typename Key, class Comparator>
 	typename SkipList<Key, Comparator>::Node* SkipList<Key, Comparator>::NewNode(const Key& key, int height)
 	{
-		char* const node_memory = new char[sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1)];
-		blocks_.push_back(node_memory);
+		char* const node_memory = arena_->AllocateAligned(
+		    sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1));
 		return new (node_memory) Node(key);
 	}
 

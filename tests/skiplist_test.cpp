@@ -2,6 +2,7 @@
 #define SKIPLIST_TEST_CPP
 
 #include "skiplist.h"
+#include "arena.h"
 #include <gtest/gtest.h>
 #include <set>
 #include <random>
@@ -21,8 +22,9 @@ struct Comparator {
 using Key = uint64_t;
 
 TEST(SkipListTest, Empty) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     ASSERT_FALSE(list.Contains(10));
 
@@ -44,8 +46,9 @@ TEST(SkipListTest, InsertAndLookup) {
     const int R = 5000;
     std::mt19937 rnd(1000);
     std::set<Key> keys;
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
 
 	for (int i = 0; i < N; i++) {
         Key key = rnd() % R;
@@ -112,8 +115,9 @@ TEST(SkipListTest, InsertAndLookup) {
 }
 
 TEST(SkipListTest, Ordering) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     std::vector<Key> keys = {5, 3, 8, 1, 9, 2, 7, 4, 6};
     for (Key k : keys) {
@@ -133,8 +137,9 @@ TEST(SkipListTest, Ordering) {
 }
 
 TEST(SkipListTest, SeekBehavior) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     for (int i = 1; i <= 5; i++) {
         list.Insert(i * 10);
@@ -160,8 +165,9 @@ TEST(SkipListTest, SeekBehavior) {
 
 #ifndef NDEBUG
 TEST(SkipListTest, NoDuplicates) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     list.Insert(5);
     EXPECT_DEATH(list.Insert(5), "");
@@ -169,8 +175,9 @@ TEST(SkipListTest, NoDuplicates) {
 #endif
 
 TEST(SkipListTest, RandomHeightDistribution) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
 
 	for (int i = 0; i < 10000; i++) {
         list.Insert(i);
@@ -183,8 +190,9 @@ TEST(SkipListTest, RandomHeightDistribution) {
 }
 
 TEST(SkipListTest, EdgeCases) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     list.Insert(42);
     EXPECT_TRUE(list.Contains(42));
@@ -203,8 +211,9 @@ TEST(SkipListTest, EdgeCases) {
 }
 
 TEST(SkipListTest, LargeDataset) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     const int N = 100000;
     std::mt19937 rnd(42);
@@ -236,8 +245,9 @@ TEST(SkipListTest, LargeDataset) {
 }
 
 TEST(SkipListTest, STLIterator_RangeBasedFor) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     std::vector<Key> keys = {1, 3, 5, 7, 9};
     for (Key k : keys) {
@@ -255,8 +265,9 @@ TEST(SkipListTest, STLIterator_RangeBasedFor) {
 
 // Test: Basic operations of standard library iterator
 TEST(SkipListTest, STLIterator_BasicOps) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     for (int i = 0; i < 10; i++) {
         list.Insert(i * 10);
@@ -285,8 +296,9 @@ TEST(SkipListTest, STLIterator_BasicOps) {
 
 // Test: STL iterator backward traversal
 TEST(SkipListTest, STLIterator_Backward) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     std::vector<Key> keys = {1, 3, 5, 7, 9};
     for (Key k : keys) {
@@ -307,8 +319,9 @@ TEST(SkipListTest, STLIterator_Backward) {
 
 // Test: STL algorithm compatibility
 TEST(SkipListTest, STLIterator_Algorithms) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     for (int i = 0; i < 10; i++) {
         list.Insert(i * 2);  // 0, 2, 4, 6, 8, 10, 12, 14, 16, 18
@@ -336,8 +349,9 @@ TEST(SkipListTest, STLIterator_Algorithms) {
 
 // Test: Reverse iterator
 TEST(SkipListTest, STLIterator_ReverseIterator) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     std::vector<Key> keys = {1, 3, 5, 7, 9};
     for (Key k : keys) {
@@ -356,8 +370,9 @@ TEST(SkipListTest, STLIterator_ReverseIterator) {
 
 // Test: iterator and Iterator coexist
 TEST(SkipListTest, BothIteratorStyles) {
+    Arena arena;
     Comparator cmp;
-    SkipList<Key, Comparator> list(cmp);
+    SkipList<Key, Comparator> list(cmp, &arena);
     
     for (int i = 1; i <= 5; i++) {
         list.Insert(i * 10);
