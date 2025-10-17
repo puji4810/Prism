@@ -4,6 +4,7 @@
 #include <string>
 #include <fstream>
 #include "slice.h"
+#include "log_format.h"
 
 namespace prism
 {
@@ -15,14 +16,22 @@ namespace prism
 			explicit Reader(const std::string& src);
 			~Reader();
 
-			bool FillBuffer();
 			bool ReadRecord(Slice& record);
 
 		private:
+			enum
+			{
+				kEof = kMaxRecordType + 1,
+				kBadRecord = kMaxRecordType + 2
+			};
+
+			bool ReadPhysicalRecord(Slice& result, RecordType& type);
+
 			Slice buffer_;
 			char* const backing_store_;
 			std::ifstream src_;
-			bool eof_ = false;
+			bool eof_ = false; // Tag to indicate the end of the file
+			std::string scratch_; // Buffer for assembling fragmented records
 		};
 	}
 }

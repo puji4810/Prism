@@ -24,74 +24,158 @@ namespace prism
 			}
 		}
 
-		bool Reader::FillBuffer()
-		{
-			if (eof_)
-				return false;
-			size_t existing = buffer_.size();
-			std::memmove(backing_store_, buffer_.data(), existing); // move existing data to the beginning of the buffer
-
-			src_.read(backing_store_ + existing, kBlockSize - existing); // always read full block
-			size_t n = src_.gcount();
-			eof_ = src_.eof();
-
-			if (n == 0)
-			{
-				return false;
-			}
-			buffer_ = Slice(backing_store_, existing + n);
-			return true;
-		}
-
 		bool Reader::ReadRecord(Slice& record)
 		{
-			for (;;)
+			scratch_.clear();
+			bool in_fragmented_record = false;
+
+			while (true)
 			{
-				// make sure we have enough header
-				while (buffer_.size() < kHeaderSize)
+				Slice fragment;
+				RecordType record_type;
+
+				if (!ReadPhysicalRecord(fragment, record_type))
 				{
-					if (!FillBuffer())
+					// EOF or error
+					if (in_fragmented_record)
+					{
+						// Incomplete fragmented record at end of file
+						scratch_.clear();
+					}
+					return false;
+				}
+
+				switch (record_type)
+				{
+					case RecordType::kFullType:
+						if (in_fragmented_record)
+						{
+							// Handle bug in earlier versions where
+							// it could emit an empty kFirstType at tail end
+							if (!scratch_.empty())
+							{
+								throw std::runtime_error("Partial record without end");
+							}
+						}
+						scratch_.clear();
+						record = fragment;
+						return true;
+
+					case RecordType::kFirstType:
+						if (in_fragmented_record)
+						{
+							// Handle bug in earlier versions
+							if (!scratch_.empty())
+							{
+								throw std::runtime_error("Partial record without end");
+							}
+						}
+						scratch_.assign(fragment.data(), fragment.size());
+						in_fragmented_record = true;
+						break;
+
+					case RecordType::kMiddleType:
+						if (!in_fragmented_record)
+						{
+							throw std::runtime_error("Missing start of fragmented record");
+						}
+						scratch_.append(fragment.data(), fragment.size());
+						break;
+
+					case RecordType::kLastType:
+						if (!in_fragmented_record)
+						{
+							throw std::runtime_error("Missing start of fragmented record");
+						}
+						scratch_.append(fragment.data(), fragment.size());
+						record = Slice(scratch_);
+						return true;
+
+					default:
+						throw std::runtime_error("Unknown record type");
+				}
+			}
+		}
+
+		bool Reader::ReadPhysicalRecord(Slice& result, RecordType& type)
+		{
+			while (true)
+			{
+				// Need to read more data
+				if (buffer_.size() < kHeaderSize)
+				{
+					if (!eof_)
+					{
+						// Last read was a full read, clear buffer and read next block
+						// Compare with clear the buffer, use memove to move the unused data to the beginning of the buffer
+						// clear the buffer may get better performance for small blocks
+						buffer_.clear();
+						src_.read(backing_store_, kBlockSize);
+						size_t n = src_.gcount();
+						
+						if (n == 0) // finish reading
+						{
+							eof_ = true;
+							buffer_.clear();
+							return false;
+						}
+						else if (n < kBlockSize)
+						{
+							eof_ = true;
+						}
+						
+						buffer_ = Slice(backing_store_, n);
+						continue;
+					}
+					else
+					{
+						// Truncated header at end of file
+						buffer_.clear();
 						return false;
+					}
 				}
 
-				Header h;
-				h.DecodeFrom(buffer_.data());
+				// Parse the header using Header struct
+				Header header;
+				header.DecodeFrom(buffer_.data());
 
-				// ensure full payload in buffer
-				while (buffer_.size() < static_cast<size_t>(kHeaderSize + h.length))
+				// Check if we have enough data for the payload
+				if (kHeaderSize + header.length > buffer_.size())
 				{
-					if (eof_)
-						return false;
-					size_t existing = buffer_.size();
-					if (existing >= kBlockSize)
-						throw std::runtime_error("Record too large to fit in buffer");
-					std::memmove(backing_store_, buffer_.data(), existing);
-					src_.read(backing_store_ + existing, kBlockSize - existing);
-					size_t n = src_.gcount();
-					if (n == 0)
-						eof_ = true;
-					buffer_ = Slice(backing_store_, existing + n);
+					if (!eof_)
+					{
+						throw std::runtime_error("Bad record length");
+					}
+					// Truncated record at end of file
+					buffer_.clear();
+					return false;
 				}
 
-				// only support full record (kFullType) until now
-				// TODO: support other types
-				if (h.type != RecordType::kFullType)
+				// Skip zero-length records (padding)
+				if (header.type == RecordType::kZeroType && header.length == 0)
 				{
-					throw std::runtime_error("Unsupported fragmented record type");
+					buffer_.remove_prefix(kHeaderSize);
+					continue;
 				}
 
-				const char type_byte = static_cast<char>(h.type);
-				uint32_t expected = Unmask(h.checksum);
-				uint32_t actual = crc32c::Crc32c(reinterpret_cast<const uint8_t*>(&type_byte), 1);
-				actual = crc32c::Extend(actual, reinterpret_cast<const uint8_t*>(buffer_.data() + kHeaderSize), h.length);
+				// Verify checksum
+				const char type_byte = static_cast<char>(header.type);
+				uint32_t expected_crc = Unmask(header.checksum);
 
-				if (actual != expected)
+				uint32_t actual_crc = crc32c::Crc32c(reinterpret_cast<const uint8_t*>(&type_byte), 1);
+				actual_crc = crc32c::Extend(actual_crc,
+				                            reinterpret_cast<const uint8_t*>(buffer_.data() + kHeaderSize),
+				                            header.length);
+
+				if (actual_crc != expected_crc)
 				{
-					throw std::runtime_error("log corruption: bad record checksum");
+					throw std::runtime_error("Checksum mismatch in log record");
 				}
 
-				record = Slice(buffer_.data() + kHeaderSize, h.length);
-				buffer_.remove_prefix(kHeaderSize + h.length);
+				// Return the record
+				result = Slice(buffer_.data() + kHeaderSize, header.length);
+				buffer_.remove_prefix(kHeaderSize + header.length);
+				type = header.type;
 				return true;
 			}
 		}
@@ -102,6 +186,7 @@ namespace prism
 			{
 				src_.close();
 			}
+			delete[] backing_store_;
 		}
 
 	}
