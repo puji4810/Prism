@@ -2,10 +2,29 @@
 #include "write_batch.h"
 
 #include <gtest/gtest.h>
+#include <filesystem>
 
 using namespace prism;
 
-TEST(DBTest, BasicPutGetDelete)
+// Test fixture for DB tests
+class DBTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Clean up any existing test databases before each test
+        std::filesystem::remove("test_db");
+        std::filesystem::remove("test_db_large");
+        std::filesystem::remove("test_db_multi_large");
+    }
+    
+    void TearDown() override {
+        // Clean up after each test
+        std::filesystem::remove("test_db");
+        std::filesystem::remove("test_db_large");
+        std::filesystem::remove("test_db_multi_large");
+    }
+};
+
+TEST_F(DBTest, BasicPutGetDelete)
 {
     auto db = DB::Open("test_db");
     
@@ -27,7 +46,7 @@ TEST(DBTest, BasicPutGetDelete)
     EXPECT_FALSE(r2.has_value()) << "Get should fail after delete";
 }
 
-TEST(DBTest, BatchWrite)
+TEST_F(DBTest, BatchWrite)
 {
     auto db = DB::Open("test_db");
     
@@ -48,7 +67,7 @@ TEST(DBTest, BatchWrite)
     EXPECT_EQ("batch_value2", *r2);
 }
 
-TEST(DBTest, Recovery)
+TEST_F(DBTest, Recovery)
 {
     {
         auto db = DB::Open("test_db");
@@ -63,7 +82,7 @@ TEST(DBTest, Recovery)
     }
 }
 
-TEST(DBTest, LargeValueFragmentation)
+TEST_F(DBTest, LargeValueFragmentation)
 {
     auto db = DB::Open("test_db_large");
     
@@ -88,7 +107,7 @@ TEST(DBTest, LargeValueFragmentation)
     EXPECT_EQ(large_value, *r2) << "Recovered large value should match";
 }
 
-TEST(DBTest, MultipleLargeRecords)
+TEST_F(DBTest, MultipleLargeRecords)
 {
     auto db = DB::Open("test_db_multi_large");
     
