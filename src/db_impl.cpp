@@ -48,7 +48,7 @@ namespace prism
 		RecoveryHandler handler(store_);
 		Slice record;
 
-		while(reader_.ReadRecord(record)){
+		while(reader_.ReadRecord(&record)){
 			if (record.empty())
                 continue;
 
