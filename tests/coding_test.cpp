@@ -202,13 +202,13 @@ TEST(CodingTest, Strings)
 
 	Slice input(s);
 	Slice v;
-	EXPECT_TRUE(GetLengthPrefixedSlice(input, v));
+	EXPECT_TRUE(GetLengthPrefixedSlice(&input, &v));
 	EXPECT_EQ("", v.ToString());
-	EXPECT_TRUE(GetLengthPrefixedSlice(input, v));
+	EXPECT_TRUE(GetLengthPrefixedSlice(&input, &v));
 	EXPECT_EQ("foo", v.ToString());
-	EXPECT_TRUE(GetLengthPrefixedSlice(input, v));
+	EXPECT_TRUE(GetLengthPrefixedSlice(&input, &v));
 	EXPECT_EQ("bar", v.ToString());
-	EXPECT_TRUE(GetLengthPrefixedSlice(input, v));
+	EXPECT_TRUE(GetLengthPrefixedSlice(&input, &v));
 	EXPECT_EQ(std::string(200, 'x'), v.ToString());
 	EXPECT_EQ("", input.ToString());
 }

@@ -14,9 +14,9 @@ namespace prism
 	void PutVarint64(std::string& dst, uint64_t value);
 	void PutLengthPrefixedSlice(std::string& dst, const Slice& value);
 
-	bool GetVarint32(Slice& src, uint32_t& value);
-	bool GetVarint64(Slice& src, uint64_t& value);
-	bool GetLengthPrefixedSlice(Slice& src, Slice& value);
+	bool GetVarint32(Slice* src, uint32_t* value);
+	bool GetVarint64(Slice* src, uint64_t* value);
+	bool GetLengthPrefixedSlice(Slice* src, Slice* value);
 
 	// Returns the length of the varint32 or varint64 encoding of "v"
 	int VarintLength(uint64_t v);
@@ -68,13 +68,13 @@ namespace prism
 	const char* GetVarint64Ptr(const char* p, const char* limit, uint64_t* value);
 
 	// consume the varint32 from the slice, and advance the slice
-	bool ConsumeVarint32(Slice& in, uint32_t& v);
+	bool ConsumeVarint32(Slice* in, uint32_t* v);
 
 	// consume the varint64 from the slice, and advance the slice
-	bool ConsumeVarint64(Slice& in, uint64_t& v);
+	bool ConsumeVarint64(Slice* in, uint64_t* v);
 
 	// consume the length prefixed slice from the slice, and advance the slice
-	bool ConsumeLengthPrefixedSlice(Slice& in, Slice& out);
+	bool ConsumeLengthPrefixedSlice(Slice* in, Slice* out);
 
 	// try to decode the varint32 from the slice, and return the value if successful
 	std::optional<uint32_t> TryDecodeVarint32(Slice in);

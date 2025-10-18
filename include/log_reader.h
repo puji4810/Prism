@@ -16,7 +16,7 @@ namespace prism
 			explicit Reader(const std::string& src);
 			~Reader();
 
-			bool ReadRecord(Slice& record);
+			bool ReadRecord(Slice* record);
 
 		private:
 			enum
@@ -25,7 +25,7 @@ namespace prism
 				kBadRecord = kMaxRecordType + 2
 			};
 
-			bool ReadPhysicalRecord(Slice& result, RecordType& type);
+			bool ReadPhysicalRecord(Slice* result, RecordType* type);
 
 			Slice buffer_;
 			char* const backing_store_;
