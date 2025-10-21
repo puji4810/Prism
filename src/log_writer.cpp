@@ -54,7 +54,7 @@ namespace prism
 			{
 				const int leftover = kBlockSize - block_offset_;
 				assert(leftover >= 0);
-				
+
 				if (leftover < kHeaderSize)
 				{
 					// Switch to a new block
@@ -62,7 +62,7 @@ namespace prism
 					{
 						// Fill the trailer with zeros
 						static_assert(kHeaderSize == 7, "");
-						const char zeros[6] = {0, 0, 0, 0, 0, 0};
+						const char zeros[6] = { 0, 0, 0, 0, 0, 0 };
 						dest_.write(zeros, leftover);
 					}
 					block_offset_ = 0; // A new block is started
@@ -106,8 +106,7 @@ namespace prism
 			assert(block_offset_ + kHeaderSize + length <= kBlockSize);
 
 			// Compute the crc of the record type and the payload
-			uint32_t crc = crc32c::Extend(type_crc_[static_cast<int>(type)],
-			                               reinterpret_cast<const uint8_t*>(ptr), length);
+			uint32_t crc = crc32c::Extend(type_crc_[static_cast<int>(type)], reinterpret_cast<const uint8_t*>(ptr), length);
 			crc = Mask(crc); // Adjust for storage
 
 			// Format the header using Header struct
@@ -123,7 +122,7 @@ namespace prism
 			dest_.write(buf, kHeaderSize);
 			dest_.write(ptr, length);
 			dest_.flush();
-			
+
 			if (!dest_)
 			{
 				throw std::runtime_error("Failed to write to log file");

@@ -49,31 +49,31 @@ namespace prism
 			found++;
 			char tag = input[0];
 			input.remove_prefix(1);
-		switch (tag)
-		{
-		case static_cast<char>(ValueType::kTypeValue):
-			if (GetLengthPrefixedSlice(&input, &key) && GetLengthPrefixedSlice(&input, &value))
+			switch (tag)
 			{
-				handler->Put(key, value);
+			case static_cast<char>(ValueType::kTypeValue):
+				if (GetLengthPrefixedSlice(&input, &key) && GetLengthPrefixedSlice(&input, &value))
+				{
+					handler->Put(key, value);
+				}
+				else
+				{
+					return Corruption("bad WriteBatch Put");
+				}
+				break;
+			case static_cast<char>(ValueType::kTypeDeletion):
+				if (GetLengthPrefixedSlice(&input, &key))
+				{
+					handler->Delete(key);
+				}
+				else
+				{
+					return Corruption("bad WriteBatch Delete");
+				}
+				break;
+			default:
+				return Corruption("unknown WriteBatch tag");
 			}
-			else
-			{
-				return Corruption("bad WriteBatch Put");
-			}
-			break;
-		case static_cast<char>(ValueType::kTypeDeletion):
-			if (GetLengthPrefixedSlice(&input, &key))
-			{
-				handler->Delete(key);
-			}
-			else
-			{
-				return Corruption("bad WriteBatch Delete");
-			}
-			break;
-		default:
-			return Corruption("unknown WriteBatch tag");
-		}
 		}
 		if (found != WriteBatchInternal::Count(this))
 		{

@@ -8,6 +8,7 @@
 
 namespace prism
 {
+	// Append the fixed32, fixed64, varint32, varint64, and length prefixed slice to the string
 	void PutFixed32(std::string& dst, uint32_t value);
 	void PutFixed64(std::string& dst, uint64_t value);
 	void PutVarint32(std::string& dst, uint32_t value);
