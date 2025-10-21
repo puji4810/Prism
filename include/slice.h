@@ -78,6 +78,8 @@ namespace prism
 
 		const char* data() const { return data_.data(); }
 
+		std::span<const char> span_data() const { return data_; } // return the span of the data.
+
 		size_t size() const { return data_.size(); }
 
 		bool empty() const { return data_.empty(); }
