@@ -8,6 +8,9 @@ set_languages("cxx23")
 local common_files = {"src/*.cpp", "util/*.cpp"}
 local common_includedirs = {"include", "src", "util"}
 
+-- include tests subdirectory targets
+includes("tests/xmake.lua")
+
 target("prism")
     set_kind("binary")
     add_files(common_files)
