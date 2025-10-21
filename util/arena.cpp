@@ -4,9 +4,11 @@
 namespace prism
 {
 	static const int kBlockSize = 4096;
-	
+
 	Arena::Arena()
-		: alloc_ptr_(nullptr), alloc_bytes_remaining_(0), memory_usage_(0)
+	    : alloc_ptr_(nullptr)
+	    , alloc_bytes_remaining_(0)
+	    , memory_usage_(0)
 	{
 	}
 
@@ -81,8 +83,5 @@ namespace prism
 		return result;
 	}
 
-	size_t Arena::MemoryUsage() const
-	{
-		return memory_usage_.load(std::memory_order_relaxed);
-	}
+	size_t Arena::MemoryUsage() const { return memory_usage_.load(std::memory_order_relaxed); }
 }

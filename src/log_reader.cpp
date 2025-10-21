@@ -24,29 +24,29 @@ namespace prism
 			}
 		}
 
-	bool Reader::ReadRecord(Slice* record)
-	{
-		scratch_.clear();
-		bool in_fragmented_record = false;
-
-		while (true)
+		bool Reader::ReadRecord(Slice* record)
 		{
-			Slice fragment;
-			RecordType record_type;
+			scratch_.clear();
+			bool in_fragmented_record = false;
 
-			if (!ReadPhysicalRecord(&fragment, &record_type))
+			while (true)
 			{
-				// EOF or error
-				if (in_fragmented_record)
+				Slice fragment;
+				RecordType record_type;
+
+				if (!ReadPhysicalRecord(&fragment, &record_type))
 				{
-					// Incomplete fragmented record at end of file
-					scratch_.clear();
+					// EOF or error
+					if (in_fragmented_record)
+					{
+						// Incomplete fragmented record at end of file
+						scratch_.clear();
+					}
+					return false;
 				}
-				return false;
-			}
 
-			switch (record_type)
-			{
+				switch (record_type)
+				{
 				case RecordType::kFullType:
 					if (in_fragmented_record)
 					{
@@ -93,92 +93,90 @@ namespace prism
 
 				default:
 					throw std::runtime_error("Unknown record type");
+				}
 			}
 		}
-	}
 
-	bool Reader::ReadPhysicalRecord(Slice* result, RecordType* type)
-	{
-		while (true)
+		bool Reader::ReadPhysicalRecord(Slice* result, RecordType* type)
 		{
-			// Need to read more data
-			if (buffer_.size() < kHeaderSize)
+			while (true)
 			{
-				if (!eof_)
+				// Need to read more data
+				if (buffer_.size() < kHeaderSize)
 				{
-					// Last read was a full read, clear buffer and read next block
-					// Compare with clear the buffer, use memove to move the unused data to the beginning of the buffer
-					// clear the buffer may get better performance for small blocks
-					buffer_.clear();
-					src_.read(backing_store_, kBlockSize);
-					size_t n = src_.gcount();
-					
-					if (n == 0) // finish reading
+					if (!eof_)
 					{
-						eof_ = true;
+						// Last read was a full read, clear buffer and read next block
+						// Compare with clear the buffer, use memove to move the unused data to the beginning of the buffer
+						// clear the buffer may get better performance for small blocks
+						buffer_.clear();
+						src_.read(backing_store_, kBlockSize);
+						size_t n = src_.gcount();
+
+						if (n == 0) // finish reading
+						{
+							eof_ = true;
+							buffer_.clear();
+							return false;
+						}
+						else if (n < kBlockSize)
+						{
+							eof_ = true;
+						}
+
+						buffer_ = Slice(backing_store_, n);
+						continue;
+					}
+					else
+					{
+						// Truncated header at end of file
 						buffer_.clear();
 						return false;
 					}
-					else if (n < kBlockSize)
-					{
-						eof_ = true;
-					}
-					
-					buffer_ = Slice(backing_store_, n);
-					continue;
 				}
-				else
+
+				// Parse the header using Header struct
+				Header header;
+				header.DecodeFrom(buffer_.data());
+
+				// Check if we have enough data for the payload
+				if (kHeaderSize + header.length > buffer_.size())
 				{
-					// Truncated header at end of file
+					if (!eof_)
+					{
+						throw std::runtime_error("Bad record length");
+					}
+					// Truncated record at end of file
 					buffer_.clear();
 					return false;
 				}
-			}
 
-			// Parse the header using Header struct
-			Header header;
-			header.DecodeFrom(buffer_.data());
-
-			// Check if we have enough data for the payload
-			if (kHeaderSize + header.length > buffer_.size())
-			{
-				if (!eof_)
+				// Skip zero-length records (padding)
+				if (header.type == RecordType::kZeroType && header.length == 0)
 				{
-					throw std::runtime_error("Bad record length");
+					buffer_.remove_prefix(kHeaderSize);
+					continue;
 				}
-				// Truncated record at end of file
-				buffer_.clear();
-				return false;
+
+				// Verify checksum
+				const char type_byte = static_cast<char>(header.type);
+				uint32_t expected_crc = Unmask(header.checksum);
+
+				uint32_t actual_crc = crc32c::Crc32c(reinterpret_cast<const uint8_t*>(&type_byte), 1);
+				actual_crc = crc32c::Extend(actual_crc, reinterpret_cast<const uint8_t*>(buffer_.data() + kHeaderSize), header.length);
+
+				if (actual_crc != expected_crc)
+				{
+					throw std::runtime_error("Checksum mismatch in log record");
+				}
+
+				// Return the record
+				*result = Slice(buffer_.data() + kHeaderSize, header.length);
+				buffer_.remove_prefix(kHeaderSize + header.length);
+				*type = header.type;
+				return true;
 			}
-
-			// Skip zero-length records (padding)
-			if (header.type == RecordType::kZeroType && header.length == 0)
-			{
-				buffer_.remove_prefix(kHeaderSize);
-				continue;
-			}
-
-			// Verify checksum
-			const char type_byte = static_cast<char>(header.type);
-			uint32_t expected_crc = Unmask(header.checksum);
-
-			uint32_t actual_crc = crc32c::Crc32c(reinterpret_cast<const uint8_t*>(&type_byte), 1);
-			actual_crc = crc32c::Extend(actual_crc,
-			                            reinterpret_cast<const uint8_t*>(buffer_.data() + kHeaderSize),
-			                            header.length);
-
-			if (actual_crc != expected_crc)
-			{
-				throw std::runtime_error("Checksum mismatch in log record");
-			}
-
-			// Return the record
-			*result = Slice(buffer_.data() + kHeaderSize, header.length);
-			buffer_.remove_prefix(kHeaderSize + header.length);
-			*type = header.type;
-			return true;
 		}
-	}
 
 		Reader::~Reader()
 		{
