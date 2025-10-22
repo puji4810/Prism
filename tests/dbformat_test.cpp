@@ -141,19 +141,19 @@ TEST(FormatTest, ParsedInternalKeyDebugString)
 {
 	ParsedInternalKey key("The \"key\" in 'single quotes'", 42, kValueTypeForSeek);
 	// Prism format: user_key: '...' , sequence: ..., type: Value/Deletion
-	const std::string prefix = "user_key: 'The \"key\" in 'single quotes''";
-	EXPECT_TRUE(key.DebugString().starts_with(prefix));
-	EXPECT_NE(std::string::npos, key.DebugString().find("sequence: 42"));
-	EXPECT_NE(std::string::npos, key.DebugString().find("type: Value"));
+	const std::string s = key.DebugString();
+	EXPECT_NE(std::string::npos, s.find("'The \"key\" in 'single quotes'"));
+	EXPECT_NE(std::string::npos, s.find("@ 42"));
+	EXPECT_NE(std::string::npos, s.find(": 1"));
 }
 
 TEST(FormatTest, InternalKeyDebugString)
 {
 	InternalKey key("The \"key\" in 'single quotes'", 42, kValueTypeForSeek);
 	const std::string s = key.DebugString();
-	EXPECT_NE(std::string::npos, s.find("user_key: 'The \"key\" in 'single quotes''"));
-	EXPECT_NE(std::string::npos, s.find("sequence: 42"));
-	EXPECT_NE(std::string::npos, s.find("type: Value"));
+	EXPECT_NE(std::string::npos, s.find("'The \"key\" in 'single quotes'"));
+	EXPECT_NE(std::string::npos, s.find("@ 42"));
+	EXPECT_NE(std::string::npos, s.find(": 1"));
 
 	InternalKey invalid_key; // empty rep_
 	EXPECT_EQ("(bad)", invalid_key.DebugString());

@@ -39,16 +39,6 @@ namespace prism
 		return Slice(internal_key.data(), internal_key.size() - 8);
 	}
 
-	std::string InternalKey::DebugString() const
-	{
-		ParsedInternalKey parsed;
-		if (ParseInternalKey(rep_, &parsed))
-			return parsed.DebugString();
-		std::ostringstream ss;
-		ss << "(bad)" << rep_;
-		return ss.str();
-	}
-
 	const char* InternalKeyComparator::Name() const { return "Prism.InternalKeyComparator"; }
 
 	int InternalKeyComparator::Compare(const Slice& a, const Slice& b) const
