@@ -3,8 +3,10 @@
 
 #include <cstdint>
 #include <string>
+#include <sstream>
 #include "slice.h"
 #include "comparator.h"
+#include "logging.h"
 
 namespace prism
 {
@@ -53,13 +55,9 @@ namespace prism
 
 		std::string DebugString() const
 		{
-			std::string result = "user_key: '";
-			result.append(user_key.data(), user_key.size());
-			result += "', sequence: ";
-			result += std::to_string(sequence);
-			result += ", type: ";
-			result += (type == ValueType::kTypeValue) ? "Value" : "Deletion";
-			return result;
+			std::ostringstream ss;
+			ss << '\'' << EscapeString(user_key.ToString()) << "' @ " << sequence << " : " << static_cast<int>(type);
+			return ss.str();
 		}
 	};
 
@@ -94,7 +92,17 @@ namespace prism
 
 		void Clear() { rep_.clear(); }
 
-		std::string DebugString() const;
+		std::string DebugString() const
+		{
+			ParsedInternalKey parsed;
+			if (ParseInternalKey(rep_, &parsed))
+			{
+				return parsed.DebugString();
+			}
+			std::ostringstream ss;
+			ss << "(bad)" << EscapeString(rep_);
+			return ss.str();
+		}
 	};
 
 	// comparator for internal keys that uses a specified comparator for
