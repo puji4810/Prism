@@ -74,9 +74,6 @@ namespace prism
 	// consume the varint64 from the slice, and advance the slice
 	bool ConsumeVarint64(Slice* in, uint64_t* v);
 
-	// consume the length prefixed slice from the slice, and advance the slice
-	bool ConsumeLengthPrefixedSlice(Slice* in, Slice* out);
-
 	// try to decode the varint32 from the slice, and return the value if successful
 	std::optional<uint32_t> TryDecodeVarint32(Slice in);
 
