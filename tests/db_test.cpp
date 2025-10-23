@@ -32,21 +32,23 @@ TEST_F(DBTest, BasicPutGetDelete)
 	auto db = DB::Open("test_db");
 
 	// Put
-	auto s1 = db->Put("key1", "value1");
-	EXPECT_TRUE(s1.has_value()) << "Put should succeed";
+	Status s1 = db->Put("key1", "value1");
+	EXPECT_TRUE(s1.ok()) << "Put should succeed: " << s1.ToString();
 
 	// Get
-	auto r1 = db->Get("key1");
-	ASSERT_TRUE(r1.has_value()) << "Get should succeed";
-	EXPECT_EQ("value1", *r1) << "Value should match";
+	std::string value;
+	Status s2 = db->Get("key1", &value);
+	ASSERT_TRUE(s2.ok()) << "Get should succeed: " << s2.ToString();
+	EXPECT_EQ("value1", value) << "Value should match";
 
 	// Delete
-	auto s2 = db->Delete("key1");
-	EXPECT_TRUE(s2.has_value()) << "Delete should succeed";
+	Status s3 = db->Delete("key1");
+	EXPECT_TRUE(s3.ok()) << "Delete should succeed: " << s3.ToString();
 
 	// Get after delete
-	auto r2 = db->Get("key1");
-	EXPECT_FALSE(r2.has_value()) << "Get should fail after delete";
+	std::string value2;
+	Status s4 = db->Get("key1", &value2);
+	EXPECT_TRUE(s4.IsNotFound()) << "Get should return NotFound after delete";
 }
 
 TEST_F(DBTest, BatchWrite)
@@ -58,30 +60,34 @@ TEST_F(DBTest, BatchWrite)
 	batch.Put("batch_key2", "batch_value2");
 	batch.Delete("key1");
 
-	auto s = db->Write(batch);
-	EXPECT_TRUE(s.has_value()) << "Batch write should succeed";
+	Status s = db->Write(batch);
+	EXPECT_TRUE(s.ok()) << "Batch write should succeed: " << s.ToString();
 
-	auto r1 = db->Get("batch_key1");
-	ASSERT_TRUE(r1.has_value());
-	EXPECT_EQ("batch_value1", *r1);
+	std::string value1;
+	Status s1 = db->Get("batch_key1", &value1);
+	ASSERT_TRUE(s1.ok()) << s1.ToString();
+	EXPECT_EQ("batch_value1", value1);
 
-	auto r2 = db->Get("batch_key2");
-	ASSERT_TRUE(r2.has_value());
-	EXPECT_EQ("batch_value2", *r2);
+	std::string value2;
+	Status s2 = db->Get("batch_key2", &value2);
+	ASSERT_TRUE(s2.ok()) << s2.ToString();
+	EXPECT_EQ("batch_value2", value2);
 }
 
 TEST_F(DBTest, Recovery)
 {
 	{
 		auto db = DB::Open("test_db");
-		db->Put("persistent_key", "persistent_value");
+		Status s = db->Put("persistent_key", "persistent_value");
+		ASSERT_TRUE(s.ok()) << s.ToString();
 	}
 
 	{
 		auto db = DB::Open("test_db");
-		auto r = db->Get("persistent_key");
-		ASSERT_TRUE(r.has_value()) << "Should recover data";
-		EXPECT_EQ("persistent_value", *r) << "Recovered value should match";
+		std::string value;
+		Status s = db->Get("persistent_key", &value);
+		ASSERT_TRUE(s.ok()) << "Should recover data: " << s.ToString();
+		EXPECT_EQ("persistent_value", value) << "Recovered value should match";
 	}
 }
 
@@ -93,21 +99,23 @@ TEST_F(DBTest, LargeValueFragmentation)
 	std::string large_value(40000, 'X'); // 40KB of 'X'
 
 	// Put the large value
-	auto s1 = db->Put("large_key", large_value);
-	ASSERT_TRUE(s1.has_value()) << "Put large value should succeed";
+	Status s1 = db->Put("large_key", large_value);
+	ASSERT_TRUE(s1.ok()) << "Put large value should succeed: " << s1.ToString();
 
 	// Get it back
-	auto r1 = db->Get("large_key");
-	ASSERT_TRUE(r1.has_value()) << "Get large value should succeed";
-	EXPECT_EQ(large_value, *r1) << "Large value should match after fragmentation";
+	std::string retrieved_value;
+	Status s2 = db->Get("large_key", &retrieved_value);
+	ASSERT_TRUE(s2.ok()) << "Get large value should succeed: " << s2.ToString();
+	EXPECT_EQ(large_value, retrieved_value) << "Large value should match after fragmentation";
 
 	// Test recovery with large value
 	db.reset(); // Close DB
 
 	db = DB::Open("test_db_large");
-	auto r2 = db->Get("large_key");
-	ASSERT_TRUE(r2.has_value()) << "Should recover large value";
-	EXPECT_EQ(large_value, *r2) << "Recovered large value should match";
+	std::string recovered_value;
+	Status s3 = db->Get("large_key", &recovered_value);
+	ASSERT_TRUE(s3.ok()) << "Should recover large value: " << s3.ToString();
+	EXPECT_EQ(large_value, recovered_value) << "Recovered large value should match";
 }
 
 TEST_F(DBTest, MultipleLargeRecords)
@@ -119,26 +127,27 @@ TEST_F(DBTest, MultipleLargeRecords)
 	std::string value2(35000, 'B'); // 35KB
 	std::string value3(45000, 'C'); // 45KB
 
-	auto s1 = db->Put("key1", value1);
-	auto s2 = db->Put("key2", value2);
-	auto s3 = db->Put("key3", value3);
+	Status s1 = db->Put("key1", value1);
+	Status s2 = db->Put("key2", value2);
+	Status s3 = db->Put("key3", value3);
 
-	ASSERT_TRUE(s1.has_value());
-	ASSERT_TRUE(s2.has_value());
-	ASSERT_TRUE(s3.has_value());
+	ASSERT_TRUE(s1.ok()) << s1.ToString();
+	ASSERT_TRUE(s2.ok()) << s2.ToString();
+	ASSERT_TRUE(s3.ok()) << s3.ToString();
 
 	// Verify all values
-	auto r1 = db->Get("key1");
-	auto r2 = db->Get("key2");
-	auto r3 = db->Get("key3");
+	std::string retrieved1, retrieved2, retrieved3;
+	Status r1 = db->Get("key1", &retrieved1);
+	Status r2 = db->Get("key2", &retrieved2);
+	Status r3 = db->Get("key3", &retrieved3);
 
-	ASSERT_TRUE(r1.has_value());
-	ASSERT_TRUE(r2.has_value());
-	ASSERT_TRUE(r3.has_value());
+	ASSERT_TRUE(r1.ok()) << r1.ToString();
+	ASSERT_TRUE(r2.ok()) << r2.ToString();
+	ASSERT_TRUE(r3.ok()) << r3.ToString();
 
-	EXPECT_EQ(value1, *r1);
-	EXPECT_EQ(value2, *r2);
-	EXPECT_EQ(value3, *r3);
+	EXPECT_EQ(value1, retrieved1);
+	EXPECT_EQ(value2, retrieved2);
+	EXPECT_EQ(value3, retrieved3);
 }
 
 int main(int argc, char** argv)

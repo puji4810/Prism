@@ -14,7 +14,7 @@ namespace prism
 		DBImpl(const std::string& dbname);
 		~DBImpl() override;
 		Status Put(const Slice& key, const Slice& value) override;
-		Result<std::string> Get(const Slice& key) override;
+		Status Get(const Slice& key, std::string* value) override;
 		Status Delete(const Slice& key) override;
 		Status Write(WriteBatch& batch) override;
 
@@ -26,7 +26,7 @@ namespace prism
 		std::unordered_map<std::string, std::string> store_;
 		log::Writer writer_;
 		log::Reader reader_;
-		uint64_t sequence_;
+		uint64_t sequence_ = 0;
 	};
 } // namespace prism
 

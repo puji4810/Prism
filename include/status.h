@@ -1,70 +1,121 @@
 #ifndef STATUS_H_
 #define STATUS_H_
 
-#include <expected>
+#include <algorithm>
 #include <string>
+#include "slice.h"
 
-namespace prism {
+namespace prism
+{
+	// A Status encapsulates the result of an operation. It may indicate success,
+	// or it may indicate an error with an associated error message.
+	//
+	// Multiple threads can invoke const methods on a Status without
+	// external synchronization, but if any of the threads may call a
+	// non-const method, all threads accessing the same Status must use
+	// external synchronization.
+	class Status
+	{
+	public:
+		// Create a success status.
+		Status() noexcept
+		    : state_(nullptr)
+		{
+		}
 
-enum class ErrorCode {
-    Ok = 0,
-    NotFound,
-    Corruption,
-    NotSupported,
-    InvalidArgument,
-    IOError
-};
+		~Status() { delete[] state_; }
 
-struct Error {
-    ErrorCode code;
-    std::string message;
-    
-    Error(ErrorCode c, std::string msg = "") 
-        : code(c), message(std::move(msg)) {}
-    
-    std::string ToString() const {
-        std::string result;
-        switch (code) {
-            case ErrorCode::NotFound: result = "NotFound: "; break;
-            case ErrorCode::Corruption: result = "Corruption: "; break;
-            case ErrorCode::NotSupported: result = "NotSupported: "; break;
-            case ErrorCode::InvalidArgument: result = "InvalidArgument: "; break;
-            case ErrorCode::IOError: result = "IOError: "; break;
-            default: return "OK";
-        }
-        return result + message;
-    }
-};
+		Status(const Status& rhs);
+		Status& operator=(const Status& rhs);
 
-// For functions that return a value
-template<typename T>
-using Result = std::expected<T, Error>;
+		Status(Status&& rhs) noexcept
+		    : state_(rhs.state_)
+		{
+			rhs.state_ = nullptr;
+		}
 
-// For no return functions
-using Status = std::expected<void, Error>;
+		Status& operator=(Status&& rhs) noexcept;
 
-inline Status Ok() { return {}; }
+		// Return a success status.
+		static Status OK() { return Status(); }
 
-inline auto NotFound(std::string msg = "") {
-    return std::unexpected(Error{ErrorCode::NotFound, std::move(msg)});
-}
+		// Return error status of an appropriate type.
+		static Status NotFound(const Slice& msg, const Slice& msg2 = Slice()) { return Status(kNotFound, msg, msg2); }
 
-inline auto Corruption(std::string msg = "") {
-    return std::unexpected(Error{ErrorCode::Corruption, std::move(msg)});
-}
+		static Status Corruption(const Slice& msg, const Slice& msg2 = Slice()) { return Status(kCorruption, msg, msg2); }
 
-inline auto NotSupported(std::string msg = "") {
-    return std::unexpected(Error{ErrorCode::NotSupported, std::move(msg)});
-}
+		static Status NotSupported(const Slice& msg, const Slice& msg2 = Slice()) { return Status(kNotSupported, msg, msg2); }
 
-inline auto InvalidArgument(std::string msg = "") {
-    return std::unexpected(Error{ErrorCode::InvalidArgument, std::move(msg)});
-}
+		static Status InvalidArgument(const Slice& msg, const Slice& msg2 = Slice()) { return Status(kInvalidArgument, msg, msg2); }
 
-inline auto IOError(std::string msg = "") {
-    return std::unexpected(Error{ErrorCode::IOError, std::move(msg)});
-}
+		static Status IOError(const Slice& msg, const Slice& msg2 = Slice()) { return Status(kIOError, msg, msg2); }
+
+		// Returns true iff the status indicates success.
+		bool ok() const { return (state_ == nullptr); }
+
+		// Returns true iff the status indicates a NotFound error.
+		bool IsNotFound() const { return code() == kNotFound; }
+
+		// Returns true iff the status indicates a Corruption error.
+		bool IsCorruption() const { return code() == kCorruption; }
+
+		// Returns true iff the status indicates an IOError.
+		bool IsIOError() const { return code() == kIOError; }
+
+		// Returns true iff the status indicates a NotSupportedError.
+		bool IsNotSupportedError() const { return code() == kNotSupported; }
+
+		// Returns true iff the status indicates an InvalidArgument.
+		bool IsInvalidArgument() const { return code() == kInvalidArgument; }
+
+		// Return a string representation of this status suitable for printing.
+		// Returns the string "OK" for success.
+		std::string ToString() const;
+
+	private:
+		enum Code
+		{
+			kOk = 0,
+			kNotFound = 1,
+			kCorruption = 2,
+			kNotSupported = 3,
+			kInvalidArgument = 4,
+			kIOError = 5
+		};
+
+		Code code() const { return (state_ == nullptr) ? kOk : static_cast<Code>(state_[4]); }
+
+		Status(Code code, const Slice& msg, const Slice& msg2);
+		static const char* CopyState(const char* s);
+
+		// OK status has a null state_.  Otherwise, state_ is a new[] array
+		// of the following form:
+		//    state_[0..3] == length of message
+		//    state_[4]    == code
+		//    state_[5..]  == message
+		const char* state_;
+	};
+
+	inline Status::Status(const Status& rhs) { state_ = (rhs.state_ == nullptr) ? nullptr : CopyState(rhs.state_); }
+
+	inline Status& Status::operator=(const Status& rhs)
+	{
+		// The following condition catches both aliasing (when this == &rhs),
+		// and the common case where both rhs and *this are ok.
+		if (state_ != rhs.state_)
+		{
+			delete[] state_;
+			state_ = (rhs.state_ == nullptr) ? nullptr : CopyState(rhs.state_);
+		}
+		return *this;
+	}
+
+	inline Status& Status::operator=(Status&& rhs) noexcept
+	{
+		std::swap(state_, rhs.state_);
+		return *this;
+	}
 
 } // namespace prism
 
-#endif
+#endif // STATUS_H_

@@ -60,7 +60,7 @@ namespace prism
 			}
 
 			auto status = batch.Iterate(&handler);
-			if (!status)
+			if (!status.ok())
 			{
 			}
 		}
@@ -92,14 +92,15 @@ namespace prism
 
 	Status DBImpl::Put(const Slice& key, const Slice& value) { return DB::Put(key, value); }
 
-	Result<std::string> DBImpl::Get(const Slice& key)
+	Status DBImpl::Get(const Slice& key, std::string* value)
 	{
 		auto it = store_.find(key.ToString());
 		if (it != store_.end())
 		{
-			return it->second;
+			*value = it->second;
+			return Status::OK();
 		}
-		return NotFound("Key not found: " + key.ToString());
+		return Status::NotFound("Key not found: " + key.ToString());
 	}
 
 	Status DBImpl::Delete(const Slice& key) { return DB::Delete(key); }
