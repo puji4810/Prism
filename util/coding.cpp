@@ -149,18 +149,6 @@ namespace prism
 		return true;
 	}
 
-	bool ConsumeLengthPrefixedSlice(Slice* in, Slice* out)
-	{
-		uint32_t len = 0;
-		if (!ConsumeVarint32(in, &len))
-			return false;
-		if (in->size() < len)
-			return false;
-		*out = Slice(in->data(), len);
-		in->remove_prefix(len);
-		return true;
-	}
-
 	std::optional<uint32_t> TryDecodeVarint32(Slice in)
 	{
 		uint32_t v = 0;
