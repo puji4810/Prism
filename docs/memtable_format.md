@@ -3,6 +3,7 @@
 ## Overview
 
 MemTable is an in-memory write buffer that:
+
 - Stores recent writes in sorted order
 - Uses SkipList for efficient lookups and iteration
 - Manages memory with Arena allocator
@@ -45,10 +46,10 @@ packet-beta
 Entry Layout (stored in Arena):
 ┌─────────────────┬──────────────┬─────┬─────────────┬──────────────┐
 │ internal_key_len│  user_key    │ tag │ value_len   │   value      │
-│   (varint32)    │ (user_key_len)│(u64)│ (varint32)  │ (value_len)  │
+│   (varint32)    │(user_key_len)│(u64)│ (varint32)  │ (value_len)  │
 └─────────────────┴──────────────┴─────┴─────────────┴──────────────┘
-     ↑                                                               ↑
-   buf (inserted into SkipList)                                    end
+     ↑                                                       ↑
+   buf (inserted into SkipList)                             end
 
 where:
   internal_key_len = user_key_len + 8
@@ -56,6 +57,7 @@ where:
 ```
 
 **Size calculation:**
+
 ```cpp
 size_t encoded_len = 
     VarintLength(internal_key_size) +  // 1-5 bytes
@@ -79,10 +81,10 @@ void MemTable::Add(SequenceNumber seq, ValueType type,
     size_t encoded_len = VarintLength(internal_key_size) +
                          internal_key_size + 
                          VarintLength(val_size) + val_size;
-    
+  
     // Step 2: Allocate from Arena (single allocation)
     char* buf = arena_.Allocate(encoded_len);
-    
+  
     // Step 3: Encode entry
     char* p = EncodeVarint32(buf, internal_key_size);
     std::memcpy(p, key.data(), key_size);
@@ -91,13 +93,14 @@ void MemTable::Add(SequenceNumber seq, ValueType type,
     p += 8;
     p = EncodeVarint32(p, val_size);
     std::memcpy(p, value.data(), val_size);
-    
+  
     // Step 4: Insert pointer into SkipList
     table_.Insert(buf);
 }
 ```
 
 **Example:**
+
 ```plaintext
 Input:
   sequence = 100
@@ -124,27 +127,27 @@ bool MemTable::Get(const LookupKey& key, std::string* value, Status* s)
 {
     // Step 1: Get memtable_key from LookupKey
     Slice memkey = key.memtable_key();
-    
+  
     // Step 2: Seek to first entry >= memkey
     Table::Iterator iter(&table_);
     iter.Seek(memkey.data());
-    
+  
     if (iter.Valid()) {
         const char* entry = iter.key();
-        
+      
         // Step 3: Parse entry and extract internal_key
         uint32_t key_length;
         const char* key_ptr = GetVarint32Ptr(entry, entry + 5, &key_length);
-        
+      
         // Step 4: Compare user_key
         if (comparator_.user_comparator()->Compare(
                 Slice(key_ptr, key_length - 8),  // Extract user_key
                 key.user_key()) == 0) {
-            
+          
             // Step 5: Check type in tag
             uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);
             ValueType type = static_cast<ValueType>(tag & 0xff);
-            
+          
             switch (type) {
                 case kTypeValue: {
                     // Step 6: Extract value
@@ -163,6 +166,7 @@ bool MemTable::Get(const LookupKey& key, std::string* value, Status* s)
 ```
 
 **Search example:**
+
 ```plaintext
 Query: user_key = "foo", sequence = 200
 
@@ -197,16 +201,16 @@ MemTable's SkipList compares `const char*` pointers, not InternalKey objects.
 ```cpp
 struct KeyComparator {
     const InternalKeyComparator comparator;
-    
+  
     explicit KeyComparator(const InternalKeyComparator& c) 
         : comparator(c) {}
-    
+  
     // Compare two entry pointers
     int operator()(const char* aptr, const char* bptr) const {
         // Extract InternalKey from length-prefixed encoding
         Slice a = GetLengthPrefixedSlice(aptr);
         Slice b = GetLengthPrefixedSlice(bptr);
-        
+      
         // Use InternalKeyComparator
         return comparator.Compare(a, b);
     }
@@ -214,6 +218,7 @@ struct KeyComparator {
 ```
 
 **How it works:**
+
 ```plaintext
 aptr → [0B 66 6F 6F 64 00 00 00 00 00 00 01 03 62 61 72]
         └─ internal_key_len=11
@@ -239,9 +244,9 @@ class MemTable {
 public:
     explicit MemTable(const InternalKeyComparator& cmp)
         : comparator_(cmp), refs_(0), table_(comparator_, &arena_) {}
-    
+  
     void Ref() { ++refs_; }
-    
+  
     void Unref() {
         --refs_;
         assert(refs_ >= 0);
@@ -249,16 +254,17 @@ public:
             delete this;  // Self-destruct
         }
     }
-    
+  
 private:
     ~MemTable() { assert(refs_ == 0); }  // Private destructor
-    
+  
     int refs_;
     // ...
 };
 ```
 
 **Usage pattern:**
+
 ```cpp
 // DBImpl holds MemTable
 MemTable* mem_ = new MemTable(comparator);
@@ -277,6 +283,7 @@ imm_->Unref();  // refs_ = 0 → delete this
 ```
 
 **Why reference counting?**
+
 - Multiple components may hold MemTable (DBImpl, iterators, compaction)
 - Allows safe concurrent reads during compaction
 - Prevents premature deletion
@@ -307,6 +314,7 @@ Node* SkipList::NewNode(const Key& key, int height) {
 ```
 
 **Memory layout:**
+
 ```plaintext
 Arena blocks:
 ┌──────────────────────────────────────────────┐
@@ -327,6 +335,7 @@ Arena blocks:
 ```
 
 **Benefits:**
+
 - No per-object allocation overhead
 - Better cache locality
 - Fast allocation (bump-pointer in most cases)
@@ -341,26 +350,26 @@ class MemTableIterator : public Iterator {
 public:
     explicit MemTableIterator(MemTable::Table* table) 
         : iter_(table) {}
-    
+  
     bool Valid() const override { return iter_.Valid(); }
     void Next() override { iter_.Next(); }
     void Prev() override { iter_.Prev(); }
     void SeekToFirst() override { iter_.SeekToFirst(); }
     void SeekToLast() override { iter_.SeekToLast(); }
-    
+  
     void Seek(const Slice& target) override {
         iter_.Seek(EncodeKey(&tmp_, target));
     }
-    
+  
     Slice key() const override {
         return GetLengthPrefixedSlice(iter_.key());
     }
-    
+  
     Slice value() const override {
         Slice key_slice = GetLengthPrefixedSlice(iter_.key());
         return GetLengthPrefixedSlice(key_slice.data() + key_slice.size());
     }
-    
+  
 private:
     MemTable::Table::Iterator iter_;  // SkipList::Iterator
     std::string tmp_;  // Scratch space for encoding
@@ -378,15 +387,18 @@ size_t MemTable::ApproximateMemoryUsage() {
 ```
 
 **What's counted:**
+
 - All Arena blocks (entry data + SkipList nodes)
 - Block overhead (`sizeof(char*)` per block)
 
 **What's NOT counted:**
+
 - MemTable object itself (`sizeof(MemTable)`)
 - KeyComparator
 - SkipList metadata (head node is in Arena)
 
 **Usage:**
+
 ```cpp
 // DBImpl decides when to create immutable MemTable
 if (mem_->ApproximateMemoryUsage() > options_.write_buffer_size) {
@@ -404,21 +416,25 @@ if (mem_->ApproximateMemoryUsage() > options_.write_buffer_size) {
 ### Why `const char*` instead of Key objects?
 
 **Rejected design:**
+
 ```cpp
 using Table = SkipList<InternalKey, Comparator>;
 ```
 
 **Problems:**
+
 - Each node stores a copy of InternalKey
 - Expensive key copies during insertion
 - Separate allocation for value
 
 **Chosen design:**
+
 ```cpp
 using Table = SkipList<const char*, KeyComparator>;
 ```
 
 **Benefits:**
+
 - Single allocation for key + value + metadata
 - Zero-copy insertion (just pointer)
 - Arena-friendly (variable-size data)
@@ -426,6 +442,7 @@ using Table = SkipList<const char*, KeyComparator>;
 ### Why length-prefixed encoding?
 
 **Alternative: Fixed struct**
+
 ```cpp
 struct Entry {
     uint32_t key_len;
@@ -435,11 +452,13 @@ struct Entry {
 ```
 
 **Problems:**
+
 - Wastes space for small keys/values
 - Alignment padding
 - Harder to extend format
 
 **Length-prefixed (varint) benefits:**
+
 - Compact (1 byte for lengths < 128)
 - Self-describing
 - Easy to parse forward
@@ -447,12 +466,14 @@ struct Entry {
 ### Why Arena for MemTable?
 
 **Benefits:**
+
 - Fast allocation (no malloc overhead)
 - No fragmentation
 - Bulk deallocation
 - Cache-friendly (sequential allocations)
 
 **Trade-offs:**
+
 - Cannot delete individual entries
 - Memory held until entire MemTable is freed
 - OK for MemTable because it's immutable after becoming `imm_`
@@ -461,16 +482,18 @@ struct Entry {
 
 ## Performance Characteristics
 
-| Operation | Time Complexity | Notes |
-|-----------|----------------|-------|
-| Add | O(log N) | SkipList insertion |
-| Get | O(log N) | SkipList search |
-| Iterator creation | O(1) | Lightweight wrapper |
-| Iterator advance | O(1) amortized | SkipList traversal |
-| Memory usage | O(N) | Linear in data size |
-| Destruction | O(B) | B = number of Arena blocks |
+
+| Operation         | Time Complexity | Notes                      |
+| ----------------- | --------------- | -------------------------- |
+| Add               | O(log N)        | SkipList insertion         |
+| Get               | O(log N)        | SkipList search            |
+| Iterator creation | O(1)            | Lightweight wrapper        |
+| Iterator advance  | O(1) amortized  | SkipList traversal         |
+| Memory usage      | O(N)            | Linear in data size        |
+| Destruction       | O(B)            | B = number of Arena blocks |
 
 **Space overhead:**
+
 ```plaintext
 Per entry:
   - Varint lengths: 2-10 bytes (typically 2)
@@ -483,4 +506,3 @@ For 1M entries of 100 bytes each:
   Overhead: ~26-50 MB
   Total: ~126-150 MB
 ```
-
