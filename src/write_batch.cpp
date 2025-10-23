@@ -38,7 +38,7 @@ namespace prism
 		Slice input(rep_);
 		if (input.size() < kHeader)
 		{
-			return Corruption("malformed WriteBatch (too small)");
+			return Status::Corruption("malformed WriteBatch (too small)");
 		}
 
 		input.remove_prefix(kHeader);
@@ -58,7 +58,7 @@ namespace prism
 				}
 				else
 				{
-					return Corruption("bad WriteBatch Put");
+					return Status::Corruption("bad WriteBatch Put");
 				}
 				break;
 			case static_cast<char>(ValueType::kTypeDeletion):
@@ -68,20 +68,20 @@ namespace prism
 				}
 				else
 				{
-					return Corruption("bad WriteBatch Delete");
+					return Status::Corruption("bad WriteBatch Delete");
 				}
 				break;
 			default:
-				return Corruption("unknown WriteBatch tag");
+				return Status::Corruption("unknown WriteBatch tag");
 			}
 		}
 		if (found != WriteBatchInternal::Count(this))
 		{
-			return Corruption("WriteBatch has wrong count");
+			return Status::Corruption("WriteBatch has wrong count");
 		}
 		else
 		{
-			return Ok();
+			return Status::OK();
 		}
 	}
 
