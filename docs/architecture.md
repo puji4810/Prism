@@ -5,16 +5,16 @@
 ```plaintext
 ┌────────────────────────────────────────────────────────────┐
 │                      User API Layer                        │
-│  DB::Open(), DB::Put(), DB::Get(), DB::Delete()           │
+│  DB::Open(), DB::Put(), DB::Get(), DB::Delete()            │
 └────────────────────────────────────────────────────────────┘
                           │
                           ▼
 ┌────────────────────────────────────────────────────────────┐
 │                        DBImpl                              │
-│  - Manages MemTable (mem_ / imm_)                         │
-│  - Coordinates WAL (Write-Ahead Log)                      │
-│  - Sequence number management                             │
-│  - Background compaction (future)                         │
+│  - Manages MemTable (mem_ / imm_)                          │
+│  - Coordinates WAL (Write-Ahead Log)                       │
+│  - Sequence number management                              │
+│  - Background compaction (future)                          │
 └────────────────────────────────────────────────────────────┘
           │                    │                    │
           ▼                    ▼                    ▼
@@ -58,6 +58,7 @@
 ```
 
 **Key points:**
+
 - **WAL first**: Ensures durability before in-memory update
 - **Batch atomic**: Multiple operations commit together
 - **Sequence number**: Monotonically increasing for MVCC
@@ -95,6 +96,7 @@
 ```
 
 **Key points:**
+
 - **Newest first**: MemTable → Immutable MemTable → SSTables
 - **Short-circuit**: Return immediately on first match
 - **Snapshot isolation**: LookupKey includes sequence number
@@ -125,6 +127,7 @@
 ```
 
 **Key points:**
+
 - **Idempotent**: Replaying same record multiple times is safe
 - **Sequence tracking**: Ensures monotonicity after restart
 - **No data loss**: All committed writes are in WAL
@@ -138,11 +141,13 @@
 **Purpose:** In-memory write buffer
 
 **Implementation:**
+
 - SkipList (sorted map)
 - Arena allocator (memory pool)
 - InternalKey encoding (MVCC)
 
 **Characteristics:**
+
 - Fast writes: O(log N)
 - Fast reads: O(log N)
 - Sorted iteration
@@ -151,6 +156,7 @@
 **Size limit:** Configured by `write_buffer_size` (default 4MB in LevelDB)
 
 **State transitions:**
+
 ```plaintext
 mem_ (active) → imm_ (immutable) → compacted to SSTable → deleted
 ```
@@ -160,12 +166,14 @@ mem_ (active) → imm_ (immutable) → compacted to SSTable → deleted
 **Purpose:** Ordered in-memory index
 
 **Properties:**
+
 - Probabilistic balanced tree
 - Expected O(log N) search/insert
 - No rebalancing needed
 - Lock-free reads (with memory barriers)
 
 **Implementation details:**
+
 - Key type: `const char*` (pointer to encoded entry)
 - Max height: 12 levels
 - Branching factor: 4 (25% probability of next level)
@@ -176,15 +184,18 @@ mem_ (active) → imm_ (immutable) → compacted to SSTable → deleted
 **Purpose:** Fast memory allocator
 
 **Strategy:**
+
 - Bump-pointer allocation (fast path)
 - Block-based (4KB default)
 - No individual free (bulk deallocation)
 
 **Usage:**
+
 - MemTable entries (key + value + metadata)
 - SkipList nodes (pointers)
 
 **Benefits:**
+
 - Zero malloc overhead for small objects
 - Cache-friendly (sequential allocation)
 - Fast destruction (free blocks, not objects)
@@ -194,12 +205,14 @@ mem_ (active) → imm_ (immutable) → compacted to SSTable → deleted
 **Purpose:** Atomic batch of operations
 
 **Format:**
+
 ```
 WriteBatch := sequence (8 bytes) | count (4 bytes) | records
 Record := kTypeValue key value | kTypeDeletion key
 ```
 
 **Uses:**
+
 - User API batching
 - WAL format
 - Replication unit (future Raft integration)
@@ -209,16 +222,19 @@ Record := kTypeValue key value | kTypeDeletion key
 **Purpose:** Write-Ahead Log for durability
 
 **Format:**
+
 ```
 Block := Record*
 Record := checksum | length | type | data
 ```
 
 **Types:**
+
 - FULL: Complete WriteBatch
 - FIRST, MIDDLE, LAST: Fragmented WriteBatch
 
 **Properties:**
+
 - 32KB block size
 - CRC32C checksums
 - Handles spanning records
@@ -247,6 +263,7 @@ DBImpl
 ```
 
 **Lifetime management:**
+
 - **MemTable**: Reference counted (Ref/Unref)
 - **Arena**: Owned by MemTable, destroyed with it
 - **SkipList**: Embedded in MemTable
@@ -261,11 +278,13 @@ DBImpl
 **Purpose:** Compact integer representation
 
 **Format:**
+
 - 1 byte if value < 128
 - 2 bytes if value < 16384
 - Up to 5 bytes for uint32
 
 **Used for:**
+
 - Key lengths
 - Value lengths
 - Record counts
@@ -275,6 +294,7 @@ DBImpl
 **Purpose:** Fast decoding, known size
 
 **Used for:**
+
 - Sequence numbers (8 bytes)
 - Tags (8 bytes)
 - Checksums (4 bytes)
@@ -285,6 +305,7 @@ DBImpl
 **Format:** `varint32(len) | bytes[len]`
 
 **Used for:**
+
 - Keys in WriteBatch
 - Values in WriteBatch
 - Internal keys in MemTable
@@ -327,7 +348,7 @@ Write operation:
   2. Write batch to WAL
   3. Apply batch to MemTable
      - Each operation gets sequence++
-     
+   
 Read operation:
   LookupKey lkey(user_key, last_sequence_);
   // Sees all committed writes
@@ -347,14 +368,17 @@ Snapshot (future):
 ### Status and Result<T>
 
 **Status:** `std::expected<void, Error>`
+
 - Used for operations that don't return values
 - Examples: Put, Delete, Write
 
 **Result<T>:** `std::expected<T, Error>`
+
 - Used for operations that return values
 - Examples: Get returns `Result<std::string>`
 
 **Error types:**
+
 ```cpp
 enum class ErrorCode {
     OK,
@@ -367,6 +391,7 @@ enum class ErrorCode {
 ```
 
 **Usage:**
+
 ```cpp
 // Writing
 Status s = db->Put(key, value);
@@ -388,10 +413,12 @@ if (result.has_value()) {
 ## Concurrency Model (Current)
 
 **Current implementation:**
+
 - Single-threaded (no locking)
 - External synchronization required
 
 **Future multi-threaded design:**
+
 ```plaintext
 Writers:
   - Mutex around DBImpl::Write()
@@ -418,11 +445,13 @@ Compaction:
 **Purpose:** On-disk sorted key-value storage
 
 **Structure:**
+
 ```
 SSTable := Data Blocks | Meta Block | Index Block | Footer
 ```
 
 **Properties:**
+
 - Immutable
 - Bloom filter for fast negative lookups
 - Binary searchable index
@@ -433,6 +462,7 @@ SSTable := Data Blocks | Meta Block | Index Block | Footer
 **Purpose:** Manage multiple SSTable versions
 
 **Responsibilities:**
+
 - Track active SSTables per level
 - Coordinate compaction
 - Provide consistent snapshots
@@ -442,10 +472,12 @@ SSTable := Data Blocks | Meta Block | Index Block | Footer
 **Purpose:** Merge MemTable/SSTables, remove old versions
 
 **Types:**
+
 - Minor compaction: MemTable → Level 0 SSTable
 - Major compaction: Level N → Level N+1
 
 **Goals:**
+
 - Reclaim space (remove deleted/overwritten keys)
 - Maintain LSM-tree invariants
 - Bound read amplification
@@ -470,23 +502,22 @@ SSTable := Data Blocks | Meta Block | Index Block | Footer
 struct Options {
     // MemTable
     size_t write_buffer_size = 4 * 1024 * 1024;  // 4MB
-    
+  
     // WAL
     bool sync = false;  // fsync after every write?
-    
+  
     // Compaction
     int max_open_files = 1000;
     size_t block_size = 4 * 1024;  // 4KB
     int block_restart_interval = 16;
-    
+  
     // Compression
     CompressionType compression = kSnappyCompression;
-    
+  
     // Cache
     size_t block_cache_size = 8 * 1024 * 1024;  // 8MB
-    
+  
     // Comparator
     const Comparator* comparator = BytewiseComparator();
 };
 ```
-
