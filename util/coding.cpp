@@ -104,14 +104,32 @@ namespace prism
 		return len;
 	}
 
-	bool GetVarint32(Slice* src, uint32_t* value) { return ConsumeVarint32(src, value); }
+	bool GetVarint32(Slice* src, uint32_t* value)
+	{
+		const char* p = src->data();
+		const char* limit = p + src->size();
+		const char* q = GetVarint32Ptr(p, limit, value);
+		if (!q)
+			return false;
+		src->remove_prefix(static_cast<size_t>(q - p));
+		return true;
+	}
 
-	bool GetVarint64(Slice* src, uint64_t* value) { return ConsumeVarint64(src, value); }
+	bool GetVarint64(Slice* src, uint64_t* value)
+	{
+		const char* p = src->data();
+		const char* limit = p + src->size();
+		const char* q = GetVarint64Ptr(p, limit, value);
+		if (!q)
+			return false;
+		src->remove_prefix(static_cast<size_t>(q - p));
+		return true;
+	}
 
 	bool GetLengthPrefixedSlice(prism::Slice* src, prism::Slice* out)
 	{
 		uint32_t len = 0;
-		if (!ConsumeVarint32(src, &len))
+		if (!GetVarint32(src, &len))
 			return false;
 		if (src->size() < static_cast<size_t>(len))
 			return false;
@@ -138,36 +156,6 @@ namespace prism
 		return nullptr;
 	}
 
-	bool ConsumeVarint32(Slice* in, uint32_t* v)
-	{
-		const char* p = in->data();
-		const char* limit = p + in->size();
-		const char* q = GetVarint32Ptr(p, limit, v);
-		if (!q)
-			return false;
-		in->remove_prefix(static_cast<size_t>(q - p));
-		return true;
-	}
-
-	std::optional<uint32_t> TryDecodeVarint32(Slice in)
-	{
-		uint32_t v = 0;
-		if (ConsumeVarint32(&in, &v))
-			return v;
-		return std::nullopt;
-	}
-
-	bool ConsumeVarint64(Slice* in, uint64_t* v)
-	{
-		const char* p = in->data();
-		const char* limit = p + in->size();
-		const char* q = GetVarint64Ptr(p, limit, v);
-		if (!q)
-			return false;
-		in->remove_prefix(static_cast<size_t>(q - p));
-		return true;
-	}
-
 	const char* GetVarint64Ptr(const char* p, const char* limit, uint64_t* value)
 	{
 		uint64_t result = 0;
@@ -190,10 +178,18 @@ namespace prism
 		return nullptr;
 	}
 
+	std::optional<uint32_t> TryDecodeVarint32(Slice in)
+	{
+		uint32_t v = 0;
+		if (GetVarint32(&in, &v))
+			return v;
+		return std::nullopt;
+	}
+
 	std::optional<uint64_t> TryDecodeVarint64(Slice in)
 	{
 		uint64_t v = 0;
-		if (ConsumeVarint64(&in, &v))
+		if (GetVarint64(&in, &v))
 			return v;
 		return std::nullopt;
 	}
