@@ -68,12 +68,6 @@ namespace prism
 	// get the varint64 from the pointer, and advance the pointer
 	const char* GetVarint64Ptr(const char* p, const char* limit, uint64_t* value);
 
-	// consume the varint32 from the slice, and advance the slice
-	bool ConsumeVarint32(Slice* in, uint32_t* v);
-
-	// consume the varint64 from the slice, and advance the slice
-	bool ConsumeVarint64(Slice* in, uint64_t* v);
-
 	// try to decode the varint32 from the slice, and return the value if successful
 	std::optional<uint32_t> TryDecodeVarint32(Slice in);
 
