@@ -5,6 +5,7 @@
 #include "arena.h"
 #include "dbformat.h"
 #include "status.h"
+#include "iterator.h"
 
 // See docs/memtable.md for more details.
 // MemTable
@@ -33,8 +34,10 @@ namespace prism
 		void Unref();
 
 		void Add(SequenceNumber seq, ValueType type, const Slice& key, const Slice& value);
-		bool Get(const LookupKey& key, std::string* value, Status* s);
-		size_t ApproximateMemoryUsage();
+		[[nodiscard]] bool Get(const LookupKey& key, std::string* value, Status* s);
+		size_t ApproximateMemoryUsage() const;
+
+		Iterator* NewIterator() const;
 
 	private:
 		~MemTable();
@@ -45,7 +48,7 @@ namespace prism
 			    : comparator(c)
 			{
 			}
-			int operator()(const char* a, const char* b) const;
+			int operator()(const char* a, const char* b) const noexcept;
 		};
 
 		friend class MemTableIterator;

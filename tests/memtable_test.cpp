@@ -3,6 +3,8 @@
 #include "comparator.h"
 #include <gtest/gtest.h>
 #include <string>
+#include <vector>
+#include <tuple>
 
 namespace prism
 {
@@ -294,6 +296,174 @@ namespace prism
 		std::string value = Get(binary_key, 100, &s);
 		ASSERT_EQ(binary_value, value);
 		ASSERT_TRUE(s.ok());
+	}
+
+	TEST_F(MemTableTest, IteratorEmpty)
+	{
+		// No inserts
+		Iterator* it = memtable_->NewIterator();
+		it->SeekToFirst();
+		ASSERT_FALSE(it->Valid());
+		delete it;
+	}
+
+	TEST_F(MemTableTest, IteratorForwardOrder)
+	{
+		// Insert a few keys with versions and a deletion in between
+		Add(100, kTypeValue, "a", "va1");
+		Add(300, kTypeValue, "b", "vb3");
+		Add(250, kTypeDeletion, "b", "");
+		Add(200, kTypeValue, "b", "vb2");
+		Add(500, kTypeValue, "c", "vc5");
+
+		Iterator* it = memtable_->NewIterator();
+		it->SeekToFirst();
+
+		std::vector<std::tuple<std::string, SequenceNumber, ValueType, std::string>> got;
+		for (; it->Valid(); it->Next())
+		{
+			ParsedInternalKey pik;
+			ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+			got.emplace_back(pik.user_key.ToString(), pik.sequence, pik.type, std::string(it->value().data(), it->value().size()));
+		}
+		delete it;
+
+		ASSERT_EQ(got.size(), 5u);
+		// Expected order: user_key asc; within same user_key, sequence desc; value/deletion encoded accordingly
+		EXPECT_EQ(std::get<0>(got[0]), "a");
+		EXPECT_EQ(std::get<1>(got[0]), 100u);
+		EXPECT_EQ(std::get<2>(got[0]), kTypeValue);
+		EXPECT_EQ(std::get<3>(got[0]), "va1");
+		EXPECT_EQ(std::get<0>(got[1]), "b");
+		EXPECT_EQ(std::get<1>(got[1]), 300u);
+		EXPECT_EQ(std::get<2>(got[1]), kTypeValue);
+		EXPECT_EQ(std::get<3>(got[1]), "vb3");
+		EXPECT_EQ(std::get<0>(got[2]), "b");
+		EXPECT_EQ(std::get<1>(got[2]), 250u);
+		EXPECT_EQ(std::get<2>(got[2]), kTypeDeletion);
+		EXPECT_EQ(std::get<3>(got[2]), "");
+		EXPECT_EQ(std::get<0>(got[3]), "b");
+		EXPECT_EQ(std::get<1>(got[3]), 200u);
+		EXPECT_EQ(std::get<2>(got[3]), kTypeValue);
+		EXPECT_EQ(std::get<3>(got[3]), "vb2");
+		EXPECT_EQ(std::get<0>(got[4]), "c");
+		EXPECT_EQ(std::get<1>(got[4]), 500u);
+		EXPECT_EQ(std::get<2>(got[4]), kTypeValue);
+		EXPECT_EQ(std::get<3>(got[4]), "vc5");
+	}
+
+	TEST_F(MemTableTest, IteratorSeekAndPrev)
+	{
+		Add(100, kTypeValue, "a", "va1");
+		Add(300, kTypeValue, "b", "vb3");
+		Add(250, kTypeDeletion, "b", "");
+		Add(200, kTypeValue, "b", "vb2");
+		Add(500, kTypeValue, "c", "vc5");
+
+		// Seek to first entry of user_key "b" using an internal-key target
+		InternalKey seek_b(Slice("b"), kMaxSequenceNumber, kValueTypeForSeek);
+		Iterator* it = memtable_->NewIterator();
+		it->Seek(seek_b.Encode());
+		ASSERT_TRUE(it->Valid());
+
+		ParsedInternalKey pik;
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "b");
+		EXPECT_EQ(pik.sequence, 300u);
+		EXPECT_EQ(pik.type, kTypeValue);
+		EXPECT_EQ(std::string(it->value().data(), it->value().size()), "vb3");
+
+		// Next should move to next internal entry of the same user_key: b@250 (deletion)
+		it->Next();
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "b");
+		EXPECT_EQ(pik.sequence, 250u);
+		EXPECT_EQ(pik.type, kTypeDeletion);
+
+		// Next to b@200 (value)
+		it->Next();
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "b");
+		EXPECT_EQ(pik.sequence, 200u);
+		EXPECT_EQ(pik.type, kTypeValue);
+		EXPECT_EQ(std::string(it->value().data(), it->value().size()), "vb2");
+
+		// Next to next user key: c@500
+		it->Next();
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "c");
+		EXPECT_EQ(pik.sequence, 500u);
+
+		// Prev back through b entries: b@200 -> b@250 -> b@300 -> a@100
+		it->Prev();
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "b");
+		EXPECT_EQ(pik.sequence, 200u);
+
+		it->Prev();
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "b");
+		EXPECT_EQ(pik.sequence, 250u);
+		EXPECT_EQ(pik.type, kTypeDeletion);
+
+		it->Prev();
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "b");
+		EXPECT_EQ(pik.sequence, 300u);
+
+		it->Prev();
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "a");
+		EXPECT_EQ(pik.sequence, 100u);
+
+		delete it;
+	}
+
+	TEST_F(MemTableTest, IteratorDeletionEntryVisible)
+	{
+		Add(100, kTypeValue, "foo", "v1");
+		Add(200, kTypeDeletion, "foo", "");
+		Add(300, kTypeValue, "foo", "v2");
+
+		Iterator* it = memtable_->NewIterator();
+		it->SeekToFirst();
+
+		// Order: foo@300 (value), foo@200 (deletion), foo@100 (value)
+		ParsedInternalKey pik;
+
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "foo");
+		EXPECT_EQ(pik.sequence, 300u);
+		EXPECT_EQ(pik.type, kTypeValue);
+		EXPECT_EQ(std::string(it->value().data(), it->value().size()), "v2");
+
+		it->Next();
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "foo");
+		EXPECT_EQ(pik.sequence, 200u);
+		EXPECT_EQ(pik.type, kTypeDeletion);
+		EXPECT_TRUE(it->value().empty());
+
+		it->Next();
+		ASSERT_TRUE(it->Valid());
+		ASSERT_TRUE(ParseInternalKey(it->key(), &pik));
+		EXPECT_EQ(pik.user_key.ToString(), "foo");
+		EXPECT_EQ(pik.sequence, 100u);
+		EXPECT_EQ(pik.type, kTypeValue);
+		EXPECT_EQ(std::string(it->value().data(), it->value().size()), "v1");
+
+		it->Next();
+		EXPECT_FALSE(it->Valid());
+		delete it;
 	}
 
 } // namespace prism
