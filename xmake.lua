@@ -8,6 +8,11 @@ set_languages("cxx23")
 local common_files = {"src/*.cpp", "util/*.cpp"}
 local common_includedirs = {"include", "src", "util"}
 
+if is_mode("debug") then
+    add_cxflags("-fsanitize=address", "-fsanitize=leak", "-fno-omit-frame-pointer", {force = true})
+    add_ldflags("-fsanitize=address", "-fsanitize=leak", {force = true})
+end
+
 -- include tests subdirectory targets
 includes("tests/xmake.lua")
 
