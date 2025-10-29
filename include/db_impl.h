@@ -4,7 +4,7 @@
 #include "db.h"
 #include "log_writer.h"
 #include "log_reader.h"
-#include <unordered_map>
+#include "memtable.h"
 
 namespace prism
 {
@@ -23,10 +23,11 @@ namespace prism
 
 		Status ApplyBatch(WriteBatch& batch);
 
-		std::unordered_map<std::string, std::string> store_;
+		MemTable* mem_;
 		log::Writer writer_;
 		log::Reader reader_;
-		uint64_t sequence_ = 0;
+		SequenceNumber sequence_ = 0;
+		InternalKeyComparator internal_comparator_;
 	};
 } // namespace prism
 

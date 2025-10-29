@@ -1,4 +1,5 @@
 #include "db_impl.h"
+#include "comparator.h"
 #include "dbformat.h"
 #include "slice.h"
 #include "write_batch.h"
@@ -12,12 +13,12 @@ namespace prism
 
 	// https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#c12-dont-make-data-members-const-or-references-in-a-copyable-or-movable-type
 	// Data members that are not const or references should not be made copyable or movable.
-	// Here we make sure that the store_ is not copyable or movable.
 	class DBImpl::RecoveryHandler: public WriteBatch::Handler
 	{
 	public:
-		RecoveryHandler(std::unordered_map<std::string, std::string>& store)
-		    : store_(store)
+		RecoveryHandler(MemTable* mem, SequenceNumber start)
+		    : mem_(mem)
+		    , sequence_(start)
 		{
 		}
 		RecoveryHandler(const RecoveryHandler&) = delete;
@@ -25,12 +26,13 @@ namespace prism
 		RecoveryHandler(RecoveryHandler&&) = delete;
 		RecoveryHandler& operator=(RecoveryHandler&&) = delete;
 
-		void Put(const Slice& key, const Slice& value) override { store_[key.ToString()] = value.ToString(); }
+		void Put(const Slice& key, const Slice& value) override { mem_->Add(sequence_++, kTypeValue, key, value); }
 
-		void Delete(const Slice& key) override { store_.erase(key.ToString()); }
+		void Delete(const Slice& key) override { mem_->Add(sequence_++, kTypeDeletion, key, Slice()); }
 
 	private:
-		std::unordered_map<std::string, std::string>& store_;
+		MemTable* mem_;
+		SequenceNumber sequence_;
 	};
 
 	DB::~DB() = default;
@@ -40,10 +42,12 @@ namespace prism
 	DBImpl::DBImpl(const std::string& dbname)
 	    : writer_{ dbname }
 	    , reader_{ dbname }
+	    , internal_comparator_(BytewiseComparator())
 	{
-		RecoveryHandler handler(store_);
-		Slice record;
+		mem_ = new MemTable(internal_comparator_);
+		mem_->Ref();
 
+		Slice record;
 		while (reader_.ReadRecord(&record))
 		{
 			if (record.empty())
@@ -52,25 +56,30 @@ namespace prism
 			WriteBatch batch;
 			WriteBatchInternal::SetContents(&batch, record);
 
-			auto batch_seq = WriteBatchInternal::Sequence(&batch);
-			auto batch_count = WriteBatchInternal::Count(&batch);
-			if (batch_seq + batch_count > sequence_)
+			const auto base = WriteBatchInternal::Sequence(&batch);
+			const auto cnt = WriteBatchInternal::Count(&batch);
+
+			RecoveryHandler handler(mem_, base);
+			Status s = batch.Iterate(&handler); // Iterate use the method in handler
+			if (!s.ok())
 			{
-				sequence_ = batch_seq + batch_count;
+				// TODO: handle error
 			}
 
-			auto status = batch.Iterate(&handler);
-			if (!status.ok())
-			{
-			}
+			if (base + cnt > sequence_)
+				sequence_ = base + cnt;
 		}
 	}
 
-	DBImpl::~DBImpl() = default;
+	DBImpl::~DBImpl()
+	{
+		if (mem_)
+			mem_->Unref();
+	}
 
 	Status DBImpl::ApplyBatch(WriteBatch& batch)
 	{
-		RecoveryHandler handler(store_);
+		RecoveryHandler handler(mem_, WriteBatchInternal::Sequence(&batch));
 		return batch.Iterate(&handler);
 	}
 
@@ -94,13 +103,14 @@ namespace prism
 
 	Status DBImpl::Get(const Slice& key, std::string* value)
 	{
-		auto it = store_.find(key.ToString());
-		if (it != store_.end())
+		const SequenceNumber snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
+		LookupKey lkey(key, snapshot);
+		Status s;
+		if (mem_->Get(lkey, value, &s))
 		{
-			*value = it->second;
-			return Status::OK();
+			return s; // hit: OK or NotFound
 		}
-		return Status::NotFound("Key not found: " + key.ToString());
+		return Status::NotFound(Slice()); // miss: only MemTable, return NotFound
 	}
 
 	Status DBImpl::Delete(const Slice& key) { return DB::Delete(key); }
