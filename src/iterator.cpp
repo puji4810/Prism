@@ -75,5 +75,7 @@ namespace prism
 
 	Iterator* NewEmptyIterator() { return new EmptyIterator(Status::OK()); }
 
+	std::unique_ptr<Iterator> NewUniqueEmptyIterator() { return std::make_unique<EmptyIterator>(Status::OK()); }
+
 	Iterator* NewErrorIterator(const Status& status) { return new EmptyIterator(status); }
 }

@@ -3,6 +3,7 @@
 
 #include "slice.h"
 #include "status.h"
+#include <memory>
 
 namespace prism
 {
@@ -51,6 +52,8 @@ namespace prism
 
 	// Return an empty iterator (yields nothing).
 	Iterator* NewEmptyIterator();
+
+	std::unique_ptr<Iterator> NewUniqueEmptyIterator();
 
 	// Return an empty iterator with the specified status.
 	Iterator* NewErrorIterator(const Status& status);

@@ -6,6 +6,7 @@
 #include "dbformat.h"
 #include "status.h"
 #include "iterator.h"
+#include <memory>
 
 // See docs/memtable.md for more details.
 // MemTable
@@ -38,6 +39,7 @@ namespace prism
 		size_t ApproximateMemoryUsage() const;
 
 		Iterator* NewIterator() const;
+		std::unique_ptr<Iterator> NewUniqueIterator() const;
 
 	private:
 		~MemTable();
