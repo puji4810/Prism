@@ -2,7 +2,6 @@
 #include "arena.h"
 #include "coding.h"
 #include "slice.h"
-#include <algorithm>
 #include <utility>
 #include <cassert>
 
@@ -68,6 +67,10 @@ namespace prism
 	};
 
 	Iterator* MemTable::NewIterator() const { return new MemTableIterator(&table_); }
+
+	std::unique_ptr<Iterator> MemTable::NewUniqueIterator() const {
+		return std::make_unique<MemTableIterator>(&table_);
+	}
 
 	void MemTable::Ref() { ++refs_; }
 
