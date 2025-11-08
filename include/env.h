@@ -35,8 +35,12 @@ namespace prism
 	public:
 		Env() = default;
 
+		//C.21: If you define or =delete any copy, move, or destructor function, define or =delete them all
+		//C.67: A polymorphic class should suppress public copy/move
 		Env(const Env&) = delete;
 		Env& operator=(const Env&) = delete;
+		Env(Env&&) noexcept = delete;
+		Env& operator=(Env&&) noexcept = delete;
 
 		virtual ~Env() = default;
 
@@ -203,6 +207,8 @@ namespace prism
 
 		SequentialFile(const SequentialFile&) = delete;
 		SequentialFile& operator=(const SequentialFile&) = delete;
+		SequentialFile(SequentialFile&&) = delete;
+		SequentialFile& operator=(SequentialFile&&) = delete;
 
 		virtual ~SequentialFile() = default;
 
@@ -234,6 +240,8 @@ namespace prism
 
 		RandomAccessFile(const RandomAccessFile&) = delete;
 		RandomAccessFile& operator=(const RandomAccessFile&) = delete;
+		RandomAccessFile(RandomAccessFile&&) = delete;
+    RandomAccessFile& operator=(RandomAccessFile&&) = delete;
 
 		virtual ~RandomAccessFile() = default;
 
@@ -259,6 +267,8 @@ namespace prism
 
 		WritableFile(const WritableFile&) = delete;
 		WritableFile& operator=(const WritableFile&) = delete;
+		WritableFile(WritableFile&&) = delete;
+		WritableFile& operator=(WritableFile&&) = delete;
 
 		virtual ~WritableFile() = default;
 
@@ -276,6 +286,8 @@ namespace prism
 
 		Logger(const Logger&) = delete;
 		Logger& operator=(const Logger&) = delete;
+		Logger(Logger&&) = delete;
+		Logger& operator=(Logger&&) = delete;
 
 		virtual ~Logger() = default;
 
@@ -291,6 +303,8 @@ namespace prism
 
 		FileLock(const FileLock&) = delete;
 		FileLock& operator=(const FileLock&) = delete;
+		FileLock(FileLock&&) = delete;
+		FileLock& operator=(FileLock&&) = delete;
 
 		virtual ~FileLock() = default;
 	};
