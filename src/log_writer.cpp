@@ -1,5 +1,5 @@
 #include "log_writer.h"
-#include "crc32c/crc32c.h"
+#include "crc32.h"
 #include "log_format.h"
 #include <cstdint>
 #include <cassert>
@@ -17,7 +17,7 @@ namespace prism
 			}
 		}
 
-		static inline uint32_t Mask(uint32_t crc) { return ((crc >> 15) | (crc << 17)) + 0xa282ead8u; }
+		
 
 		Writer::Writer(std::string dest)
 		    : block_offset_(0)

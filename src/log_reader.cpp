@@ -2,18 +2,12 @@
 #include "slice.h"
 #include "log_format.h"
 #include <cstring>
-#include "crc32c/crc32c.h"
+#include "crc32.h"
 
 namespace prism
 {
 	namespace log
 	{
-		static inline uint32_t Unmask(uint32_t masked)
-		{
-			uint32_t rot = masked - 0xa282ead8u;
-			return (rot << 15) | (rot >> 17);
-		}
-
 		Reader::Reader(const std::string& src)
 		    : src_(src, std::ios::binary)
 		    , backing_store_(new char[kBlockSize])
