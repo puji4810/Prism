@@ -1,5 +1,6 @@
 #include "env.h"
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
@@ -49,7 +50,93 @@ namespace prism
 		}
 
 		Status NewSequentialFile(const std::string&, SequentialFile**) override { return Status::NotSupported("Not implemented yet"); }
-		Status NewWritableFile(const std::string&, WritableFile**) override { return Status::NotSupported("Not implemented yet"); }
+
+		class PosixWritableFile: public WritableFile
+		{
+		public:
+			PosixWritableFile(const std::string& fname, int fd)
+			    : filename_(fname)
+			    , fd_(fd)
+			{
+			}
+
+			~PosixWritableFile() override
+			{
+				if (fd_ >= 0)
+				{
+					::close(fd_);
+				}
+			}
+
+			Status Append(const Slice& data) override
+			{
+				const char* p = data.data();
+				size_t n = data.size();
+				while (n > 0)
+				{
+					ssize_t r = ::write(fd_, p, n);
+					if (r < 0)
+					{
+						if (errno == EINTR)
+						{
+							continue;
+						}
+						return Status::IOError(filename_, std::strerror(errno));
+					}
+					p += r;
+					n -= static_cast<size_t>(r);
+				}
+				return Status::OK();
+			}
+
+			Status Close() override
+			{
+				if (fd_ >= 0)
+				{
+					if (::close(fd_) != 0)
+					{
+						fd_ = -1;
+						return Status::IOError(filename_, std::strerror(errno));
+					}
+					fd_ = -1;
+				}
+				return Status::OK();
+			}
+
+			Status Flush() override
+			{
+				// Rely on OS buffering; no extra flush beyond Sync.
+				return Status::OK();
+			}
+
+			Status Sync() override
+			{
+				if (fd_ >= 0)
+				{
+					if (::fsync(fd_) != 0)
+					{
+						return Status::IOError(filename_, std::strerror(errno));
+					}
+				}
+				return Status::OK();
+			}
+
+		private:
+			std::string filename_;
+			int fd_{};
+		};
+
+		Status NewWritableFile(const std::string& fname, WritableFile** result) override
+		{
+			int fd = ::open(fname.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (fd < 0)
+			{
+				*result = nullptr;
+				return Status::IOError(fname, std::strerror(errno));
+			}
+			*result = new PosixWritableFile(fname, fd);
+			return Status::OK();
+		}
 		bool FileExists(const std::string&) override { return false; }
 		Status GetChildren(const std::string&, std::vector<std::string>*) override { return Status::NotSupported("Not implemented yet"); }
 		Status CreateDir(const std::string&) override { return Status::NotSupported("Not implemented yet"); }
