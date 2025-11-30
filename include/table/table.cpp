@@ -1,9 +1,10 @@
 #include "table.h"
+#include "cache.h"
+#include "coding.h"
 #include <cstdint>
 
 namespace prism
 {
-	
 
 	Status Table::Open(const Options& options, RandomAccessFile* file, uint64_t file_size, Table** table)
 	{
@@ -46,7 +47,7 @@ namespace prism
 			rep->file = file;
 			rep->metaindex_handle = footer.metaindex_handle();
 			rep->index_block = index_block;
-			// rep->cache_id = (options.block_cache ? options.block_cache->NewId() : 0);
+			rep->cache_id = (options.block_cache ? options.block_cache->NewId() : 0);
 			// rep->filter_data = nullptr;
 			// rep->filter = nullptr;
 			*table = new Table(rep);
@@ -60,36 +61,37 @@ namespace prism
 
 	void Table::ReadMeta(const Footer& footer)
 	{
-		// TODO
+		// TODO: filter block support
+		(void)footer;
 	}
 
 	void Table::ReadFilter(const Slice& filter_handle_value)
 	{
-		// TODO
+		// TODO: filter block support
+		(void)filter_handle_value;
 	}
 
-	static void DeleteBlock(void* arg, void* ignored) { delete reinterpret_cast<Block*>(arg); }
+	static void DeleteBlock(void* arg, void* /*ignored*/) { delete reinterpret_cast<Block*>(arg); }
 
-	// static void DeleteCachedBlock(const Slice& key, void* value)
-	// {
-	// 	Block* block = reinterpret_cast<Block*>(value);
-	// 	delete block;
-	// }
+	static void DeleteCachedBlock(const Slice& /*key*/, void* value)
+	{
+		Block* block = reinterpret_cast<Block*>(value);
+		delete block;
+	}
 
-	// static void ReleaseBlock(void* arg, void* h)
-	// {
-	// 	Cache* cache = reinterpret_cast<Cache*>(arg);
-	// 	Cache::Handle* handle = reinterpret_cast<Cache::Handle*>(h);
-	// 	cache->Release(handle);
-	// }
+	static void ReleaseBlock(void* arg, void* h)
+	{
+		Cache* cache = reinterpret_cast<Cache*>(arg);
+		Cache::Handle* handle = reinterpret_cast<Cache::Handle*>(h);
+		cache->Release(handle);
+	}
 
 	Iterator* Table::BlockReader(void* arg, const ReadOptions& options, const Slice& index_value)
 	{
 		Table* table = reinterpret_cast<Table*>(arg);
-		// TODO
-		// Cache* block_cache = table->rep_->options.block_cache;
-		// Cache::Handle* cache_handle = nullptr;
+		Cache* block_cache = table->rep_->options.block_cache;
 		Block* block = nullptr;
+		Cache::Handle* cache_handle = nullptr;
 
 		BlockHandle handle;
 		Slice input = index_value;
@@ -98,11 +100,38 @@ namespace prism
 		if (s.ok())
 		{
 			BlockContents contents;
-			// TODO: implment this case after block_cache finished
-			s = ReadBlock(table->rep_->file, options, handle, &contents);
-			if (s.ok())
+			if (block_cache != nullptr)
 			{
-				block = new Block(contents);
+				char cache_key_buffer[16];
+				EncodeFixed64(cache_key_buffer, table->rep_->cache_id);
+				EncodeFixed64(cache_key_buffer + 8, handle.offset());
+				Slice key(cache_key_buffer, sizeof(cache_key_buffer));
+
+				cache_handle = block_cache->Lookup(key);
+				if (cache_handle != nullptr)
+				{
+					block = reinterpret_cast<Block*>(block_cache->Value(cache_handle));
+				}
+				else
+				{
+					s = ReadBlock(table->rep_->file, options, handle, &contents);
+					if (s.ok())
+					{
+						block = new Block(contents);
+						if (contents.cachable && options.fill_cache)
+						{
+							cache_handle = block_cache->Insert(key, block, block->size(), &DeleteCachedBlock);
+						}
+					}
+				}
+			}
+			else
+			{
+				s = ReadBlock(table->rep_->file, options, handle, &contents);
+				if (s.ok())
+				{
+					block = new Block(contents);
+				}
 			}
 		}
 
@@ -110,8 +139,14 @@ namespace prism
 		if (block != nullptr)
 		{
 			iter = block->NewIterator(table->rep_->options.comparator);
-			// TODO: add cache cese
-			iter->RegisterCleanup(&DeleteBlock, block, nullptr);
+			if (cache_handle == nullptr)
+			{
+				iter->RegisterCleanup(&DeleteBlock, block, nullptr);
+			}
+			else
+			{
+				iter->RegisterCleanup(&ReleaseBlock, block_cache, cache_handle);
+			}
 		}
 		else
 		{
@@ -121,11 +156,11 @@ namespace prism
 		return iter;
 	}
 
-		Iterator* Table::NewIterator(const ReadOptions& options) const
-		{
-			return NewTwoLevelIterator(
-			    rep_->index_block->NewIterator(rep_->options.comparator), &Table::BlockReader, const_cast<Table*>(this), options);
-		}
+	Iterator* Table::NewIterator(const ReadOptions& options) const
+	{
+		return NewTwoLevelIterator(
+		    rep_->index_block->NewIterator(rep_->options.comparator), &Table::BlockReader, const_cast<Table*>(this), options);
+	}
 
 	uint64_t Table::ApproximateOffsetOf(const Slice& key) const
 	{
