@@ -83,6 +83,7 @@ namespace prism
 		    , elems_(0)
 		    , list_(nullptr)
 		{
+			Resize();
 		}
 
 		~HandleTable() { delete[] list_; }
