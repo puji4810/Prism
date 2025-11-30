@@ -1,5 +1,6 @@
 #include "table/table_builder.h"
 #include "table/table.h"
+#include "table_cache.h"
 #include "options.h"
 #include "env.h"
 #include "comparator.h"
@@ -135,6 +136,64 @@ TEST(TableTest, InternalGet) {
 	s = TestInternalGetHelper(*table, ro, Slice("x"), &value, &found);
 	ASSERT_TRUE(s.ok());
 	EXPECT_FALSE(found);
+
+	delete table;
+	delete raf;
+	std::filesystem::remove(fname);
+}
+
+TEST(TableTest, BlockCacheFillAndBypass) {
+	Env* env = Env::Default();
+	const std::string fname = TestFilePath();
+	std::filesystem::remove(fname);
+
+	Options options;
+	options.comparator = BytewiseComparator();
+
+	WritableFile* wf = nullptr;
+	ASSERT_TRUE(env->NewWritableFile(fname, &wf).ok());
+	{
+		TableBuilder builder(options, wf);
+		builder.Add(Slice("a"), Slice("1"));
+		builder.Add(Slice("b"), Slice("2"));
+		builder.Add(Slice("c"), Slice("3"));
+		ASSERT_TRUE(builder.Finish().ok());
+	}
+	ASSERT_TRUE(wf->Close().ok());
+	delete wf;
+
+	uint64_t file_size = std::filesystem::file_size(fname);
+	RandomAccessFile* raf = nullptr;
+	ASSERT_TRUE(env->NewRandomAccessFile(fname, &raf).ok());
+
+	std::unique_ptr<Cache> block_cache(NewLRUCache(1024 * 1024));
+	options.block_cache = block_cache.get();
+
+	Table* table = nullptr;
+	ASSERT_TRUE(Table::Open(options, raf, file_size, &table).ok());
+	ASSERT_NE(table, nullptr);
+
+	// 1) fill_cache = false -> should not populate block_cache
+	ReadOptions ro_nocache;
+	ro_nocache.fill_cache = false;
+	std::string value;
+	bool found = false;
+	Status s = TestInternalGetHelper(*table, ro_nocache, Slice("b"), &value, &found);
+	ASSERT_TRUE(s.ok());
+	EXPECT_TRUE(found);
+	EXPECT_EQ(value, "2");
+	EXPECT_EQ(block_cache->TotalCharge(), 0u);
+
+	// 2) fill_cache = true -> should populate block_cache
+	ReadOptions ro_cache;
+	ro_cache.fill_cache = true;
+	value.clear();
+	found = false;
+	s = TestInternalGetHelper(*table, ro_cache, Slice("b"), &value, &found);
+	ASSERT_TRUE(s.ok());
+	EXPECT_TRUE(found);
+	EXPECT_EQ(value, "2");
+	EXPECT_GT(block_cache->TotalCharge(), 0u);
 
 	delete table;
 	delete raf;
