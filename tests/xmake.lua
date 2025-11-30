@@ -1,7 +1,7 @@
 -- Tests build targets for Prism
 -- All test targets are defined here and included from root xmake.lua
 
-local common_files = {"$(projectdir)/src/*.cpp", "$(projectdir)/util/*.cpp"}
+local common_files = {"$(projectdir)/src/*.cpp", "$(projectdir)/util/*.cpp", "$(projectdir)/include/table/*.cpp"}
 local common_includedirs = {"$(projectdir)/include", "$(projectdir)/src", "$(projectdir)/util"}
 
 add_packages("crc32c", "gtest")
@@ -37,6 +37,7 @@ target("dbformat_test")
     add_files("$(projectdir)/tests/dbformat_test.cpp")
     add_files("$(projectdir)/src/*.cpp")
     add_files("$(projectdir)/util/*.cpp")
+    add_files("$(projectdir)/include/table/*.cpp")
     add_includedirs("$(projectdir)/include", "$(projectdir)/util")
     add_tests("default")
 
@@ -52,6 +53,7 @@ target("memtable_test")
     add_files("$(projectdir)/tests/memtable_test.cpp")
     add_files("$(projectdir)/src/*.cpp")
     add_files("$(projectdir)/util/*.cpp")
+    add_files("$(projectdir)/include/table/*.cpp")
     add_includedirs("$(projectdir)/include", "$(projectdir)/util")
     add_tests("default")
 
