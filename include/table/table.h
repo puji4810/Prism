@@ -79,9 +79,8 @@ namespace prism
 		// Calls (*handle_result)(arg, ...) with the entry found after a call
 		// to Seek(key).  May not make such a call if filter policy says
 		// that key is not present.
-		template <class HandleResult>
-		Status InternalGet(const ReadOptions&, const Slice& key, HandleResult&& handle_result);
-
+		using HandleResult = Status (*)(void*, const Slice& k, const Slice& v);
+		Status InternalGet(const ReadOptions& options, const Slice& key, void* arg, HandleResult handle_result);
 		void ReadMeta(const Footer& footer);
 		void ReadFilter(const Slice& filter_handle_value);
 
@@ -109,11 +108,9 @@ namespace prism
 
 } // namespace prism
 
-// Template method implementations
 namespace prism
 {
-	template <class HandleResult>
-	inline Status Table::InternalGet(const ReadOptions& options, const Slice& key, HandleResult&& handle_result)
+	inline Status Table::InternalGet(const ReadOptions& options, const Slice& key, void* arg, HandleResult handle_result)
 	{
 		// TODO: add filter and block cache optimization in the future
 		Status s;
@@ -125,7 +122,7 @@ namespace prism
 			block_iter->Seek(key);
 			if (block_iter->Valid())
 			{
-				handle_result(block_iter->key(), block_iter->value());
+				handle_result(arg, block_iter->key(), block_iter->value());
 			}
 			s = block_iter->status();
 			delete block_iter;
