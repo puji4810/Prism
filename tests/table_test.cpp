@@ -23,12 +23,21 @@ namespace prism
 // Friend of Table to exercise the InternalGet template in tests.
 Status TestInternalGetHelper(Table& table, const ReadOptions& options, const Slice& key, std::string* value_out, bool* found_out)
 {
-	*found_out = false;
-	auto handle = [&](const Slice&, const Slice& v) {
-		*found_out = true;
-		*value_out = v.ToString();
+	struct State
+	{
+		std::string* value_out;
+		bool* found_out;
 	};
-	return table.InternalGet(options, key, handle);
+
+	State state{value_out, found_out};
+	*found_out = false;
+	auto handle = [](void* arg, const Slice&, const Slice& v) -> Status {
+		auto* state = static_cast<State*>(arg);
+		*state->found_out = true;
+		*state->value_out = v.ToString();
+		return Status::OK();
+	};
+	return table.InternalGet(options, key, &state, handle);
 }
 }
 
