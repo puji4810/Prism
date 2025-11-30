@@ -5,7 +5,7 @@ add_requires("crc32c", "gtest")
 
 set_languages("cxx23")
 
-local common_files = {"src/*.cpp", "util/*.cpp"}
+local common_files = {"src/*.cpp", "util/*.cpp", "include/table/*.cpp"}
 local common_includedirs = {"include", "src", "util"}
 
 if is_mode("debug") then
