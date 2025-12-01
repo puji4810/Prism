@@ -7,6 +7,7 @@
 #include "block.h"
 #include "status.h"
 #include "format.h"
+#include "filter_block.h"
 #include "two_level_iterator.h"
 #include "status.h"
 #include "iterator.h"
@@ -21,6 +22,7 @@ namespace prism
 	class RandomAccessFile; // TODO: posix_env
 	struct ReadOptions;
 	class TableCache; // TODO: table_cache
+	class FilterBlockReader;
 
 	// A Table is a sorted map from strings to strings.  Tables are
 	// immutable and persistent.  A Table may be safely accessed from
@@ -91,16 +93,18 @@ namespace prism
 	{
 		~Rep()
 		{
+			delete filter;
+			delete[] filter_data;
 			delete index_block;
-			// TODO: delete filter/filter_data when implemented
 		}
 
 		Options options;
 		Status status;
 		RandomAccessFile* file;
 		uint64_t cache_id = 0;
-		// FilterBlockReader* filter; // TODO: implement
-		// const char* filter_data;
+
+		FilterBlockReader* filter = nullptr;
+		const char* filter_data = nullptr;
 
 		BlockHandle metaindex_handle; // handle to metaindex_block
 		Block* index_block = nullptr;
@@ -112,20 +116,36 @@ namespace prism
 {
 	inline Status Table::InternalGet(const ReadOptions& options, const Slice& key, void* arg, HandleResult handle_result)
 	{
-		// TODO: add filter and block cache optimization in the future
 		Status s;
 		Iterator* index_iter = rep_->index_block->NewIterator(rep_->options.comparator);
 		index_iter->Seek(key);
 		if (index_iter->Valid())
 		{
-			Iterator* block_iter = BlockReader(this, options, index_iter->value());
-			block_iter->Seek(key);
-			if (block_iter->Valid())
+			Slice handle_value = index_iter->value();
+			FilterBlockReader* filter = rep_->filter;
+			BlockHandle handle;
+			bool skip_data_block = false;
+
+			// Use filter block to fast-reject blocks that cannot contain the key.
+			if (filter != nullptr && handle.DecodeFrom(handle_value).ok() && !filter->KeyMayMatch(handle.offset(), key))
 			{
-				handle_result(arg, block_iter->key(), block_iter->value());
+				skip_data_block = true;
 			}
-			s = block_iter->status();
-			delete block_iter;
+
+			if (!skip_data_block)
+			{
+				Iterator* block_iter = BlockReader(this, options, index_iter->value());
+				block_iter->Seek(key);
+				if (block_iter->Valid())
+				{
+					s = handle_result(arg, block_iter->key(), block_iter->value());
+				}
+				else
+				{
+					s = block_iter->status();
+				}
+				delete block_iter;
+			}
 		}
 		if (s.ok())
 		{
