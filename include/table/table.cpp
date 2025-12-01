@@ -1,6 +1,8 @@
 #include "table.h"
 #include "cache.h"
 #include "coding.h"
+#include "filter_policy.h"
+#include "comparator.h"
 #include <cstdint>
 
 namespace prism
@@ -48,8 +50,8 @@ namespace prism
 			rep->metaindex_handle = footer.metaindex_handle();
 			rep->index_block = index_block;
 			rep->cache_id = (options.block_cache ? options.block_cache->NewId() : 0);
-			// rep->filter_data = nullptr;
-			// rep->filter = nullptr;
+			rep->filter_data = nullptr;
+			rep->filter = nullptr;
 			*table = new Table(rep);
 			(*table)->ReadMeta(footer);
 		}
@@ -61,14 +63,65 @@ namespace prism
 
 	void Table::ReadMeta(const Footer& footer)
 	{
-		// TODO: filter block support
-		(void)footer;
+		if (rep_->options.filter_policy == nullptr)
+		{
+			return; // No filter configured.
+		}
+
+		ReadOptions opt;
+		if (rep_->options.paranoid_checks)
+		{
+			opt.verify_checksums = true;
+		}
+		BlockContents contents;
+		Status s = ReadBlock(rep_->file, opt, footer.metaindex_handle(), &contents);
+		if (!s.ok())
+		{
+			// Meta information is optional; ignore errors.
+			return;
+		}
+
+		Block* meta = new Block(contents);
+		Iterator* iter = meta->NewIterator(BytewiseComparator());
+		std::string key = "filter.";
+		key.append(rep_->options.filter_policy->Name());
+		iter->Seek(key);
+		if (iter->Valid() && iter->key() == Slice(key))
+		{
+			ReadFilter(iter->value());
+		}
+		delete iter;
+		delete meta;
 	}
 
 	void Table::ReadFilter(const Slice& filter_handle_value)
 	{
-		// TODO: filter block support
-		(void)filter_handle_value;
+		Slice v = filter_handle_value;
+		BlockHandle filter_handle;
+		Status s = filter_handle.DecodeFrom(v);
+		if (!s.ok())
+		{
+			return;
+		}
+
+		ReadOptions opt;
+		if (rep_->options.paranoid_checks)
+		{
+			opt.verify_checksums = true;
+		}
+		BlockContents block;
+		s = ReadBlock(rep_->file, opt, filter_handle, &block);
+		if (!s.ok())
+		{
+			return;
+		}
+
+		if (block.heap_allocated)
+		{
+			// Remember underlying buffer for later deletion.
+			rep_->filter_data = block.data.data();
+		}
+		rep_->filter = new FilterBlockReader(rep_->options.filter_policy, block.data);
 	}
 
 	static void DeleteBlock(void* arg, void* /*ignored*/) { delete reinterpret_cast<Block*>(arg); }
