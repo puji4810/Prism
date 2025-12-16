@@ -54,18 +54,9 @@ namespace prism
 			const int buffer_size = (iteration == 0) ? kStackBufferSize : dynamic_buffer_size;
 			char* const buffer = (iteration == 0) ? stack_buffer : new char[dynamic_buffer_size];
 
-			int buffer_offset = std::snprintf(
-			    buffer,
-			    buffer_size,
-			    "%04d/%02d/%02d-%02d:%02d:%02d.%06d %s ",
-			    now_components.tm_year + 1900,
-			    now_components.tm_mon + 1,
-			    now_components.tm_mday,
-			    now_components.tm_hour,
-			    now_components.tm_min,
-			    now_components.tm_sec,
-			    static_cast<int>(now_timeval.tv_usec),
-			    thread_id.c_str());
+			int buffer_offset = std::snprintf(buffer, buffer_size, "%04d/%02d/%02d-%02d:%02d:%02d.%06d %s ", now_components.tm_year + 1900,
+			    now_components.tm_mon + 1, now_components.tm_mday, now_components.tm_hour, now_components.tm_min, now_components.tm_sec,
+			    static_cast<int>(now_timeval.tv_usec), thread_id.c_str());
 
 			assert(buffer_offset < buffer_size);
 
@@ -104,4 +95,3 @@ namespace prism
 	}
 
 }
-

@@ -17,8 +17,6 @@ namespace prism
 			}
 		}
 
-		
-
 		Writer::Writer(std::string dest)
 		    : block_offset_(0)
 		{

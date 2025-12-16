@@ -10,7 +10,7 @@ namespace prism
 		static uint32_t BloomHash(const Slice& key) { return Hash(key.data(), key.size(), 0xbc9f1d34); }
 	}
 
-	class BloomFilterPolicy : public FilterPolicy
+	class BloomFilterPolicy: public FilterPolicy
 	{
 	public:
 		explicit BloomFilterPolicy(int bits_per_key)
@@ -96,9 +96,6 @@ namespace prism
 		size_t k_;
 	};
 
-	const FilterPolicy* NewBloomFilterPolicy(int bits_per_key)
-	{
-		return new BloomFilterPolicy(bits_per_key);
-	}
+	const FilterPolicy* NewBloomFilterPolicy(int bits_per_key) { return new BloomFilterPolicy(bits_per_key); }
 
 } // namespace prism

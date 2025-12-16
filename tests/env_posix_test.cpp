@@ -47,7 +47,7 @@ namespace
 
 	struct ScheduleState
 	{
-		std::atomic<int> done{0};
+		std::atomic<int> done{ 0 };
 		std::mutex mu;
 		std::condition_variable cv;
 	};
@@ -198,7 +198,6 @@ TEST(PosixEnvTest, NowMicrosAndSleep)
 	const uint64_t after = env->NowMicros();
 	EXPECT_GT(after, before);
 }
-
 
 int main(int argc, char** argv)
 {

@@ -295,5 +295,5 @@ namespace prism
 	Iterator* NewTwoLevelIterator(Iterator* index_iter, BlockFunction block_function, void* arg, const ReadOptions& options)
 	{
 		return new TwoLevelIterator(index_iter, block_function, arg, options);
-	}	
+	}
 }
