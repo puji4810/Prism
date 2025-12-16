@@ -636,6 +636,14 @@ namespace prism
 		{
 			if (::mkdir(dirname.c_str(), 0755) != 0)
 			{
+				if (errno == EEXIST)
+				{
+					struct ::stat statbuf;
+					if (::stat(dirname.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode))
+					{
+						return Status::OK();
+					}
+				}
 				return PosixError(dirname, errno);
 			}
 			return Status::OK();
