@@ -37,69 +37,50 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
   - Block structure (32KB)
   - Record types (FULL, FIRST, MIDDLE, LAST)
   - CRC32C checksums
+- **[Table Format](table_format.md)** - SSTable on-disk storage
+
+  - Block structure (data/index/filter blocks)
+  - BlockHandle and Footer format
+  - Prefix compression and restart points
+  - Two-level iteration
+  - CRC32C checksums
 
 ## 🏗️ Implementation Status
 
 ### ✅ Completed
 
 - [X]  **Slice** - Zero-copy string view
-- [X]  **Status/Result** - Modern error handling with `std::expected`
+- [X]  **Status** - Error handling
 - [X]  **Coding utilities** - Varint and fixed-width encoding/decoding
 - [X]  **Arena** - Fast memory allocator
 - [X]  **SkipList** - Probabilistic ordered index
 - [X]  **WriteBatch** - Atomic batch operations
-- [X]  **Log Writer/Reader** - Write-Ahead Log (WAL)
-- [X]  **DBImpl (basic)** - Simple implementation with WAL recovery
+- [X]  **Log Writer/Reader** - WAL (currently std::fstream-based)
+- [X]  **InternalKey & LookupKey** - MVCC support
+- [X]  **MemTable** - In-memory write buffer
+- [X]  **Iterator** - Base iterator + TwoLevelIterator + MemTable/Table iterators
+- [X]  **Env (PosixEnv)** - Filesystem abstraction
+- [X]  **Cache (LRU)** - LRU block/metadata cache
+- [X]  **SSTable (core)** - Table/TableBuilder/TableCache (read/write)
+- [X]  **DBImpl (L0-only)** - WAL + MemTable + flush to SSTable + reads across MemTable/SSTable
 
 ### 🚧 In Progress
 
-- [ ]  **InternalKey & LookupKey** - MVCC support
-- [ ]  **MemTable** - In-memory write buffer
-- [ ]  **DBImpl (complete)** - Full integration with MemTable
+- [ ]  **Filter block / Bloom filter** - write-side FilterBlockBuilder integration
+- [ ]  **Version & VersionSet** - MANIFEST-based metadata + recovery
+- [ ]  **Compaction** - Background merging (multi-level)
+- [ ]  **WAL via Env** - log numbering/rotation + Env::(Sequential|Appendable)File
 
 ### 📋 Planned
 
-- [ ]  **SSTable** - On-disk sorted tables
-
-  - [ ]  TableBuilder
-  - [ ]  TableReader
-  - [ ]  Block format
-  - [ ]  Bloom filter
-  - [ ]  Index blocks
-- [ ]  **Version & VersionSet** - Multi-version management
-
-  - [ ]  File metadata
-  - [ ]  Level management
-  - [ ]  Manifest (version log)
-- [ ]  **Compaction** - Background merging
-
-  - [ ]  Minor compaction (MemTable → L0)
-  - [ ]  Major compaction (L_n → L_n+1)
-  - [ ]  Compaction picker
-- [ ]  **Iterator** - Unified iteration interface
-
-  - [ ]  MemTableIterator
-  - [ ]  SSTableIterator
-  - [ ]  MergingIterator
-  - [ ]  TwoLevelIterator
-- [ ]  **Cache** - Block caching
-
-  - [ ]  LRU cache
-  - [ ]  Sharded cache
+- [ ]  **MergingIterator** - Merge MemTable/levels iterators
+- [ ]  **Sharded cache** - Concurrent cache implementation
 - [ ]  **Snapshot** - Point-in-time reads
 
   - [ ]  Snapshot management
   - [ ]  Garbage collection
-- [ ]  **Options** - Configuration system
-
-  - [ ]  Compression options
-  - [ ]  Comparator options
-  - [ ]  Performance tuning
-- [ ]  **Raft Integration** - Distributed consensus
-
-  - [ ]  Log replication
-  - [ ]  Leader election
-  - [ ]  Snapshot transfer
+- [ ]  **DB::Open(options, dbname)** - full Options plumbing (create_if_missing/error_if_exists, etc.)
+- [ ]  **Compression** - Snappy/Zstd (block compression)
 
 ## 🔑 Key Concepts
 
@@ -205,7 +186,7 @@ xmake test
 
 1. **Correctness** - Comprehensive tests, clear invariants
 2. **Performance** - Fast writes, acceptable read latency
-3. **Modern C++** - `std::expected`, RAII, zero-copy
+3. **Modern C++** - RAII, zero-copy, clear ownership
 4. **Understandability** - Clear code, good documentation
 5. **LevelDB compatibility** - Follow proven design patterns
 
@@ -272,29 +253,22 @@ When adding new components:
 
 - [X]  Basic infrastructure (Slice, Status, Coding)
 - [X]  Memory management (Arena, SkipList)
-- [X]  Persistence (WriteBatch, Log)
-- [ ]  **In-memory storage (MemTable)** ← We are here
-- [ ]  Complete DBImpl
+- [X]  Persistence (WriteBatch, WAL format)
+- [X]  **In-memory storage (MemTable)**
+- [X]  SSTable core (Table/TableBuilder/TableCache)
+- [X]  DBImpl (L0-only) end-to-end read/write/recover
 
-### Phase 2: Persistent Storage
+### Phase 2: Versioning & Compaction (Next)
 
-- [ ]  SSTable implementation
-- [ ]  Version management
-- [ ]  Minor compaction (MemTable → SSTable)
+- [ ]  VersionEdit/VersionSet + MANIFEST
+- [ ]  Minor compaction (MemTable → L0) background
+- [ ]  Major compaction (Ln → Ln+1)
+- [ ]  Bloom filter (write-side) + read-side wiring
 
 ### Phase 3: Optimization
 
-- [ ]  Major compaction (SSTable merging)
-- [ ]  Block cache
-- [ ]  Bloom filters
-- [ ]  Compression
-
-### Phase 4: Distribution (Raft)
-
-- [ ]  Log replication
-- [ ]  Leader election
-- [ ]  Membership changes
-- [ ]  Snapshot transfer
+- [ ]  Sharded cache + tuning
+- [ ]  Compression (Snappy/Zstd)
 
 ## 📄 License
 
@@ -302,5 +276,5 @@ See [LICENSE](../LICENSE) file in the project root.
 
 ---
 
-**Last Updated:** 2025-01-16
+**Last Updated:** 2025-12-16
 **Version:** 0.1.0-dev
