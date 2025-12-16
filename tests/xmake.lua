@@ -48,6 +48,13 @@ target("status_test")
     add_includedirs("$(projectdir)/include", "$(projectdir)/util")
     add_tests("default")
 
+target("result_test")
+    set_kind("binary")
+    add_files("$(projectdir)/tests/result_test.cpp")
+    add_files("$(projectdir)/util/status.cpp")
+    add_includedirs("$(projectdir)/include", "$(projectdir)/util")
+    add_tests("default")
+
 target("memtable_test")
     set_kind("binary")
     add_files("$(projectdir)/tests/memtable_test.cpp")
