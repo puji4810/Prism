@@ -149,4 +149,3 @@ namespace prism
 		return s;
 	}
 } // namespace prism
-
