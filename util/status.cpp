@@ -23,7 +23,10 @@ namespace prism
 		char* result = new char[size + 5];
 		std::memcpy(result, &size, sizeof(size));
 		result[4] = static_cast<char>(code);
-		std::memcpy(result + 5, msg.data(), len1);
+		if (len1 != 0)
+		{
+			std::memcpy(result + 5, msg.data(), len1);
+		}
 		if (len2)
 		{
 			result[5 + len1] = ':';

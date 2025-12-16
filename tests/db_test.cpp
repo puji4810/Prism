@@ -13,17 +13,19 @@ protected:
 	void SetUp() override
 	{
 		// Clean up any existing test databases before each test
-		std::filesystem::remove("test_db");
-		std::filesystem::remove("test_db_large");
-		std::filesystem::remove("test_db_multi_large");
+		std::error_code ec;
+		std::filesystem::remove_all("test_db", ec);
+		std::filesystem::remove_all("test_db_large", ec);
+		std::filesystem::remove_all("test_db_multi_large", ec);
 	}
 
 	void TearDown() override
 	{
 		// Clean up after each test
-		std::filesystem::remove("test_db");
-		std::filesystem::remove("test_db_large");
-		std::filesystem::remove("test_db_multi_large");
+		std::error_code ec;
+		std::filesystem::remove_all("test_db", ec);
+		std::filesystem::remove_all("test_db_large", ec);
+		std::filesystem::remove_all("test_db_multi_large", ec);
 	}
 };
 

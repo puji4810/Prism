@@ -106,14 +106,16 @@ namespace prism
 		auto* buf = arena_.Allocate(encoded_len);
 		auto* p = EncodeVarint32(buf, internal_key_size);
 
-		std::memcpy(p, key.data(), key_size);
+		if (key_size != 0)
+			std::memcpy(p, key.data(), key_size);
 		p += key_size;
 
 		EncodeFixed64(p, (seq << 8) | type);
 		p += 8;
 
 		p = EncodeVarint32(p, val_size);
-		std::memcpy(p, value.data(), val_size);
+		if (val_size != 0)
+			std::memcpy(p, value.data(), val_size);
 		assert(p + val_size == buf + encoded_len);
 
 		table_.Insert(buf);
