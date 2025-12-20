@@ -1,22 +1,39 @@
 #ifndef LOG_READER_H_
 #define LOG_READER_H_
 
+#include <cstdint>
 #include <string>
-#include <fstream>
+
 #include "slice.h"
+#include "status.h"
 #include "log_format.h"
 
 namespace prism
 {
+	class SequentialFile;
+
 	namespace log
 	{
 		class Reader
 		{
 		public:
-			explicit Reader(const std::string& src);
+			class Reporter
+			{
+			public:
+				virtual ~Reporter();
+				virtual void Corruption(size_t bytes, const Status& status) = 0;
+			};
+
+			Reader(SequentialFile* src, Reporter* reporter, bool verify_checksums, uint64_t initial_offset);
 			~Reader();
 
-			bool ReadRecord(Slice* record);
+			Reader(const Reader&) = delete;
+			Reader& operator=(const Reader&) = delete;
+			Reader(Reader&&) = delete;
+			Reader& operator=(Reader&&) = delete;
+
+			bool ReadRecord(Slice* record, std::string* scratch);
+			[[nodiscard]] Status status() const { return status_; }
 
 		private:
 			enum
@@ -25,13 +42,24 @@ namespace prism
 				kBadRecord = kMaxRecordType + 2
 			};
 
-			bool ReadPhysicalRecord(Slice* result, RecordType* type);
+			bool SkipToInitialBlock();
 
-			Slice buffer_;
+			unsigned int ReadPhysicalRecord(Slice* result);
+			void ReportCorruption(uint64_t bytes, const char* reason);
+			void ReportDrop(uint64_t bytes, const Status& reason);
+
+			SequentialFile* src_;
+			Reporter* reporter_;
+			bool checksum_;
+
 			char* const backing_store_;
-			std::ifstream src_;
-			bool eof_ = false; // Tag to indicate the end of the file
-			std::string scratch_; // Buffer for assembling fragmented records
+			Slice buffer_;
+			bool eof_;
+			uint64_t last_record_offset_;
+			uint64_t end_of_buffer_offset_;
+			uint64_t initial_offset_;
+			bool resyncing_;
+			Status status_;
 		};
 	}
 }

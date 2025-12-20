@@ -1,185 +1,267 @@
 #include "log_reader.h"
-#include "slice.h"
-#include "log_format.h"
-#include <cstring>
+
 #include "crc32.h"
+#include "env.h"
 
-namespace prism
+#include <cstdio>
+
+namespace prism::log
 {
-	namespace log
+	Reader::Reporter::~Reporter() = default;
+
+	Reader::Reader(SequentialFile* src, Reporter* reporter, bool verify_checksums, uint64_t initial_offset)
+	    : src_(src)
+	    , reporter_(reporter)
+	    , checksum_(verify_checksums)
+	    , backing_store_(new char[kBlockSize])
+	    , buffer_()
+	    , eof_(false)
+	    , last_record_offset_(0)
+	    , end_of_buffer_offset_(0)
+	    , initial_offset_(initial_offset)
+	    , resyncing_(initial_offset > 0)
+	    , status_()
 	{
-		Reader::Reader(const std::string& src)
-		    : src_(src, std::ios::binary)
-		    , backing_store_(new char[kBlockSize])
+	}
+
+	Reader::~Reader() { delete[] backing_store_; }
+
+	bool Reader::SkipToInitialBlock()
+	{
+		const size_t offset_in_block = static_cast<size_t>(initial_offset_ % kBlockSize);
+		uint64_t block_start_location = initial_offset_ - offset_in_block;
+
+		// Don't search a block if we'd be in the trailer.
+		if (offset_in_block > static_cast<size_t>(kBlockSize - kHeaderSize))
 		{
-			if (!src_)
+			block_start_location += kBlockSize;
+		}
+
+		end_of_buffer_offset_ = block_start_location;
+		if (block_start_location > 0)
+		{
+			Status s = src_->Skip(block_start_location);
+			if (!s.ok())
 			{
-				throw std::runtime_error("Failed to open log file: " + src);
+				ReportDrop(block_start_location, s);
+				return false;
 			}
 		}
 
-		bool Reader::ReadRecord(Slice* record)
+		return true;
+	}
+
+	bool Reader::ReadRecord(Slice* record, std::string* scratch)
+	{
+		if (last_record_offset_ < initial_offset_)
 		{
-			scratch_.clear();
-			bool in_fragmented_record = false;
-
-			while (true)
+			if (!SkipToInitialBlock())
 			{
-				Slice fragment;
-				RecordType record_type;
-
-				if (!ReadPhysicalRecord(&fragment, &record_type))
-				{
-					// EOF or error
-					if (in_fragmented_record)
-					{
-						// Incomplete fragmented record at end of file
-						scratch_.clear();
-					}
-					return false;
-				}
-
-				switch (record_type)
-				{
-				case RecordType::kFullType:
-					if (in_fragmented_record)
-					{
-						// Handle bug in earlier versions where
-						// it could emit an empty kFirstType at tail end
-						if (!scratch_.empty())
-						{
-							throw std::runtime_error("Partial record without end");
-						}
-					}
-					scratch_.clear();
-					*record = fragment;
-					return true;
-
-				case RecordType::kFirstType:
-					if (in_fragmented_record)
-					{
-						// Handle bug in earlier versions
-						if (!scratch_.empty())
-						{
-							throw std::runtime_error("Partial record without end");
-						}
-					}
-					scratch_.assign(fragment.data(), fragment.size());
-					in_fragmented_record = true;
-					break;
-
-				case RecordType::kMiddleType:
-					if (!in_fragmented_record)
-					{
-						throw std::runtime_error("Missing start of fragmented record");
-					}
-					scratch_.append(fragment.data(), fragment.size());
-					break;
-
-				case RecordType::kLastType:
-					if (!in_fragmented_record)
-					{
-						throw std::runtime_error("Missing start of fragmented record");
-					}
-					scratch_.append(fragment.data(), fragment.size());
-					*record = Slice(scratch_);
-					return true;
-
-				default:
-					throw std::runtime_error("Unknown record type");
-				}
+				return false;
 			}
 		}
 
-		bool Reader::ReadPhysicalRecord(Slice* result, RecordType* type)
+		scratch->clear();
+		record->clear();
+		bool in_fragmented_record = false;
+		uint64_t prospective_record_offset = 0;
+
+		Slice fragment;
+		while (true)
 		{
-			while (true)
+			const unsigned int record_type = ReadPhysicalRecord(&fragment);
+
+			const uint64_t physical_record_offset =
+			    end_of_buffer_offset_ - fragment.size() - kHeaderSize - buffer_.size();
+
+			if (resyncing_)
 			{
-				// Need to read more data
-				if (buffer_.size() < kHeaderSize)
+				if (record_type == static_cast<unsigned int>(RecordType::kMiddleType))
 				{
-					if (!eof_)
-					{
-						// Last read was a full read, clear buffer and read next block
-						// Compare with clear the buffer, use memove to move the unused data to the beginning of the buffer
-						// clear the buffer may get better performance for small blocks
-						buffer_.clear();
-						src_.read(backing_store_, kBlockSize);
-						size_t n = src_.gcount();
-
-						if (n == 0) // finish reading
-						{
-							eof_ = true;
-							buffer_.clear();
-							return false;
-						}
-						else if (n < kBlockSize)
-						{
-							eof_ = true;
-						}
-
-						buffer_ = Slice(backing_store_, n);
-						continue;
-					}
-					else
-					{
-						// Truncated header at end of file
-						buffer_.clear();
-						return false;
-					}
+					continue;
 				}
-
-				// Parse the header using Header struct
-				Header header;
-				header.DecodeFrom(buffer_.data());
-
-				// Check if we have enough data for the payload
-				if (kHeaderSize + header.length > buffer_.size())
+				if (record_type == static_cast<unsigned int>(RecordType::kLastType))
 				{
-					if (!eof_)
-					{
-						throw std::runtime_error("Bad record length");
-					}
-					// Truncated record at end of file
+					resyncing_ = false;
+					continue;
+				}
+				resyncing_ = false;
+			}
+
+			switch (record_type)
+			{
+			case static_cast<unsigned int>(RecordType::kFullType):
+				if (in_fragmented_record && !scratch->empty())
+				{
+					ReportCorruption(scratch->size(), "partial record without end(1)");
+				}
+				prospective_record_offset = physical_record_offset;
+				scratch->clear();
+				*record = fragment;
+				last_record_offset_ = prospective_record_offset;
+				return true;
+
+			case static_cast<unsigned int>(RecordType::kFirstType):
+				if (in_fragmented_record && !scratch->empty())
+				{
+					ReportCorruption(scratch->size(), "partial record without end(2)");
+				}
+				prospective_record_offset = physical_record_offset;
+				scratch->assign(fragment.data(), fragment.size());
+				in_fragmented_record = true;
+				break;
+
+			case static_cast<unsigned int>(RecordType::kMiddleType):
+				if (!in_fragmented_record)
+				{
+					ReportCorruption(fragment.size(), "missing start of fragmented record(1)");
+				}
+				else
+				{
+					scratch->append(fragment.data(), fragment.size());
+				}
+				break;
+
+			case static_cast<unsigned int>(RecordType::kLastType):
+				if (!in_fragmented_record)
+				{
+					ReportCorruption(fragment.size(), "missing start of fragmented record(2)");
+				}
+				else
+				{
+					scratch->append(fragment.data(), fragment.size());
+					*record = Slice(*scratch);
+					last_record_offset_ = prospective_record_offset;
+					return true;
+				}
+				break;
+
+			case kEof:
+				if (in_fragmented_record)
+				{
+					scratch->clear();
+				}
+				return false;
+
+			case kBadRecord:
+				if (in_fragmented_record)
+				{
+					ReportCorruption(scratch->size(), "error in middle of record");
+					in_fragmented_record = false;
+					scratch->clear();
+				}
+				break;
+
+			default:
+			{
+				char buf[40];
+				std::snprintf(buf, sizeof(buf), "unknown record type %u", record_type);
+				ReportCorruption(fragment.size() + (in_fragmented_record ? scratch->size() : 0), buf);
+				in_fragmented_record = false;
+				scratch->clear();
+				break;
+			}
+			}
+		}
+	}
+
+	void Reader::ReportCorruption(uint64_t bytes, const char* reason)
+	{
+		ReportDrop(bytes, Status::Corruption(reason));
+	}
+
+	void Reader::ReportDrop(uint64_t bytes, const Status& reason)
+	{
+		if (status_.ok())
+		{
+			status_ = reason;
+		}
+		if (reporter_ != nullptr && end_of_buffer_offset_ - buffer_.size() - bytes >= initial_offset_)
+		{
+			reporter_->Corruption(static_cast<size_t>(bytes), reason);
+		}
+	}
+
+	unsigned int Reader::ReadPhysicalRecord(Slice* result)
+	{
+		while (true)
+		{
+			if (buffer_.size() < kHeaderSize)
+			{
+				if (!eof_)
+				{
 					buffer_.clear();
-					return false;
-				}
-
-				// Skip zero-length records (padding)
-				if (header.type == RecordType::kZeroType && header.length == 0)
-				{
-					buffer_.remove_prefix(kHeaderSize);
+					Status s = src_->Read(kBlockSize, &buffer_, backing_store_);
+					end_of_buffer_offset_ += buffer_.size();
+					if (!s.ok())
+					{
+						buffer_.clear();
+						ReportDrop(kBlockSize, s);
+						eof_ = true;
+						return kEof;
+					}
+					if (buffer_.size() < static_cast<size_t>(kBlockSize))
+					{
+						eof_ = true;
+					}
 					continue;
 				}
 
-				// Verify checksum
+				buffer_.clear();
+				return kEof;
+			}
+
+			const char* header_bytes = buffer_.data();
+			Header header;
+			header.DecodeFrom(header_bytes);
+			const size_t length = header.length;
+			const unsigned int type = static_cast<unsigned int>(static_cast<unsigned char>(header.type));
+
+			if (kHeaderSize + length > buffer_.size())
+			{
+				const size_t drop_size = buffer_.size();
+				buffer_.clear();
+				if (!eof_)
+				{
+					ReportCorruption(drop_size, "bad record length");
+					return kBadRecord;
+				}
+				return kEof;
+			}
+
+			if (type == static_cast<unsigned int>(RecordType::kZeroType) && length == 0)
+			{
+				buffer_.clear();
+				return kBadRecord;
+			}
+
+			if (checksum_)
+			{
+				const uint32_t expected_crc = Unmask(header.checksum);
 				const char type_byte = static_cast<char>(header.type);
-				uint32_t expected_crc = Unmask(header.checksum);
-
-				uint32_t actual_crc = crc32c::Crc32c(reinterpret_cast<const uint8_t*>(&type_byte), 1);
-				actual_crc = crc32c::Extend(actual_crc, reinterpret_cast<const uint8_t*>(buffer_.data() + kHeaderSize), header.length);
-
+				uint32_t actual_crc = crc32c::Crc32c(&type_byte, 1);
+				actual_crc = crc32c::Extend(actual_crc,
+				    reinterpret_cast<const uint8_t*>(header_bytes + kHeaderSize), length);
 				if (actual_crc != expected_crc)
 				{
-					throw std::runtime_error("Checksum mismatch in log record");
+					const size_t drop_size = buffer_.size();
+					buffer_.clear();
+					ReportCorruption(drop_size, "checksum mismatch");
+					return kBadRecord;
 				}
-
-				// Return the record
-				*result = Slice(buffer_.data() + kHeaderSize, header.length);
-				buffer_.remove_prefix(kHeaderSize + header.length);
-				*type = header.type;
-				return true;
 			}
-		}
 
-		Reader::~Reader()
-		{
-			if (src_.is_open())
+			buffer_.remove_prefix(kHeaderSize + length);
+
+			if (end_of_buffer_offset_ - buffer_.size() - kHeaderSize - length < initial_offset_)
 			{
-				src_.close();
+				result->clear();
+				return kBadRecord;
 			}
-			delete[] backing_store_;
-		}
 
+			*result = Slice(header_bytes + kHeaderSize, length);
+			return type;
+		}
 	}
 }
+

@@ -4,20 +4,23 @@
 #include "dbformat.h"
 #include "env.h"
 #include "filename.h"
+#include "log_reader.h"
+#include "options.h"
 #include "slice.h"
 #include "table_cache.h"
+#include "table/merger.h"
 #include "table/table_builder.h"
 #include "write_batch.h"
 #include "write_batch_internal.h"
 
 #include <algorithm>
+#include <cassert>
 #include <memory>
 
 namespace prism
 {
 	namespace
 	{
-		constexpr uint64_t kLogFileNumber = 1;
 		constexpr int kNumNonTableCacheFiles = 10;
 
 		int TableCacheEntries(const Options& options)
@@ -133,6 +136,294 @@ namespace prism
 				return Status::Corruption("unknown value type");
 			}
 		}
+
+		class DBIter: public Iterator
+		{
+		public:
+			enum class Direction
+			{
+				kForward,
+				kReverse
+			};
+
+			DBIter(const Comparator* user_comparator, Iterator* internal_iter, SequenceNumber sequence)
+			    : user_comparator_(user_comparator)
+			    , iter_(internal_iter)
+			    , sequence_(sequence)
+			    , direction_(Direction::kForward)
+			    , valid_(false)
+			{
+			}
+
+			~DBIter() override { delete iter_; }
+
+			bool Valid() const override { return valid_; }
+
+			Slice key() const override
+			{
+				assert(valid_);
+				if (direction_ == Direction::kForward)
+				{
+					return ExtractUserKey(iter_->key());
+				}
+				return Slice(saved_key_);
+			}
+
+			Slice value() const override
+			{
+				assert(valid_);
+				if (direction_ == Direction::kForward)
+				{
+					return iter_->value();
+				}
+				return Slice(saved_value_);
+			}
+
+			Status status() const override
+			{
+				if (status_.ok())
+				{
+					return iter_->status();
+				}
+				return status_;
+			}
+
+			void SeekToFirst() override
+			{
+				direction_ = Direction::kForward;
+				ClearSavedValue();
+				iter_->SeekToFirst();
+				if (iter_->Valid())
+				{
+					FindNextUserEntry(false, &saved_key_ /*temporary*/);
+				}
+				else
+				{
+					valid_ = false;
+				}
+			}
+
+			void SeekToLast() override
+			{
+				direction_ = Direction::kReverse;
+				ClearSavedValue();
+				iter_->SeekToLast();
+				FindPrevUserEntry();
+			}
+
+			void Seek(const Slice& target) override
+			{
+				direction_ = Direction::kForward;
+				ClearSavedValue();
+				saved_key_.clear();
+				AppendInternalKey(saved_key_, ParsedInternalKey(target, sequence_, kValueTypeForSeek));
+				iter_->Seek(saved_key_);
+				if (iter_->Valid())
+				{
+					FindNextUserEntry(false, &saved_key_ /*temporary*/);
+				}
+				else
+				{
+					valid_ = false;
+				}
+			}
+
+			void Next() override
+			{
+				assert(valid_);
+
+				if (direction_ == Direction::kReverse)
+				{
+					direction_ = Direction::kForward;
+					if (!iter_->Valid())
+					{
+						iter_->SeekToFirst();
+					}
+					else
+					{
+						iter_->Next();
+					}
+					if (!iter_->Valid())
+					{
+						valid_ = false;
+						saved_key_.clear();
+						return;
+					}
+					// saved_key_ already contains the key to skip past.
+				}
+				else
+				{
+					SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
+					iter_->Next();
+					if (!iter_->Valid())
+					{
+						valid_ = false;
+						saved_key_.clear();
+						return;
+					}
+				}
+
+				FindNextUserEntry(true, &saved_key_);
+			}
+
+			void Prev() override
+			{
+				assert(valid_);
+
+				if (direction_ == Direction::kForward)
+				{
+					assert(iter_->Valid());
+					SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
+					while (true)
+					{
+						iter_->Prev();
+						if (!iter_->Valid())
+						{
+							valid_ = false;
+							saved_key_.clear();
+							ClearSavedValue();
+							return;
+						}
+						if (user_comparator_->Compare(ExtractUserKey(iter_->key()), saved_key_) < 0)
+						{
+							break;
+						}
+					}
+					direction_ = Direction::kReverse;
+				}
+
+				FindPrevUserEntry();
+			}
+
+		private:
+			bool ParseKey(ParsedInternalKey* ikey)
+			{
+				if (!ParseInternalKey(iter_->key(), ikey))
+				{
+					status_ = Status::Corruption("corrupted internal key in DBIter");
+					return false;
+				}
+				return true;
+			}
+
+			void SaveKey(const Slice& k, std::string* dst) { dst->assign(k.data(), k.size()); }
+
+			void ClearSavedValue()
+			{
+				if (saved_value_.capacity() > 1048576)
+				{
+					std::string empty;
+					std::swap(empty, saved_value_);
+				}
+				else
+				{
+					saved_value_.clear();
+				}
+			}
+
+			void FindNextUserEntry(bool skipping, std::string* skip)
+			{
+				assert(iter_->Valid());
+				assert(direction_ == Direction::kForward);
+
+				do
+				{
+					ParsedInternalKey ikey;
+					if (ParseKey(&ikey) && ikey.sequence <= sequence_)
+					{
+						switch (ikey.type)
+						{
+						case kTypeDeletion:
+							SaveKey(ikey.user_key, skip);
+							skipping = true;
+							break;
+						case kTypeValue:
+							if (skipping && user_comparator_->Compare(ikey.user_key, *skip) <= 0)
+							{
+								// Hidden.
+							}
+							else
+							{
+								valid_ = true;
+								saved_key_.clear();
+								return;
+							}
+							break;
+						}
+					}
+					iter_->Next();
+				} while (iter_->Valid());
+
+				saved_key_.clear();
+				valid_ = false;
+			}
+
+			void FindPrevUserEntry()
+			{
+				assert(direction_ == Direction::kReverse);
+
+				ValueType value_type = kTypeDeletion;
+				if (iter_->Valid())
+				{
+					do
+					{
+						ParsedInternalKey ikey;
+						if (ParseKey(&ikey) && ikey.sequence <= sequence_)
+						{
+							if ((value_type != kTypeDeletion) && user_comparator_->Compare(ikey.user_key, saved_key_) < 0)
+							{
+								break;
+							}
+
+							value_type = ikey.type;
+							if (value_type == kTypeDeletion)
+							{
+								saved_key_.clear();
+								ClearSavedValue();
+							}
+							else
+							{
+								const Slice raw_value = iter_->value();
+								if (saved_value_.capacity() > raw_value.size() + 1048576)
+								{
+									std::string empty;
+									std::swap(empty, saved_value_);
+								}
+								SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
+								saved_value_.assign(raw_value.data(), raw_value.size());
+							}
+						}
+						iter_->Prev();
+					} while (iter_->Valid());
+				}
+
+				if (value_type == kTypeDeletion)
+				{
+					valid_ = false;
+					saved_key_.clear();
+					ClearSavedValue();
+					direction_ = Direction::kForward;
+				}
+				else
+				{
+					valid_ = true;
+				}
+			}
+
+			const Comparator* user_comparator_;
+			Iterator* iter_;
+			SequenceNumber sequence_;
+			Status status_;
+			std::string saved_key_;
+			std::string saved_value_;
+			Direction direction_;
+			bool valid_;
+		};
+
+		Iterator* NewDBIterator(const Comparator* user_comparator, Iterator* internal_iter, SequenceNumber sequence)
+		{
+			return new DBIter(user_comparator, internal_iter, sequence);
+		}
 	}
 
 	// https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#c12-dont-make-data-members-const-or-references-in-a-copyable-or-movable-type
@@ -161,22 +452,31 @@ namespace prism
 
 	DB::~DB() = default;
 
+	std::unique_ptr<DB> DB::Open(const Options& options, const std::string& dbname)
+	{
+		Options opts = options;
+		if (opts.env == nullptr)
+		{
+			opts.env = Env::Default();
+		}
+		if (opts.comparator == nullptr)
+		{
+			opts.comparator = BytewiseComparator();
+		}
+
+		auto impl = std::make_unique<DBImpl>(opts, dbname);
+		if (!impl->Recover().ok())
+		{
+			return nullptr;
+		}
+		return impl;
+	}
+
 	std::unique_ptr<DB> DB::Open(const std::string& dbname)
 	{
 		Options options;
-		if (options.env != nullptr)
-		{
-			Status s = options.env->CreateDir(dbname);
-			if (!s.ok())
-			{
-				std::vector<std::string> children;
-				if (!options.env->GetChildren(dbname, &children).ok())
-				{
-					return nullptr;
-				}
-			}
-		}
-		return std::make_unique<DBImpl>(options, dbname);
+		options.create_if_missing = true;
+		return Open(options, dbname);
 	}
 
 	DBImpl::DBImpl(const Options& options, const std::string& dbname)
@@ -184,8 +484,6 @@ namespace prism
 	    , options_(options)
 	    , dbname_(dbname)
 	    , mem_(nullptr)
-	    , writer_(LogFileName(dbname, kLogFileNumber))
-	    , reader_(LogFileName(dbname, kLogFileNumber))
 	    , internal_comparator_(options.comparator)
 	{
 		options_.comparator = &internal_comparator_;
@@ -194,17 +492,24 @@ namespace prism
 
 		mem_ = new MemTable(internal_comparator_);
 		mem_->Ref();
-
-		RecoverLogFile();
-		RecoverTableFiles();
 	}
 
 	DBImpl::~DBImpl()
 	{
 		if (imm_)
+		{
 			imm_->Unref();
+		}
 		if (mem_)
+		{
 			mem_->Unref();
+		}
+		CloseLogFile();
+		if (db_lock_ != nullptr)
+		{
+			env_->UnlockFile(db_lock_);
+			db_lock_ = nullptr;
+		}
 		delete table_cache_;
 	}
 
@@ -214,39 +519,121 @@ namespace prism
 		return batch.Iterate(&handler);
 	}
 
-	Status DBImpl::RecoverLogFile()
+	Status DBImpl::CloseLogFile()
 	{
-		Slice record;
-		while (reader_.ReadRecord(&record))
+		log_.reset();
+		if (logfile_ == nullptr)
 		{
-			if (record.empty())
-				continue;
-
-			WriteBatch batch;
-			WriteBatchInternal::SetContents(&batch, record);
-
-			const auto base = WriteBatchInternal::Sequence(&batch);
-			const auto count = WriteBatchInternal::Count(&batch);
-
-			RecoveryHandler handler(mem_, base);
-			Status s = batch.Iterate(&handler);
-			if (!s.ok())
-			{
-				return s;
-			}
-
-			const SequenceNumber next = base + count;
-			if (next > sequence_)
-			{
-				sequence_ = next;
-			}
+			logfile_number_ = 0;
+			return Status::OK();
 		}
+		Status s = logfile_->Close();
+		delete logfile_;
+		logfile_ = nullptr;
+		logfile_number_ = 0;
+		return s;
+	}
+
+	Status DBImpl::NewLogFile()
+	{
+		const uint64_t new_log_number = next_file_number_++;
+		WritableFile* file = nullptr;
+		Status s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &file);
+		if (!s.ok())
+		{
+			return s;
+		}
+		logfile_ = file;
+		logfile_number_ = new_log_number;
+		log_ = std::make_unique<log::Writer>(file);
 		return Status::OK();
 	}
 
-	Status DBImpl::RecoverTableFiles()
+	Status DBImpl::Recover()
+	{
+		if (env_ == nullptr)
+		{
+			return Status::InvalidArgument("env is null");
+		}
+
+		Status s = env_->CreateDir(dbname_);
+		if (!s.ok())
+		{
+			return s;
+		}
+
+		if (db_lock_ != nullptr)
+		{
+			return Status::InvalidArgument("db lock already held");
+		}
+		s = env_->LockFile(LockFileName(dbname_), &db_lock_);
+		if (!s.ok())
+		{
+			return s;
+		}
+
+		std::vector<uint64_t> log_numbers;
+		s = RecoverTableFiles(&log_numbers);
+		if (!s.ok())
+		{
+			return s;
+		}
+
+		const bool db_exists = !files_.empty() || !log_numbers.empty();
+		if (!db_exists)
+		{
+			if (!options_.create_if_missing)
+			{
+				return Status::InvalidArgument(dbname_, "does not exist (create_if_missing is false)");
+			}
+		}
+		else if (options_.error_if_exists)
+		{
+			return Status::InvalidArgument(dbname_, "exists (error_if_exists is true)");
+		}
+
+		bool found_sequence = false;
+		SequenceNumber max_sequence = 0;
+		for (const auto& file : files_)
+		{
+			std::unique_ptr<Iterator> iter(table_cache_->NewIterator(ReadOptions(), file.number, file.file_size));
+			for (iter->SeekToFirst(); iter->Valid(); iter->Next())
+			{
+				ParsedInternalKey parsed;
+				if (!ParseInternalKey(iter->key(), &parsed))
+				{
+					return Status::Corruption("bad internal key");
+				}
+				found_sequence = true;
+				if (parsed.sequence > max_sequence)
+				{
+					max_sequence = parsed.sequence;
+				}
+			}
+			if (!iter->status().ok())
+			{
+				return iter->status();
+			}
+		}
+		sequence_ = found_sequence ? (max_sequence + 1) : 0;
+
+		s = RecoverLogFiles(log_numbers);
+		if (!s.ok())
+		{
+			return s;
+		}
+
+		if (log_ == nullptr)
+		{
+			s = NewLogFile();
+		}
+		return s;
+	}
+
+	Status DBImpl::RecoverTableFiles(std::vector<uint64_t>* log_numbers)
 	{
 		files_.clear();
+		log_numbers->clear();
 
 		std::vector<std::string> filenames;
 		Status s = env_->GetChildren(dbname_, &filenames);
@@ -255,7 +642,7 @@ namespace prism
 			return s;
 		}
 
-		uint64_t max_number = kLogFileNumber;
+		uint64_t max_number = 0;
 		for (const auto& name : filenames)
 		{
 			uint64_t number = 0;
@@ -268,6 +655,12 @@ namespace prism
 			if (number > max_number)
 			{
 				max_number = number;
+			}
+
+			if (type == FileType::kLogFile)
+			{
+				log_numbers->push_back(number);
+				continue;
 			}
 
 			if (type != FileType::kTableFile)
@@ -312,6 +705,7 @@ namespace prism
 		}
 
 		std::sort(files_.begin(), files_.end(), [](const FileMeta& a, const FileMeta& b) { return a.number < b.number; });
+		std::sort(log_numbers->begin(), log_numbers->end());
 		next_file_number_ = max_number + 1;
 		if (next_file_number_ == 0)
 		{
@@ -326,30 +720,66 @@ namespace prism
 		{
 			return Status::InvalidArgument("immutable memtable already set");
 		}
+		if (log_ == nullptr || logfile_ == nullptr)
+		{
+			return Status::InvalidArgument("log file not open");
+		}
+
+		const uint64_t new_log_number = next_file_number_++;
+		WritableFile* new_log_file = nullptr;
+		Status s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &new_log_file);
+		if (!s.ok())
+		{
+			return s;
+		}
+		auto new_log = std::make_unique<log::Writer>(new_log_file);
+
+		const uint64_t old_log_number = logfile_number_;
+		WritableFile* old_log_file = logfile_;
+		auto old_log = std::move(log_);
+
+		logfile_ = new_log_file;
+		logfile_number_ = new_log_number;
+		log_ = std::move(new_log);
 
 		imm_ = mem_;
 		mem_ = new MemTable(internal_comparator_);
 		mem_->Ref();
 
-		const uint64_t file_number = next_file_number_++;
+		const uint64_t table_number = next_file_number_++;
 		std::unique_ptr<Iterator> iter(imm_->NewIterator());
 
 		uint64_t file_size = 0;
 		InternalKey smallest;
 		InternalKey largest;
-		Status s = BuildTable(dbname_, env_, options_, table_cache_, file_number, iter.get(), &file_size, &smallest, &largest);
+		s = BuildTable(dbname_, env_, options_, table_cache_, table_number, iter.get(), &file_size, &smallest, &largest);
 		if (!s.ok())
 		{
+			log_.reset();
+			Status close_status = logfile_->Close();
+			delete logfile_;
+			logfile_ = nullptr;
+			logfile_number_ = 0;
+			env_->RemoveFile(LogFileName(dbname_, new_log_number));
+
 			mem_->Unref();
 			mem_ = imm_;
 			imm_ = nullptr;
+
+			logfile_ = old_log_file;
+			logfile_number_ = old_log_number;
+			log_ = std::move(old_log);
+			if (!close_status.ok())
+			{
+				return close_status;
+			}
 			return s;
 		}
 
 		if (file_size > 0)
 		{
 			FileMeta meta;
-			meta.number = file_number;
+			meta.number = table_number;
 			meta.file_size = file_size;
 			meta.smallest = smallest;
 			meta.largest = largest;
@@ -358,28 +788,193 @@ namespace prism
 
 		imm_->Unref();
 		imm_ = nullptr;
+
+		old_log.reset();
+		Status old_close = old_log_file->Close();
+		delete old_log_file;
+		if (old_close.ok())
+		{
+			env_->RemoveFile(LogFileName(dbname_, old_log_number));
+			return Status::OK();
+		}
+		return old_close;
+	}
+
+	Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers)
+	{
+		struct LogReporter: public log::Reader::Reporter
+		{
+			Logger* info_log = nullptr;
+			const char* fname = "";
+			Status* status = nullptr;
+
+			void Corruption(size_t bytes, const Status& s) override
+			{
+				Log(info_log, "%s: dropping %d bytes; %s", fname, static_cast<int>(bytes), s.ToString().c_str());
+				if (status != nullptr && status->ok())
+				{
+					*status = s;
+				}
+			}
+		};
+
+		for (size_t i = 0; i < log_numbers.size(); ++i)
+		{
+			const uint64_t log_number = log_numbers[i];
+			const bool last_log = (i + 1 == log_numbers.size());
+
+			const std::string fname = LogFileName(dbname_, log_number);
+			SequentialFile* file = nullptr;
+			Status s = env_->NewSequentialFile(fname, &file);
+			if (!s.ok())
+			{
+				return s;
+			}
+
+			Status read_status;
+			LogReporter reporter;
+			reporter.info_log = options_.info_log;
+			reporter.fname = fname.c_str();
+			reporter.status = options_.paranoid_checks ? &read_status : nullptr;
+
+			log::Reader reader(file, &reporter, true /*verify_checksums*/, 0 /*initial_offset*/);
+
+			std::string scratch;
+			Slice record;
+			int compactions = 0;
+			while (reader.ReadRecord(&record, &scratch) && read_status.ok())
+			{
+				if (record.size() < kHeader)
+				{
+					reporter.Corruption(record.size(), Status::Corruption("log record too small"));
+					continue;
+				}
+
+				WriteBatch batch;
+				WriteBatchInternal::SetContents(&batch, record);
+
+				const auto base = WriteBatchInternal::Sequence(&batch);
+				const auto count = WriteBatchInternal::Count(&batch);
+
+				RecoveryHandler handler(mem_, base);
+				s = batch.Iterate(&handler);
+				if (!s.ok())
+				{
+					break;
+				}
+
+				const SequenceNumber next = base + count;
+				if (next > sequence_)
+				{
+					sequence_ = next;
+				}
+
+				if (mem_->ApproximateMemoryUsage() > options_.write_buffer_size)
+				{
+					++compactions;
+
+					const uint64_t table_number = next_file_number_++;
+					std::unique_ptr<Iterator> iter(mem_->NewIterator());
+
+					uint64_t file_size = 0;
+					InternalKey smallest;
+					InternalKey largest;
+					s = BuildTable(dbname_, env_, options_, table_cache_, table_number, iter.get(), &file_size, &smallest, &largest);
+					if (s.ok() && file_size > 0)
+					{
+						FileMeta meta;
+						meta.number = table_number;
+						meta.file_size = file_size;
+						meta.smallest = smallest;
+						meta.largest = largest;
+						files_.push_back(std::move(meta));
+					}
+					mem_->Unref();
+					mem_ = new MemTable(internal_comparator_);
+					mem_->Ref();
+					if (!s.ok())
+					{
+						break;
+					}
+				}
+			}
+
+			delete file;
+
+			if (!s.ok())
+			{
+				return s;
+			}
+			if (!read_status.ok())
+			{
+				return read_status;
+			}
+			if (options_.paranoid_checks && !reader.status().ok())
+			{
+				return reader.status();
+			}
+
+			// Try to reuse the last log file to avoid creating a new one on open.
+			if (options_.reuse_logs && last_log && compactions == 0)
+			{
+				uint64_t file_size = 0;
+				if (env_->GetFileSize(fname, &file_size).ok() && env_->NewAppendableFile(fname, &logfile_).ok())
+				{
+					logfile_number_ = log_number;
+					log_ = std::make_unique<log::Writer>(logfile_, file_size);
+					return Status::OK();
+				}
+			}
+
+			// Flush any remaining recovered entries into an sstable and delete this log file.
+			if (mem_->ApproximateMemoryUsage() > 0)
+			{
+				const uint64_t table_number = next_file_number_++;
+				std::unique_ptr<Iterator> iter(mem_->NewIterator());
+
+				uint64_t file_size = 0;
+				InternalKey smallest;
+				InternalKey largest;
+				s = BuildTable(dbname_, env_, options_, table_cache_, table_number, iter.get(), &file_size, &smallest, &largest);
+				if (s.ok() && file_size > 0)
+				{
+					FileMeta meta;
+					meta.number = table_number;
+					meta.file_size = file_size;
+					meta.smallest = smallest;
+					meta.largest = largest;
+					files_.push_back(std::move(meta));
+				}
+				mem_->Unref();
+				mem_ = new MemTable(internal_comparator_);
+				mem_->Ref();
+				if (!s.ok())
+				{
+					return s;
+				}
+			}
+
+			env_->RemoveFile(fname);
+		}
+
 		return Status::OK();
 	}
 
-	// Default implementation of Put
-	Status DB::Put(const Slice& key, const Slice& value)
+	Status DBImpl::Put(const WriteOptions& write_options, const Slice& key, const Slice& value)
 	{
 		WriteBatch batch;
 		batch.Put(key, value);
-		return Write(batch);
+		return Write(write_options, &batch);
 	}
 
-	// Default implementation of Delete
-	Status DB::Delete(const Slice& key)
+	Status DBImpl::Delete(const WriteOptions& write_options, const Slice& key)
 	{
 		WriteBatch batch;
 		batch.Delete(key);
-		return Write(batch);
+		return Write(write_options, &batch);
 	}
 
-	Status DBImpl::Put(const Slice& key, const Slice& value) { return DB::Put(key, value); }
-
-	Status DBImpl::Get(const Slice& key, std::string* value)
+	Status DBImpl::Get(const ReadOptions& read_options, const Slice& key, std::string* value)
 	{
 		const SequenceNumber snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
 		LookupKey lkey(key, snapshot);
@@ -397,7 +992,6 @@ namespace prism
 		Slice internal_key = ikey.Encode();
 
 		TableGetState state{ internal_comparator_.user_comparator(), key, value };
-		ReadOptions read_options;
 		for (auto it = files_.rbegin(); it != files_.rend(); ++it)
 		{
 			s = table_cache_->Get(read_options, it->number, it->file_size, internal_key, &state, &SaveValue);
@@ -413,17 +1007,32 @@ namespace prism
 		return Status::NotFound(Slice());
 	}
 
-	Status DBImpl::Delete(const Slice& key) { return DB::Delete(key); }
-
-	Status DBImpl::Write(WriteBatch& batch)
+	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* batch)
 	{
-		WriteBatchInternal::SetSequence(&batch, sequence_);
-		sequence_ += WriteBatchInternal::Count(&batch);
+		if (batch == nullptr)
+		{
+			return Status::InvalidArgument("null WriteBatch");
+		}
+		if (log_ == nullptr || logfile_ == nullptr)
+		{
+			return Status::InvalidArgument("log file not open");
+		}
 
-		Slice record = WriteBatchInternal::Contents(&batch);
-		writer_.AddRecord(record);
+		WriteBatchInternal::SetSequence(batch, sequence_);
+		sequence_ += WriteBatchInternal::Count(batch);
 
-		Status s = ApplyBatch(batch);
+		Slice record = WriteBatchInternal::Contents(batch);
+		Status s = log_->AddRecord(record);
+		if (s.ok() && write_options.sync)
+		{
+			s = logfile_->Sync();
+		}
+		if (!s.ok())
+		{
+			return s;
+		}
+
+		s = ApplyBatch(*batch);
 		if (!s.ok())
 		{
 			return s;
@@ -435,4 +1044,34 @@ namespace prism
 		}
 		return Status::OK();
 	}
+
+	Iterator* DBImpl::NewIterator(const ReadOptions& read_options)
+	{
+		if (read_options.snapshot != nullptr)
+		{
+			return NewErrorIterator(Status::NotSupported("snapshot"));
+		}
+
+		const SequenceNumber snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
+
+		std::vector<Iterator*> children;
+		children.reserve(files_.size() + 2);
+
+		children.push_back(mem_->NewIterator());
+		if (imm_ != nullptr)
+		{
+			children.push_back(imm_->NewIterator());
+		}
+		for (const auto& file : files_)
+		{
+			children.push_back(table_cache_->NewIterator(read_options, file.number, file.file_size));
+		}
+
+		Iterator* internal_iter = NewMergingIterator(&internal_comparator_, children.data(), static_cast<int>(children.size()));
+		return NewDBIterator(internal_comparator_.user_comparator(), internal_iter, snapshot);
+	}
+
+	const Snapshot* DBImpl::GetSnapshot() { return nullptr; }
+
+	void DBImpl::ReleaseSnapshot(const Snapshot* /*snapshot*/) {}
 }
