@@ -3,8 +3,10 @@
 
 #include <string>
 #include <memory>
+#include "options.h"
 #include "status.h"
 #include "slice.h"
+#include "iterator.h"
 #include "write_batch.h"
 
 namespace prism
@@ -18,11 +20,13 @@ namespace prism
 		// Open the database with the specified "name".
 		// Returns a pointer to a heap-allocated database on success.
 		// Returns nullptr on error.
+		static std::unique_ptr<DB> Open(const Options& opts, const std::string& dbname);
 		static std::unique_ptr<DB> Open(const std::string& dbname);
 		
 		// Set the database entry for "key" to "value".
 		// Returns OK on success, and a non-OK status on error.
-		virtual Status Put(const Slice& key, const Slice& value) = 0;
+		virtual Status Put(const WriteOptions& options, const Slice& key, const Slice& value) = 0;
+		Status Put(const Slice& key, const Slice& value) { return Put(WriteOptions(), key, value); }
 		
 		// If the database contains an entry for "key" store the
 		// corresponding value in *value and return OK.
@@ -31,16 +35,26 @@ namespace prism
 		// a status for which Status::IsNotFound() returns true.
 		//
 		// May return some other Status on an error.
-		virtual Status Get(const Slice& key, std::string* value) = 0;
+		virtual Status Get(const ReadOptions& options, const Slice& key, std::string* value) = 0;
+		Status Get(const Slice& key, std::string* value) { return Get(ReadOptions(), key, value); }
 		
 		// Remove the database entry (if any) for "key".  Returns OK on
 		// success, and a non-OK status on error.  It is not an error if "key"
 		// did not exist in the database.
-		virtual Status Delete(const Slice& key) = 0;
+		virtual Status Delete(const WriteOptions& options, const Slice& key) = 0;
+		Status Delete(const Slice& key) { return Delete(WriteOptions(), key); }
 		
 		// Apply the specified updates to the database.
 		// Returns OK on success, non-OK on failure.
-		virtual Status Write(WriteBatch& batch) = 0;
+		virtual Status Write(const WriteOptions& options, WriteBatch* batch) = 0;
+		Status Write(WriteBatch& batch) { return Write(WriteOptions(), &batch); }
+
+		// Return a heap-allocated iterator over the contents of the database.
+		// The caller must delete the iterator when it is no longer needed.
+		virtual Iterator* NewIterator(const ReadOptions& options) = 0;
+
+		virtual const Snapshot* GetSnapshot() = 0;
+		virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
 	};
 } // namespace prism
 

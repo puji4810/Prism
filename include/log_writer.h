@@ -1,29 +1,34 @@
 #ifndef LOG_WRITER_H_
 #define LOG_WRITER_H_
 
-#include <string>
-#include <fstream>
+#include <cstdint>
 #include "slice.h"
+#include "status.h"
 #include "log_format.h"
 
 namespace prism
 {
+	class WritableFile;
+
 	namespace log
 	{
 		class Writer
 		{
 		public:
-			explicit Writer(std::string dest);
-			Writer(std::string dest, uint64_t dest_length);
+			explicit Writer(WritableFile* dest);
+			Writer(WritableFile* dest, uint64_t dest_length);
 
-			void AddRecord(const Slice& record);
+			Writer(const Writer&) = delete;
+			Writer& operator=(const Writer&) = delete;
+			Writer(Writer&&) = delete;
+			Writer& operator=(Writer&&) = delete;
 
-			~Writer();
+			Status AddRecord(const Slice& record);
 
 		private:
-			void EmitPhysicalRecord(RecordType type, const char* ptr, size_t length);
+			Status EmitPhysicalRecord(RecordType type, const char* ptr, size_t length);
 
-			std::ofstream dest_;
+			WritableFile* dest_;
 			uint32_t type_crc_[kMaxRecordType + 1]; // crc32c values for all supported record types.
 			int block_offset_;  // Current offset in block
 		};

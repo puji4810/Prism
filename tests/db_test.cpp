@@ -152,6 +152,37 @@ TEST_F(DBTest, MultipleLargeRecords)
 	EXPECT_EQ(value3, retrieved3);
 }
 
+TEST_F(DBTest, Iterator)
+{
+	Options options;
+	options.create_if_missing = true;
+	options.write_buffer_size = 256;
+	auto db = DB::Open(options, "test_db");
+	ASSERT_NE(db, nullptr);
+
+	ASSERT_TRUE(db->Put("b", "2").ok());
+	ASSERT_TRUE(db->Put("a", "1").ok());
+	ASSERT_TRUE(db->Put("c", "3").ok());
+	ASSERT_TRUE(db->Delete("b").ok());
+
+	ReadOptions ro;
+	std::unique_ptr<Iterator> it(db->NewIterator(ro));
+	it->SeekToFirst();
+
+	ASSERT_TRUE(it->Valid());
+	EXPECT_EQ(it->key().ToString(), "a");
+	EXPECT_EQ(it->value().ToString(), "1");
+
+	it->Next();
+	ASSERT_TRUE(it->Valid());
+	EXPECT_EQ(it->key().ToString(), "c");
+	EXPECT_EQ(it->value().ToString(), "3");
+
+	it->Next();
+	EXPECT_FALSE(it->Valid());
+	EXPECT_TRUE(it->status().ok()) << it->status().ToString();
+}
+
 int main(int argc, char** argv)
 {
 	::testing::InitGoogleTest(&argc, argv);

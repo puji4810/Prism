@@ -55,31 +55,30 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
 - [X]  **Arena** - Fast memory allocator
 - [X]  **SkipList** - Probabilistic ordered index
 - [X]  **WriteBatch** - Atomic batch operations
-- [X]  **Log Writer/Reader** - WAL (currently std::fstream-based)
+- [X]  **Log Writer/Reader** - WAL (Env::SequentialFile/WritableFile + numbered logs)
 - [X]  **InternalKey & LookupKey** - MVCC support
 - [X]  **MemTable** - In-memory write buffer
 - [X]  **Iterator** - Base iterator + TwoLevelIterator + MemTable/Table iterators
+- [X]  **MergingIterator + DBIter** - `DB::NewIterator()` over MemTable + SSTable
 - [X]  **Env (PosixEnv)** - Filesystem abstraction
 - [X]  **Cache (LRU)** - LRU block/metadata cache
 - [X]  **SSTable (core)** - Table/TableBuilder/TableCache (read/write)
 - [X]  **DBImpl (L0-only)** - WAL + MemTable + flush to SSTable + reads across MemTable/SSTable
+- [X]  **DB API (partial LevelDB-aligned)** - `DB::Open(options, dbname)`, Read/WriteOptions, LOCK file
 
 ### 🚧 In Progress
 
 - [ ]  **Filter block / Bloom filter** - write-side FilterBlockBuilder integration
 - [ ]  **Version & VersionSet** - MANIFEST-based metadata + recovery
 - [ ]  **Compaction** - Background merging (multi-level)
-- [ ]  **WAL via Env** - log numbering/rotation + Env::(Sequential|Appendable)File
 
 ### 📋 Planned
 
-- [ ]  **MergingIterator** - Merge MemTable/levels iterators
 - [ ]  **Sharded cache** - Concurrent cache implementation
 - [ ]  **Snapshot** - Point-in-time reads
 
   - [ ]  Snapshot management
   - [ ]  Garbage collection
-- [ ]  **DB::Open(options, dbname)** - full Options plumbing (create_if_missing/error_if_exists, etc.)
 - [ ]  **Compression** - Snappy/Zstd (block compression)
 
 ## 🔑 Key Concepts
