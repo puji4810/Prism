@@ -3,7 +3,14 @@
 
 int main()
 {
-	auto db = prism::DB::Open("my_database");
+	auto db_result = prism::DB::Open("my_database");
+	if (!db_result.has_value())
+	{
+		printf("Open failed: %s\n", db_result.error().ToString().c_str());
+		return 1;
+	}
+
+	auto db = std::move(db_result.value());
 
 	// Example: Put a value
 	// prism::Status s = db->Put("key2", "value2");
@@ -12,19 +19,18 @@ int main()
 	// }
 
 	// Example: Get a value
-	std::string value;
-	prism::Status s = db->Get("key2", &value);
-	if (s.ok())
+	auto value_result = db->Get("key2");
+	if (value_result.has_value())
 	{
-		printf("Got value: %s\n", value.c_str());
+		printf("Got value: %s\n", value_result.value().c_str());
 	}
-	else if (s.IsNotFound())
+	else if (value_result.error().IsNotFound())
 	{
 		printf("Key not found\n");
 	}
 	else
 	{
-		printf("Get failed: %s\n", s.ToString().c_str());
+		printf("Get failed: %s\n", value_result.error().ToString().c_str());
 	}
 
 	return 0;

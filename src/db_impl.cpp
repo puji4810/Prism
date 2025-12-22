@@ -1,6 +1,7 @@
 #include "db_impl.h"
 
 #include "comparator.h"
+#include "db.h"
 #include "dbformat.h"
 #include "env.h"
 #include "filename.h"
@@ -452,7 +453,7 @@ namespace prism
 
 	DB::~DB() = default;
 
-	std::unique_ptr<DB> DB::Open(const Options& options, const std::string& dbname)
+	Result<std::unique_ptr<DB>> DB::Open(const Options& options, const std::string& dbname)
 	{
 		Options opts = options;
 		if (opts.env == nullptr)
@@ -465,14 +466,15 @@ namespace prism
 		}
 
 		auto impl = std::make_unique<DBImpl>(opts, dbname);
-		if (!impl->Recover().ok())
+		Status s = impl->Recover();
+		if (!s.ok())
 		{
-			return nullptr;
+			return std::unexpected(s);
 		}
-		return impl;
+		return std::unique_ptr<DB>(std::move(impl));
 	}
 
-	std::unique_ptr<DB> DB::Open(const std::string& dbname)
+	Result<std::unique_ptr<DB>> DB::Open(const std::string& dbname)
 	{
 		Options options;
 		options.create_if_missing = true;
@@ -974,37 +976,46 @@ namespace prism
 		return Write(write_options, &batch);
 	}
 
-	Status DBImpl::Get(const ReadOptions& read_options, const Slice& key, std::string* value)
+	Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
 	{
+		std::string value;
 		const SequenceNumber snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
 		LookupKey lkey(key, snapshot);
 		Status s;
-		if (mem_->Get(lkey, value, &s))
+		if (mem_->Get(lkey, &value, &s))
 		{
-			return s; // hit: OK or NotFound
+			if (s.ok())
+			{
+				return value;
+			}
+			return std::unexpected(s); // hit: OK or NotFound
 		}
-		if (imm_ && imm_->Get(lkey, value, &s))
+		if (imm_ && imm_->Get(lkey, &value, &s))
 		{
-			return s;
+			if (s.ok())
+			{
+				return value;
+			}
+			return std::unexpected(s);
 		}
 
 		InternalKey ikey(key, snapshot, kValueTypeForSeek);
 		Slice internal_key = ikey.Encode();
 
-		TableGetState state{ internal_comparator_.user_comparator(), key, value };
+		TableGetState state{ internal_comparator_.user_comparator(), key, &value };
 		for (auto it = files_.rbegin(); it != files_.rend(); ++it)
 		{
 			s = table_cache_->Get(read_options, it->number, it->file_size, internal_key, &state, &SaveValue);
 			if (!s.ok())
 			{
-				return s;
+				return std::unexpected(s);
 			}
 			if (state.value_found)
 			{
-				return Status::OK();
+				return value;
 			}
 		}
-		return Status::NotFound(Slice());
+		return std::unexpected(Status::NotFound(Slice()));
 	}
 
 	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* batch)
