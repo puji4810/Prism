@@ -15,6 +15,7 @@ namespace prism
 {
 	class DB
 	{
+		// TODO : multi-thread-safe interface
 	public:
 		DB() = default;
 		virtual ~DB();
@@ -50,8 +51,8 @@ namespace prism
 
 		// Apply the specified updates to the database.
 		// Returns OK on success, non-OK on failure.
-		virtual Status Write(const WriteOptions& options, WriteBatch* batch) = 0;
-		Status Write(WriteBatch& batch) { return Write(WriteOptions(), &batch); }
+		virtual Status Write(const WriteOptions& options, WriteBatch batch) = 0;
+		Status Write(WriteBatch batch) { return Write(WriteOptions(), std::move(batch)); }
 
 		// Return a heap-allocated iterator over the contents of the database.
 		// The caller must delete the iterator when it is no longer needed.
