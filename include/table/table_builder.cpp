@@ -1,14 +1,17 @@
 #include "table_builder.h"
 #include "coding.h"
 #include "env.h"
+#include "filter_policy.h"
 #include "options.h"
 #include "status.h"
 #include "table/block_builder.h"
+#include "table/filter_block.h"
 #include "table/format.h"
 #include "crc32.h"
 #include "crc32c/crc32c.h"
 #include <cassert>
 #include <cstdint>
+#include <memory>
 
 namespace prism
 {
@@ -26,6 +29,11 @@ namespace prism
 		    , pending_index_entry(false)
 		{
 			index_block_options.block_restart_interval = 1; // the interval of index block is 1
+			if (options.filter_policy != nullptr)
+			{
+				filter_block = std::make_unique<FilterBlockBuilder>(options.filter_policy);
+				filter_block->StartBlock(0);
+			}
 		}
 
 		Options options;
@@ -38,7 +46,7 @@ namespace prism
 		std::string last_key;
 		int64_t num_entries; // the number of entres added by the builder
 		bool closed; // Either Finish() or Abandon() has been called.
-		// FilterBlockBuilder* filter_block; // TODO: implement filter block builder
+		std::unique_ptr<FilterBlockBuilder> filter_block;
 
 		// We write the index when we see the first key in next block
 		// This allows us use a shorter index key
@@ -69,6 +77,10 @@ namespace prism
 		if (options.comparator != rep_->options.comparator)
 		{
 			return Status::InvalidArgument("changing comparator while building table");
+		}
+		if (options.filter_policy != rep_->options.filter_policy)
+		{
+			return Status::InvalidArgument("changing filter policy while building table");
 		}
 
 		rep_->options = options;
@@ -101,6 +113,10 @@ namespace prism
 		r->last_key.assign(key.data(), key.size());
 		r->num_entries++;
 		r->data_block.Add(key, value);
+		if (r->filter_block != nullptr)
+		{
+			r->filter_block->AddKey(key);
+		}
 
 		if (r->data_block.CurrentSizeEstimate() >= r->options.block_size)
 		{
@@ -185,11 +201,10 @@ namespace prism
 			r->pending_index_entry = true;
 			r->status = r->file->Flush();
 		}
-		// TODO: filter_block
-		// if (r->filter_block != nullptr)
-		// {
-		// 	r->filter_block->StartBlock(r->offset);
-		// }
+		if (ok() && r->filter_block != nullptr)
+		{
+			r->filter_block->StartBlock(r->offset);
+		}
 	}
 
 	Status TableBuilder::Finish()
@@ -199,30 +214,31 @@ namespace prism
 		assert(!r->closed);
 		r->closed = true;
 
-		// BlockHandle filter_block_handle; // TODO: implement filter block handle when filter_block is added
+		BlockHandle filter_block_handle;
 		BlockHandle metaindex_block_handle, index_block_handle;
 
-		// TODO: filter_block
-		// // Write filter block
-		// if (ok() && r->filter_block != nullptr)
-		// {
-		// 	WriteRawBlock(r->filter_block->Finish(), CompressionType::kNoCompression, &filter_block_handle);
-		// }
+		// Write filter block
+		if (ok() && r->filter_block != nullptr)
+		{
+			WriteRawBlock(r->filter_block->Finish(), CompressionType::kNoCompression, &filter_block_handle);
+		}
 
 		// Write metaindex block
 		if (ok())
 		{
-			BlockBuilder meta_index_block(&r->options);
-			// TODO: filter_block
-			// if (r->filter_block != nullptr)
-			// {
-			// 	// Add mapping from "filter.Name" to location of filter data
-			// 	std::string key = "filter.";
-			// 	key.append(r->options.filter_policy->Name());
-			// 	std::string handle_encoding;
-			// 	filter_block_handle.EncodeTo(&handle_encoding);
-			// 	meta_index_block.Add(key, handle_encoding);
-			// }
+			Options meta_index_block_options = r->options;
+			meta_index_block_options.comparator = BytewiseComparator();
+			meta_index_block_options.block_restart_interval = 1;
+			BlockBuilder meta_index_block(&meta_index_block_options);
+			if (r->filter_block != nullptr)
+			{
+				// Add mapping from "filter.Name" to location of filter data
+				std::string key = "filter.";
+				key.append(r->options.filter_policy->Name());
+				std::string handle_encoding;
+				filter_block_handle.EncodeTo(handle_encoding);
+				meta_index_block.Add(key, handle_encoding);
+			}
 
 			// TODO(postrelease): Add stats and other meta blocks
 			WriteBlock(&meta_index_block, &metaindex_block_handle);
