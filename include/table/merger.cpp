@@ -6,6 +6,10 @@ namespace prism
 {
 	namespace
 	{
+		// A internal wrapper class with an interface similar to Iterator that
+		// caches the valid() and key() results for an underlying iterator.
+		// This can help avoid virtual function calls and also gives better
+		// cache locality.
 		class IteratorWrapper
 		{
 		public:
@@ -112,6 +116,11 @@ namespace prism
 		class MergingIterator: public Iterator
 		{
 		public:
+			// K-way merge of multiple sorted child iterators into one sorted stream.
+			// Takes ownership of `children` iterators (they are deleted via IteratorWrapper).
+			//
+			// This is a pure merge: it does not remove duplicates or apply snapshot/version
+			// semantics (handled by higher-level DB iterators).
 			MergingIterator(const Comparator* comparator, Iterator** children, int n)
 			    : comparator_(comparator)
 			    , children_(new IteratorWrapper[n])
@@ -165,12 +174,18 @@ namespace prism
 
 				if (direction_ != Direction::kForward)
 				{
+					// Direction change: reverse -> forward.
+					// In reverse mode, non-current children are positioned at keys < key() (Prev()
+					// aligns them to a "seek-for-prev"). Forward merging requires them to be at
+					// the first entry >= key(), otherwise FindSmallest() could move backwards.
 					for (int i = 0; i < n_; ++i)
 					{
 						IteratorWrapper* child = &children_[i];
 						if (child != current_)
 						{
 							child->Seek(key());
+							// Seek() is >=. If it lands exactly on key(), advance once so we don't
+							// return the same key again after the direction switch.
 							if (child->Valid() && comparator_->Compare(key(), child->key()) == 0)
 							{
 								child->Next();
@@ -190,6 +205,10 @@ namespace prism
 
 				if (direction_ != Direction::kReverse)
 				{
+					// Direction change: forward -> reverse.
+					// Seek() finds the first entry >= key(). To iterate backwards without
+					// repeating key(), we need each non-current child positioned at the last
+					// entry < key() (a "seek-for-prev").
 					for (int i = 0; i < n_; ++i)
 					{
 						IteratorWrapper* child = &children_[i];
@@ -198,10 +217,13 @@ namespace prism
 							child->Seek(key());
 							if (child->Valid())
 							{
+								// Seek() is >=, so step back to get strictly < key().
 								child->Prev();
 							}
 							else
 							{
+								// Seek() landed at end(): all entries are < key() (or the child is empty).
+								// Jump to the last entry so this child can still participate in reverse merge.
 								child->SeekToLast();
 							}
 						}
@@ -309,4 +331,3 @@ namespace prism
 		return new MergingIterator(comparator, children, n);
 	}
 }
-
