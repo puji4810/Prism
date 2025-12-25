@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <memory>
 
 namespace prism
@@ -966,14 +967,14 @@ namespace prism
 	{
 		WriteBatch batch;
 		batch.Put(key, value);
-		return Write(write_options, &batch);
+		return Write(write_options, std::move(batch));
 	}
 
 	Status DBImpl::Delete(const WriteOptions& write_options, const Slice& key)
 	{
 		WriteBatch batch;
 		batch.Delete(key);
-		return Write(write_options, &batch);
+		return Write(write_options, std::move(batch));
 	}
 
 	Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
@@ -1018,21 +1019,23 @@ namespace prism
 		return std::unexpected(Status::NotFound(Slice()));
 	}
 
-	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* batch)
+	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch batch)
 	{
-		if (batch == nullptr)
+		// TODO : Group commit
+		std::size_t count = WriteBatchInternal::Count(&batch);
+		if (!count)
 		{
-			return Status::InvalidArgument("null WriteBatch");
+			return Status::InvalidArgument("empty WriteBatch");
 		}
 		if (log_ == nullptr || logfile_ == nullptr)
 		{
 			return Status::InvalidArgument("log file not open");
 		}
 
-		WriteBatchInternal::SetSequence(batch, sequence_);
-		sequence_ += WriteBatchInternal::Count(batch);
+		WriteBatchInternal::SetSequence(&batch, sequence_);
+		sequence_ += count;
 
-		Slice record = WriteBatchInternal::Contents(batch);
+		Slice record = WriteBatchInternal::Contents(&batch);
 		Status s = log_->AddRecord(record);
 		if (s.ok() && write_options.sync)
 		{
@@ -1043,7 +1046,7 @@ namespace prism
 			return s;
 		}
 
-		s = ApplyBatch(*batch);
+		s = ApplyBatch(batch);
 		if (!s.ok())
 		{
 			return s;

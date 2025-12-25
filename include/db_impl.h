@@ -23,7 +23,7 @@ namespace prism
 		Status Put(const WriteOptions& options, const Slice& key, const Slice& value) override;
 		Result<std::string> Get(const ReadOptions& options, const Slice& key) override;
 		Status Delete(const WriteOptions& options, const Slice& key) override;
-		Status Write(const WriteOptions& options, WriteBatch* batch) override;
+		Status Write(const WriteOptions& options, WriteBatch batch) override;
 		Iterator* NewIterator(const ReadOptions& options) override;
 		const Snapshot* GetSnapshot() override;
 		void ReleaseSnapshot(const Snapshot* snapshot) override;
