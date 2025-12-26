@@ -1,5 +1,7 @@
 #include "comparator.h"
+#include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 namespace prism
 {
@@ -58,12 +60,18 @@ namespace prism
 		}
 	};
 
-	// TODO： the order destructor of the singleton is not guaranteed,
-	// maybe we need to implement the NoDestructor class
 	const Comparator* BytewiseComparator()
 	{
-		// use new to make sure the destructor is not called
-		static BytewiseComparatorImpl* singleton = new BytewiseComparatorImpl();
+		static std::once_flag flag;
+		// allooc a byte array for placement new
+		// we dont call the destruction
+		// so we avoid the undefined order of destructor
+		alignas(BytewiseComparatorImpl) static std::byte buf[sizeof(BytewiseComparatorImpl)];
+		static BytewiseComparatorImpl* singleton = nullptr;
+
+		std::call_once(flag, [] {
+			singleton = new (buf) BytewiseComparatorImpl();
+		});
 		return singleton;
 	}
 }
