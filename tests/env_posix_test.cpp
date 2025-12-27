@@ -96,7 +96,9 @@ TEST(PosixEnvTest, FileAndDirectoryOps)
 	EXPECT_EQ(file_size, 5u);
 
 	SequentialFile* sf = nullptr;
-	ASSERT_TRUE(env->NewSequentialFile(file_path, &sf).ok());
+	auto r = env->NewSequentialFile(file_path);
+	ASSERT_TRUE(r);
+	sf = std::move(r)->release();
 	ASSERT_NE(sf, nullptr);
 	char scratch[32];
 	Slice got;

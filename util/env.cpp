@@ -74,18 +74,18 @@ namespace prism
 	Status ReadFileToString(Env* env, const std::string& fname, std::string* data)
 	{
 		data->clear();
-		SequentialFile* file;
-		Status s = env->NewSequentialFile(fname, &file);
-		if (!s.ok())
+		Status s;
+		auto file = env->NewSequentialFile(fname);
+		if (!file)
 		{
-			return s;
+			return file.error();
 		}
 		static constexpr int kBufferSize = 8192;
 		char* space = new char[kBufferSize];
 		while (true)
 		{
 			Slice fragment;
-			s = file->Read(kBufferSize, &fragment, space);
+			s = (*file)->Read(kBufferSize, &fragment, space);
 			if (!s.ok())
 			{
 				break;
@@ -97,7 +97,6 @@ namespace prism
 			}
 		}
 		delete[] space;
-		delete file;
 		return s;
 	}
 

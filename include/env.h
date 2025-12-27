@@ -15,10 +15,12 @@
 
 #include <cstdarg>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "status.h"
+#include "result.h"
 
 namespace prism
 {
@@ -58,7 +60,7 @@ namespace prism
 		// NotFound status when the file does not exist.
 		//
 		// The returned file will only be accessed by one thread at a time.
-		virtual Status NewSequentialFile(const std::string& fname, SequentialFile** result) = 0;
+		virtual Result<std::unique_ptr<SequentialFile>> NewSequentialFile(const std::string& fname) = 0;
 
 		// Create an object supporting random-access reads from the file with the
 		// specified name.  On success, stores a pointer to the new file in
@@ -339,7 +341,7 @@ namespace prism
 		[[nodiscard]] Env* target() const noexcept { return target_; }
 
 		// The following text is boilerplate that forwards all methods to target().
-		Status NewSequentialFile(const std::string& f, SequentialFile** r) override { return target_->NewSequentialFile(f, r); }
+		Result<std::unique_ptr<SequentialFile>> NewSequentialFile(const std::string& f) override { return target_->NewSequentialFile(f); }
 		Status NewRandomAccessFile(const std::string& f, RandomAccessFile** r) override { return target_->NewRandomAccessFile(f, r); }
 		Status NewWritableFile(const std::string& f, WritableFile** r) override { return target_->NewWritableFile(f, r); }
 		Status NewAppendableFile(const std::string& f, WritableFile** r) override { return target_->NewAppendableFile(f, r); }
