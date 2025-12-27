@@ -4,6 +4,8 @@
 #include "port/port_config.h"
 #include "port/thread_annotations.h"
 #include "posix_logger.h"
+#include <expected>
+#include <memory>
 #include <set>
 #include <cassert>
 #include <algorithm>
@@ -565,17 +567,14 @@ namespace prism
 			return status;
 		}
 
-		Status NewSequentialFile(const std::string& filename, SequentialFile** result) override
+		Result<std::unique_ptr<SequentialFile>> NewSequentialFile(const std::string& filename) override
 		{
 			int fd = ::open(filename.c_str(), O_RDONLY | kOpenBaseFlags);
 			if (fd < 0)
 			{
-				*result = nullptr;
-				return PosixError(filename, errno);
+				return std::unexpected<Status>(PosixError(filename, errno));
 			}
-
-			*result = new PosixSequentialFile(filename, fd);
-			return Status::OK();
+			return std::make_unique<PosixSequentialFile>(filename,fd);
 		}
 
 		Status NewWritableFile(const std::string& fname, WritableFile** result) override

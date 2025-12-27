@@ -8,6 +8,7 @@
 #include "log_reader.h"
 #include "options.h"
 #include "slice.h"
+#include "status.h"
 #include "table_cache.h"
 #include "table/merger.h"
 #include "table/table_builder.h"
@@ -827,11 +828,12 @@ namespace prism
 			const bool last_log = (i + 1 == log_numbers.size());
 
 			const std::string fname = LogFileName(dbname_, log_number);
-			SequentialFile* file = nullptr;
-			Status s = env_->NewSequentialFile(fname, &file);
-			if (!s.ok())
+			// SequentialFile* file = nullptr;
+			Status s;
+			auto file = env_->NewSequentialFile(fname);
+			if (!file)
 			{
-				return s;
+				return file.error();
 			}
 
 			Status read_status;
@@ -840,7 +842,7 @@ namespace prism
 			reporter.fname = fname.c_str();
 			reporter.status = options_.paranoid_checks ? &read_status : nullptr;
 
-			log::Reader reader(file, &reporter, true /*verify_checksums*/, 0 /*initial_offset*/);
+			log::Reader reader(file.value().get(), &reporter, true /*verify_checksums*/, 0 /*initial_offset*/);
 
 			std::string scratch;
 			Slice record;
@@ -901,8 +903,6 @@ namespace prism
 					}
 				}
 			}
-
-			delete file;
 
 			if (!s.ok())
 			{
