@@ -529,19 +529,17 @@ namespace prism
 			std::abort();
 		}
 
-		Status NewRandomAccessFile(const std::string& fname, RandomAccessFile** result) override
+		Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& fname) override
 		{
 			int fd = ::open(fname.c_str(), O_RDONLY | kOpenBaseFlags);
 			if (fd < 0)
 			{
-				*result = nullptr;
-				return Status::IOError(fname, strerror(errno));
+				return std::unexpected(Status::IOError(fname, strerror(errno)));
 			}
 
 			if (!mmap_limiter_.Acquire())
 			{
-				*result = new PosixRandomAccessFile(fname, fd, &fd_limiter_);
-				return Status::OK();
+				return std::make_unique<PosixRandomAccessFile>(fname, fd, &fd_limiter_);
 			}
 
 			uint64_t file_size;
@@ -551,7 +549,7 @@ namespace prism
 				void* mmap_base = ::mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
 				if (mmap_base != MAP_FAILED)
 				{
-					*result = new PosixMmapReadableFile(fname, reinterpret_cast<char*>(mmap_base), file_size, &mmap_limiter_);
+					return std::make_unique<PosixMmapReadableFile>(fname, reinterpret_cast<char*>(mmap_base), file_size, &mmap_limiter_);
 				}
 				else
 				{
@@ -563,8 +561,10 @@ namespace prism
 			if (!status.ok())
 			{
 				mmap_limiter_.Release();
+				return std::unexpected(status);
 			}
-			return status;
+
+			return std::unexpected(Status::Corruption("should not reach here"));
 		}
 
 		Result<std::unique_ptr<SequentialFile>> NewSequentialFile(const std::string& filename) override
@@ -574,7 +574,7 @@ namespace prism
 			{
 				return std::unexpected<Status>(PosixError(filename, errno));
 			}
-			return std::make_unique<PosixSequentialFile>(filename,fd);
+			return std::make_unique<PosixSequentialFile>(filename, fd);
 		}
 
 		Status NewWritableFile(const std::string& fname, WritableFile** result) override
