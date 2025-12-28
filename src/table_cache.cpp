@@ -48,33 +48,30 @@ namespace prism
 		if (*handle == nullptr)
 		{
 			std::string fname = TableFileName(dbname_, file_number);
-			RandomAccessFile* file = nullptr;
 			Table* table = nullptr;
-			s = env_->NewRandomAccessFile(fname, &file);
-			if (!s.ok())
+			auto file = env_->NewRandomAccessFile(fname);
+			if (!file)
 			{
 				std::string old_fname = SSTTableFileName(dbname_, file_number);
-				if (env_->NewRandomAccessFile(old_fname, &file).ok())
+				if (env_->NewRandomAccessFile(old_fname))
 				{
 					s = Status::OK();
 				}
 			}
 			if (s.ok())
 			{
-				s = Table::Open(options_, file, file_size, &table);
+				s = Table::Open(options_, file.value().get(), file_size, &table);
 			}
 
 			if (!s.ok())
 			{
-				assert(table == nullptr);
-				delete file;
-				// We do not cache error results so that if the error is transient,
+				assert(table == nullptr);				// We do not cache error results so that if the error is transient,
 				// or somebody repairs the file, we recover automatically.
 			}
 			else
 			{
 				TableAndFile* tf = new TableAndFile;
-				tf->file = file;
+				tf->file = file.value().release(); //  release the ownership to tf
 				tf->table = table;
 				*handle = cache_->Insert(key, tf, 1, &DeleteEntry);
 			}

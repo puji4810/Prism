@@ -70,7 +70,7 @@ namespace prism
 		// not exist.
 		//
 		// The returned file may be concurrently accessed by multiple threads.
-		virtual Status NewRandomAccessFile(const std::string& fname, RandomAccessFile** result) = 0;
+		virtual Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& fname) = 0;
 
 		// Create an object that writes to a new file with the specified
 		// name.  Deletes any existing file with the same name and creates a
@@ -342,7 +342,7 @@ namespace prism
 
 		// The following text is boilerplate that forwards all methods to target().
 		Result<std::unique_ptr<SequentialFile>> NewSequentialFile(const std::string& f) override { return target_->NewSequentialFile(f); }
-		Status NewRandomAccessFile(const std::string& f, RandomAccessFile** r) override { return target_->NewRandomAccessFile(f, r); }
+		Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& f) override { return target_->NewRandomAccessFile(f); }
 		Status NewWritableFile(const std::string& f, WritableFile** r) override { return target_->NewWritableFile(f, r); }
 		Status NewAppendableFile(const std::string& f, WritableFile** r) override { return target_->NewAppendableFile(f, r); }
 		bool FileExists(const std::string& f) override { return target_->FileExists(f); }

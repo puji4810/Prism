@@ -132,11 +132,12 @@ TEST(TableTest, BuildAndIterate)
 
 	uint64_t file_size = std::filesystem::file_size(fname);
 
-	RandomAccessFile* raf = nullptr;
-	ASSERT_TRUE(env->NewRandomAccessFile(fname, &raf).ok());
+	// RandomAccessFile* raf = nullptr;
+	auto raf = env->NewRandomAccessFile(fname);
+	ASSERT_TRUE(raf);
 
 	Table* table = nullptr;
-	ASSERT_TRUE(Table::Open(options, raf, file_size, &table).ok());
+	ASSERT_TRUE(Table::Open(options, raf.value().get(), file_size, &table).ok());
 	ASSERT_NE(table, nullptr);
 
 	ReadOptions ro;
@@ -152,7 +153,6 @@ TEST(TableTest, BuildAndIterate)
 	EXPECT_EQ(idx, kvs.size());
 
 	delete table;
-	delete raf;
 	std::filesystem::remove(fname);
 }
 
@@ -178,11 +178,12 @@ TEST(TableTest, InternalGet)
 	delete wf;
 
 	uint64_t file_size = std::filesystem::file_size(fname);
-	RandomAccessFile* raf = nullptr;
-	ASSERT_TRUE(env->NewRandomAccessFile(fname, &raf).ok());
+	// RandomAccessFile* raf = nullptr;
+	auto raf = env->NewRandomAccessFile(fname);
+	ASSERT_TRUE(raf);
 
 	Table* table = nullptr;
-	ASSERT_TRUE(Table::Open(options, raf, file_size, &table).ok());
+	ASSERT_TRUE(Table::Open(options, raf.value().get(), file_size, &table).ok());
 	ASSERT_NE(table, nullptr);
 
 	ReadOptions ro;
@@ -203,7 +204,6 @@ TEST(TableTest, InternalGet)
 	EXPECT_FALSE(found);
 
 	delete table;
-	delete raf;
 	std::filesystem::remove(fname);
 }
 
@@ -231,12 +231,13 @@ TEST(TableTest, FilterBlockSkipsDataReads)
 	delete wf;
 
 	uint64_t file_size = std::filesystem::file_size(fname);
-	RandomAccessFile* raf = nullptr;
-	ASSERT_TRUE(env->NewRandomAccessFile(fname, &raf).ok());
+	// RandomAccessFile* raf = nullptr;
+	auto raf = env->NewRandomAccessFile(fname);
+	ASSERT_TRUE(raf);
 
 	uint64_t read_calls = 0;
 	uint64_t read_bytes = 0;
-	CountingRandomAccessFile counting_file(raf, &read_calls, &read_bytes);
+	CountingRandomAccessFile counting_file(raf.value().get(), &read_calls, &read_bytes);
 
 	Table* table = nullptr;
 	ASSERT_TRUE(Table::Open(options, &counting_file, file_size, &table).ok());
@@ -260,7 +261,6 @@ TEST(TableTest, FilterBlockSkipsDataReads)
 	EXPECT_GT(read_calls, baseline_hit);
 
 	delete table;
-	delete raf;
 	std::filesystem::remove(fname);
 }
 
@@ -286,14 +286,15 @@ TEST(TableTest, BlockCacheFillAndBypass)
 	delete wf;
 
 	uint64_t file_size = std::filesystem::file_size(fname);
-	RandomAccessFile* raf = nullptr;
-	ASSERT_TRUE(env->NewRandomAccessFile(fname, &raf).ok());
+	// RandomAccessFile* raf = nullptr;
+	auto raf = env->NewRandomAccessFile(fname);
+	ASSERT_TRUE(raf);
 
 	std::unique_ptr<Cache> block_cache(NewLRUCache(1024 * 1024));
 	options.block_cache = block_cache.get();
 
 	Table* table = nullptr;
-	ASSERT_TRUE(Table::Open(options, raf, file_size, &table).ok());
+	ASSERT_TRUE(Table::Open(options, raf.value().get(), file_size, &table).ok());
 	ASSERT_NE(table, nullptr);
 
 	// 1) fill_cache = false -> should not populate block_cache
@@ -318,7 +319,6 @@ TEST(TableTest, BlockCacheFillAndBypass)
 	EXPECT_EQ(value, "2");
 
 	delete table;
-	delete raf;
 	std::filesystem::remove(fname);
 }
 
