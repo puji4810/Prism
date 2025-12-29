@@ -273,7 +273,6 @@ TEST(TableTest, BlockCacheFillAndBypass)
 	Options options;
 	options.comparator = BytewiseComparator();
 
-	ASSERT_TRUE(env->NewWritableFile(fname));
 	auto result = env->NewWritableFile(fname);
 	ASSERT_TRUE(result.has_value());
 	auto wf = std::move(result.value());
