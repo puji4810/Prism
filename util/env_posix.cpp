@@ -549,6 +549,7 @@ namespace prism
 				void* mmap_base = ::mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
 				if (mmap_base != MAP_FAILED)
 				{
+					::close(fd);
 					return std::make_unique<PosixMmapReadableFile>(fname, reinterpret_cast<char*>(mmap_base), file_size, &mmap_limiter_);
 				}
 				else
