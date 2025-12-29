@@ -79,7 +79,7 @@ namespace prism
 		// returns non-OK.
 		//
 		// The returned file will only be accessed by one thread at a time.
-		virtual Status NewWritableFile(const std::string& fname, WritableFile** result) = 0;
+		virtual Result<std::unique_ptr<WritableFile>> NewWritableFile(const std::string& fname) = 0;
 
 		// Create an object that either appends to an existing file, or
 		// writes to a new file (if the file does not exist to begin with).
@@ -343,7 +343,7 @@ namespace prism
 		// The following text is boilerplate that forwards all methods to target().
 		Result<std::unique_ptr<SequentialFile>> NewSequentialFile(const std::string& f) override { return target_->NewSequentialFile(f); }
 		Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& f) override { return target_->NewRandomAccessFile(f); }
-		Status NewWritableFile(const std::string& f, WritableFile** r) override { return target_->NewWritableFile(f, r); }
+		Result<std::unique_ptr<WritableFile>> NewWritableFile(const std::string& f) override { return target_->NewWritableFile(f); }
 		Status NewAppendableFile(const std::string& f, WritableFile** r) override { return target_->NewAppendableFile(f, r); }
 		bool FileExists(const std::string& f) override { return target_->FileExists(f); }
 		Status GetChildren(const std::string& dir, std::vector<std::string>* r) override { return target_->GetChildren(dir, r); }

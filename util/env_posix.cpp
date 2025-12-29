@@ -577,17 +577,14 @@ namespace prism
 			return std::make_unique<PosixSequentialFile>(filename, fd);
 		}
 
-		Status NewWritableFile(const std::string& fname, WritableFile** result) override
+		Result<std::unique_ptr<WritableFile>> NewWritableFile(const std::string& fname) override
 		{
 			int fd = ::open(fname.c_str(), O_WRONLY | O_CREAT | O_TRUNC | kOpenBaseFlags, 0644);
 			if (fd < 0)
 			{
-				*result = nullptr;
-				return PosixError(fname, errno);
+				return std::unexpected<Status>(PosixError(fname, errno));
 			}
-
-			*result = new PosixWritableFile(fname, fd);
-			return Status::OK();
+			return std::make_unique<PosixWritableFile>(fname, fd);
 		}
 
 		Status NewAppendableFile(const std::string& fname, WritableFile** result) override

@@ -82,12 +82,12 @@ TEST(PosixEnvTest, FileAndDirectoryOps)
 
 	const auto file_path = (test_dir / "a.txt").string();
 
-	WritableFile* wf = nullptr;
-	ASSERT_TRUE(env->NewWritableFile(file_path, &wf).ok());
+	auto result = env->NewWritableFile(file_path);
+	ASSERT_TRUE(result.has_value());
+	auto wf = std::move(result.value());
 	ASSERT_NE(wf, nullptr);
 	ASSERT_TRUE(wf->Append(Slice("hello")).ok());
 	ASSERT_TRUE(wf->Close().ok());
-	delete wf;
 
 	EXPECT_TRUE(env->FileExists(file_path));
 

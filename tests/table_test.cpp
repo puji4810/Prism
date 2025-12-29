@@ -113,10 +113,11 @@ TEST(TableTest, BuildAndIterate)
 	Options options;
 	options.comparator = BytewiseComparator();
 
-	WritableFile* wf = nullptr;
-	ASSERT_TRUE(env->NewWritableFile(fname, &wf).ok());
+	auto result = env->NewWritableFile(fname);
+	ASSERT_TRUE(result.has_value());
+	auto wf = std::move(result.value());
 
-	TableBuilder builder(options, wf);
+	TableBuilder builder(options, wf.get());
 	std::vector<std::pair<std::string, std::string>> kvs = {
 		{ "a", "1" },
 		{ "b", "2" },
@@ -128,7 +129,6 @@ TEST(TableTest, BuildAndIterate)
 	}
 	ASSERT_TRUE(builder.Finish().ok());
 	ASSERT_TRUE(wf->Close().ok());
-	delete wf;
 
 	uint64_t file_size = std::filesystem::file_size(fname);
 
@@ -165,17 +165,17 @@ TEST(TableTest, InternalGet)
 	Options options;
 	options.comparator = BytewiseComparator();
 
-	WritableFile* wf = nullptr;
-	ASSERT_TRUE(env->NewWritableFile(fname, &wf).ok());
+	auto result = env->NewWritableFile(fname);
+	ASSERT_TRUE(result.has_value());
+	auto wf = std::move(result.value());
 	{
-		TableBuilder builder(options, wf);
+		TableBuilder builder(options, wf.get());
 		builder.Add(Slice("a"), Slice("1"));
 		builder.Add(Slice("b"), Slice("2"));
 		builder.Add(Slice("c"), Slice("3"));
 		ASSERT_TRUE(builder.Finish().ok());
 	}
 	ASSERT_TRUE(wf->Close().ok());
-	delete wf;
 
 	uint64_t file_size = std::filesystem::file_size(fname);
 	// RandomAccessFile* raf = nullptr;
@@ -218,17 +218,17 @@ TEST(TableTest, FilterBlockSkipsDataReads)
 	options.comparator = BytewiseComparator();
 	options.filter_policy = &policy;
 
-	WritableFile* wf = nullptr;
-	ASSERT_TRUE(env->NewWritableFile(fname, &wf).ok());
+	auto result = env->NewWritableFile(fname);
+	ASSERT_TRUE(result.has_value());
+	auto wf = std::move(result.value());
 	{
-		TableBuilder builder(options, wf);
+		TableBuilder builder(options, wf.get());
 		builder.Add(Slice("a"), Slice("1"));
 		builder.Add(Slice("b"), Slice("2"));
 		builder.Add(Slice("c"), Slice("3"));
 		ASSERT_TRUE(builder.Finish().ok());
 	}
 	ASSERT_TRUE(wf->Close().ok());
-	delete wf;
 
 	uint64_t file_size = std::filesystem::file_size(fname);
 	// RandomAccessFile* raf = nullptr;
@@ -273,17 +273,18 @@ TEST(TableTest, BlockCacheFillAndBypass)
 	Options options;
 	options.comparator = BytewiseComparator();
 
-	WritableFile* wf = nullptr;
-	ASSERT_TRUE(env->NewWritableFile(fname, &wf).ok());
+	ASSERT_TRUE(env->NewWritableFile(fname));
+	auto result = env->NewWritableFile(fname);
+	ASSERT_TRUE(result.has_value());
+	auto wf = std::move(result.value());
 	{
-		TableBuilder builder(options, wf);
+		TableBuilder builder(options, wf.get());
 		builder.Add(Slice("a"), Slice("1"));
 		builder.Add(Slice("b"), Slice("2"));
 		builder.Add(Slice("c"), Slice("3"));
 		ASSERT_TRUE(builder.Finish().ok());
 	}
 	ASSERT_TRUE(wf->Close().ok());
-	delete wf;
 
 	uint64_t file_size = std::filesystem::file_size(fname);
 	// RandomAccessFile* raf = nullptr;

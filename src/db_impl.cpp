@@ -46,14 +46,15 @@ namespace prism
 			}
 
 			const std::string fname = TableFileName(dbname, file_number);
-			WritableFile* file = nullptr;
-			Status s = env->NewWritableFile(fname, &file);
-			if (!s.ok())
+			Status s;
+			auto result = env->NewWritableFile(fname);
+			if (!result.has_value())
 			{
-				return s;
+				return result.error();
 			}
+			auto file = std::move(result.value());
 
-			TableBuilder builder(options, file);
+			TableBuilder builder(options, file.get());
 			smallest->DecodeFrom(iter->key());
 
 			for (; iter->Valid(); iter->Next())
@@ -87,8 +88,6 @@ namespace prism
 			{
 				s = file->Close();
 			}
-
-			delete file;
 
 			if (!s.ok())
 			{
@@ -541,15 +540,15 @@ namespace prism
 	Status DBImpl::NewLogFile()
 	{
 		const uint64_t new_log_number = next_file_number_++;
-		WritableFile* file = nullptr;
-		Status s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &file);
-		if (!s.ok())
+		auto result = env_->NewWritableFile(LogFileName(dbname_, new_log_number));
+		if (!result.has_value())
 		{
-			return s;
+			return result.error();
 		}
-		logfile_ = file;
+		auto file = std::move(result.value());
+		logfile_ = file.release();
 		logfile_number_ = new_log_number;
-		log_ = std::make_unique<log::Writer>(file);
+		log_ = std::make_unique<log::Writer>(logfile_);
 		return Status::OK();
 	}
 
@@ -730,13 +729,13 @@ namespace prism
 		}
 
 		const uint64_t new_log_number = next_file_number_++;
-		WritableFile* new_log_file = nullptr;
-		Status s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &new_log_file);
-		if (!s.ok())
+		Status s;
+		auto result = env_->NewWritableFile(LogFileName(dbname_, new_log_number));
+		if (!result.has_value())
 		{
-			return s;
+			return result.error();
 		}
-		auto new_log = std::make_unique<log::Writer>(new_log_file);
+		auto new_log_file = std::move(result.value()).release();
 
 		const uint64_t old_log_number = logfile_number_;
 		WritableFile* old_log_file = logfile_;
@@ -744,7 +743,7 @@ namespace prism
 
 		logfile_ = new_log_file;
 		logfile_number_ = new_log_number;
-		log_ = std::move(new_log);
+		log_ = std::make_unique<log::Writer>(new_log_file);
 
 		imm_ = mem_;
 		mem_ = new MemTable(internal_comparator_);
