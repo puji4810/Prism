@@ -107,7 +107,9 @@ TEST(PosixEnvTest, FileAndDirectoryOps)
 	delete sf;
 
 	WritableFile* af = nullptr;
-	ASSERT_TRUE(env->NewAppendableFile(file_path, &af).ok());
+	auto appendable_result = env->NewAppendableFile(file_path);
+	ASSERT_TRUE(appendable_result.has_value());
+	af = std::move(appendable_result.value()).release();
 	ASSERT_NE(af, nullptr);
 	ASSERT_TRUE(af->Append(Slice(" world")).ok());
 	ASSERT_TRUE(af->Close().ok());

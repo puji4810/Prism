@@ -93,7 +93,7 @@ namespace prism
 		// not allow appending to an existing file.  Users of Env (including
 		// the leveldb implementation) must be prepared to deal with
 		// an Env that does not support appending.
-		virtual Status NewAppendableFile(const std::string& fname, WritableFile** result);
+		virtual Result<std::unique_ptr<WritableFile>> NewAppendableFile(const std::string& fname);
 
 		// Returns true iff the named file exists.
 		[[nodiscard]] virtual bool FileExists(const std::string& fname) = 0;
@@ -344,7 +344,7 @@ namespace prism
 		Result<std::unique_ptr<SequentialFile>> NewSequentialFile(const std::string& f) override { return target_->NewSequentialFile(f); }
 		Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& f) override { return target_->NewRandomAccessFile(f); }
 		Result<std::unique_ptr<WritableFile>> NewWritableFile(const std::string& f) override { return target_->NewWritableFile(f); }
-		Status NewAppendableFile(const std::string& f, WritableFile** r) override { return target_->NewAppendableFile(f, r); }
+		Result<std::unique_ptr<WritableFile>> NewAppendableFile(const std::string& f) override { return target_->NewAppendableFile(f); }
 		bool FileExists(const std::string& f) override { return target_->FileExists(f); }
 		Status GetChildren(const std::string& dir, std::vector<std::string>* r) override { return target_->GetChildren(dir, r); }
 		Status RemoveFile(const std::string& f) override { return target_->RemoveFile(f); }
