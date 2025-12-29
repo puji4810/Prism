@@ -921,13 +921,13 @@ namespace prism
 			{
 				uint64_t file_size = 0;
 				auto logfile_result = env_->NewAppendableFile(fname);
-				if (!logfile_result.has_value())
+				if (!logfile_result)
 				{
-					return logfile_result.error();
+					// ignore and fall through
 				}
-				logfile_ = logfile_result.value().release();
-				if (env_->GetFileSize(fname, &file_size).ok())
+				else if (env_->GetFileSize(fname, &file_size).ok())
 				{
+					logfile_ = logfile_result.value().release();
 					logfile_number_ = log_number;
 					log_ = std::make_unique<log::Writer>(logfile_, file_size);
 					return Status::OK();
@@ -946,12 +946,7 @@ namespace prism
 				s = BuildTable(dbname_, env_, options_, table_cache_, table_number, iter.get(), &file_size, &smallest, &largest);
 				if (s.ok() && file_size > 0)
 				{
-					FileMeta meta;
-					meta.number = table_number;
-					meta.file_size = file_size;
-					meta.smallest = smallest;
-					meta.largest = largest;
-					files_.push_back(std::move(meta));
+					files_.emplace_back(FileMeta{ table_number, file_size, smallest, largest });
 				}
 				mem_->Unref();
 				mem_ = new MemTable(internal_comparator_);
@@ -1096,7 +1091,7 @@ namespace prism
 
 	Status DestroyDB(const std::string& dbname, const Options& options)
 	{
-		Env* env = options.env;
+		Env* env = options.env ? options.env : Env::Default();
 		std::vector<std::string> filenames;
 		Status result = env->GetChildren(dbname, &filenames);
 		if (!result.ok())
