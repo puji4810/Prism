@@ -38,12 +38,13 @@ namespace prism
 	// Internal helper for WriteStringToFile
 	static Status DoWriteStringToFile(Env* env, const Slice& data, const std::string& fname, bool should_sync)
 	{
-		WritableFile* file;
-		Status s = env->NewWritableFile(fname, &file);
-		if (!s.ok())
+		Status s = Status::OK();
+		Result<std::unique_ptr<WritableFile>> result = env->NewWritableFile(fname);
+		if (!result.has_value())
 		{
-			return s;
+			return result.error();
 		}
+		auto file = std::move(result.value());
 		s = file->Append(data);
 		if (s.ok() && should_sync)
 		{
@@ -53,7 +54,6 @@ namespace prism
 		{
 			s = file->Close();
 		}
-		delete file; // Will auto-close if we did not close above
 		if (!s.ok())
 		{
 			env->RemoveFile(fname);
