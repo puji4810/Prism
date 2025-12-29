@@ -9,9 +9,9 @@ namespace prism
 {
 
 	// Default implementations for deprecated methods
-	Status Env::NewAppendableFile(const std::string& fname, WritableFile** result)
+	Result<std::unique_ptr<WritableFile>> Env::NewAppendableFile(const std::string& fname)
 	{
-		return Status::NotSupported("NewAppendableFile not supported", fname);
+		return std::unexpected<Status>(Status::NotSupported("NewAppendableFile not supported", fname));
 	}
 
 	// Legacy method forwarding for compatibility
