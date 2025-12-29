@@ -53,30 +53,24 @@ namespace prism
 			if (!file)
 			{
 				std::string old_fname = SSTTableFileName(dbname_, file_number);
-				if (env_->NewRandomAccessFile(old_fname))
+				file = env_->NewRandomAccessFile(old_fname);
+				if (!file)
 				{
-					s = Status::OK();
+					return file.error();
 				}
 			}
-			if (s.ok())
+			auto table_result = Table::Open(options_, file.value().get(), file_size, &table);
+			if (!table_result.ok())
 			{
-				s = Table::Open(options_, file.value().get(), file_size, &table);
+				return table_result;
 			}
-
-			if (!s.ok())
-			{
-				assert(table == nullptr);				// We do not cache error results so that if the error is transient,
-				// or somebody repairs the file, we recover automatically.
-			}
-			else
-			{
-				TableAndFile* tf = new TableAndFile;
-				tf->file = file.value().release(); //  release the ownership to tf
-				tf->table = table;
-				*handle = cache_->Insert(key, tf, 1, &DeleteEntry);
-			}
+			assert(table != nullptr);
+			TableAndFile* tf = new TableAndFile;
+			tf->file = file.value().release(); //  release the ownership to tf
+			tf->table = table;
+			*handle = cache_->Insert(key, tf, 1, &DeleteEntry);
 		}
-		return s;
+		return Status::OK();
 	}
 
 	Iterator* TableCache::NewIterator(const ReadOptions& options, uint64_t file_number, uint64_t file_size, Table** tableptr)
