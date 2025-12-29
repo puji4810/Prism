@@ -920,7 +920,13 @@ namespace prism
 			if (options_.reuse_logs && last_log && compactions == 0)
 			{
 				uint64_t file_size = 0;
-				if (env_->GetFileSize(fname, &file_size).ok() && env_->NewAppendableFile(fname, &logfile_).ok())
+				auto logfile_result = env_->NewAppendableFile(fname);
+				if (!logfile_result.has_value())
+				{
+					return logfile_result.error();
+				}
+				logfile_ = logfile_result.value().release();
+				if (env_->GetFileSize(fname, &file_size).ok())
 				{
 					logfile_number_ = log_number;
 					log_ = std::make_unique<log::Writer>(logfile_, file_size);
