@@ -15,7 +15,6 @@ namespace prism
 {
 	class DB
 	{
-		// TODO : multi-thread-safe interface
 	public:
 		DB() = default;
 		virtual ~DB();
