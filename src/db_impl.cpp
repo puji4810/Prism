@@ -672,20 +672,19 @@ namespace prism
 				continue;
 			}
 
-			uint64_t file_size = 0;
 			std::string fname = TableFileName(dbname_, number);
-			s = env_->GetFileSize(fname, &file_size);
-			if (!s.ok())
+			auto file_size = env_->GetFileSize(fname);
+			if (!file_size.has_value())
 			{
 				fname = SSTTableFileName(dbname_, number);
-				s = env_->GetFileSize(fname, &file_size);
-			}
-			if (!s.ok())
-			{
-				continue;
+				file_size = env_->GetFileSize(fname);
+				if (!file_size.has_value())
+				{
+					continue;
+				}
 			}
 
-			std::unique_ptr<Iterator> iter(table_cache_->NewIterator(ReadOptions(), number, file_size));
+			std::unique_ptr<Iterator> iter(table_cache_->NewIterator(ReadOptions(), number, file_size.value()));
 			iter->SeekToFirst();
 			if (!iter->status().ok())
 			{
@@ -698,7 +697,7 @@ namespace prism
 
 			FileMeta meta;
 			meta.number = number;
-			meta.file_size = file_size;
+			meta.file_size = file_size.value();
 			meta.smallest.DecodeFrom(iter->key());
 			iter->SeekToLast();
 			if (iter->Valid())
@@ -926,11 +925,11 @@ namespace prism
 				{
 					// ignore and fall through
 				}
-				else if (env_->GetFileSize(fname, &file_size).ok())
+				else if (auto file_size = env_->GetFileSize(fname); file_size.has_value())
 				{
 					logfile_ = logfile_result.value().release();
 					logfile_number_ = log_number;
-					log_ = std::make_unique<log::Writer>(logfile_, file_size);
+					log_ = std::make_unique<log::Writer>(logfile_, file_size.value());
 					return Status::OK();
 				}
 			}
@@ -1099,7 +1098,7 @@ namespace prism
 			// Ignore error in case directory does not exist
 			return Status::OK();
 		}
-		Status result;
+		Status result{};
 
 		FileLock* lock;
 		const std::string lockname = LockFileName(dbname);
