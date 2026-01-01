@@ -544,7 +544,7 @@ namespace prism
 				return std::make_unique<PosixRandomAccessFile>(fname, fd, &fd_limiter_);
 			}
 
-			Status status;
+			Status status{};
 			auto file_size = GetFileSize(fname);
 			if (!file_size.has_value())
 			{
