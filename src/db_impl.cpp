@@ -5,6 +5,7 @@
 #include "dbformat.h"
 #include "env.h"
 #include "filename.h"
+#include "iterator.h"
 #include "log_reader.h"
 #include "options.h"
 #include "slice.h"
@@ -1059,11 +1060,11 @@ namespace prism
 		return Status::OK();
 	}
 
-	Iterator* DBImpl::NewIterator(const ReadOptions& read_options)
+	std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& read_options)
 	{
 		if (read_options.snapshot != nullptr)
 		{
-			return NewErrorIterator(Status::NotSupported("snapshot"));
+			return std::make_unique<EmptyIterator>(Status::NotSupported("snapshot"));
 		}
 
 		const SequenceNumber snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
@@ -1082,7 +1083,7 @@ namespace prism
 		}
 
 		Iterator* internal_iter = NewMergingIterator(&internal_comparator_, children.data(), static_cast<int>(children.size()));
-		return NewDBIterator(internal_comparator_.user_comparator(), internal_iter, snapshot);
+		return std::make_unique<DBIter>(internal_comparator_.user_comparator(), internal_iter, snapshot);
 	}
 
 	const Snapshot* DBImpl::GetSnapshot() { return nullptr; }
