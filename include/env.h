@@ -101,7 +101,7 @@ namespace prism
 		// Store in *result the names of the children of the specified directory.
 		// The names are relative to "dir".
 		// Original contents of *results are dropped.
-		virtual Status GetChildren(const std::string& dir, std::vector<std::string>* result) = 0;
+		virtual Result<std::vector<std::string>> GetChildren(const std::string& dir) = 0;
 		// Delete the named file.
 		//
 		// The default implementation calls DeleteFile, to support legacy Env
@@ -346,7 +346,7 @@ namespace prism
 		Result<std::unique_ptr<WritableFile>> NewWritableFile(const std::string& f) override { return target_->NewWritableFile(f); }
 		Result<std::unique_ptr<WritableFile>> NewAppendableFile(const std::string& f) override { return target_->NewAppendableFile(f); }
 		bool FileExists(const std::string& f) override { return target_->FileExists(f); }
-		Status GetChildren(const std::string& dir, std::vector<std::string>* r) override { return target_->GetChildren(dir, r); }
+		Result<std::vector<std::string>> GetChildren(const std::string& dir) override { return target_->GetChildren(dir); }
 		Status RemoveFile(const std::string& f) override { return target_->RemoveFile(f); }
 		Status CreateDir(const std::string& d) override { return target_->CreateDir(d); }
 		Status RemoveDir(const std::string& d) override { return target_->RemoveDir(d); }

@@ -639,15 +639,15 @@ namespace prism
 		files_.clear();
 		log_numbers->clear();
 
-		std::vector<std::string> filenames;
-		Status s = env_->GetChildren(dbname_, &filenames);
-		if (!s.ok())
+		Status s;
+		auto filenames = env_->GetChildren(dbname_);
+		if (!filenames.has_value())
 		{
-			return s;
+			return filenames.error();
 		}
 
 		uint64_t max_number = 0;
-		for (const auto& name : filenames)
+		for (const auto& name : filenames.value())
 		{
 			uint64_t number = 0;
 			FileType type;
@@ -1093,13 +1093,13 @@ namespace prism
 	Status DestroyDB(const std::string& dbname, const Options& options)
 	{
 		Env* env = options.env ? options.env : Env::Default();
-		std::vector<std::string> filenames;
-		Status result = env->GetChildren(dbname, &filenames);
-		if (!result.ok())
+		auto filenames = env->GetChildren(dbname);
+		if (!filenames.has_value())
 		{
 			// Ignore error in case directory does not exist
 			return Status::OK();
 		}
+		Status result;
 
 		FileLock* lock;
 		const std::string lockname = LockFileName(dbname);
@@ -1108,11 +1108,11 @@ namespace prism
 		{
 			uint64_t number;
 			FileType type;
-			for (size_t i = 0; i < filenames.size(); i++)
+			for (size_t i = 0; i < filenames.value().size(); i++)
 			{
-				if (ParseFileName(filenames[i], &number, &type) && type != FileType::kDBLockFile)
+				if (ParseFileName(filenames.value()[i], &number, &type) && type != FileType::kDBLockFile)
 				{ // Lock file will be deleted at end
-					Status del = env->RemoveFile(dbname + "/" + filenames[i]);
+					Status del = env->RemoveFile(dbname + "/" + filenames.value().at(i));
 					if (result.ok() && !del.ok())
 					{
 						result = del;
