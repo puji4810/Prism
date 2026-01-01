@@ -2,7 +2,10 @@
 #include "write_batch.h"
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <filesystem>
+#include <thread>
+#include <vector>
 
 using namespace prism;
 
@@ -199,6 +202,90 @@ TEST_F(DBTest, Iterator)
 	it->Next();
 	EXPECT_FALSE(it->Valid());
 	EXPECT_TRUE(it->status().ok()) << it->status().ToString();
+}
+
+TEST_F(DBTest, ThreadSafeConcurrentPutGet)
+{
+	auto res = DB::Open("test_db");
+	ASSERT_TRUE(res.has_value());
+	auto db = std::move(res.value());
+
+	constexpr int kWriterThreads = 4;
+	constexpr int kReaderThreads = 4;
+	constexpr int kKeysPerWriter = 200;
+
+	std::atomic<bool> start{ false };
+	std::atomic<bool> writers_done{ false };
+
+	auto key_for = [](int writer, int i) { return "key_" + std::to_string(writer) + "_" + std::to_string(i); };
+	auto value_for = [](int writer, int i) { return "value_" + std::to_string(writer) + "_" + std::to_string(i); };
+
+	std::vector<std::thread> threads;
+	threads.reserve(kWriterThreads + kReaderThreads);
+
+	for (int t = 0; t < kWriterThreads; ++t)
+	{
+		threads.emplace_back([&, t]
+		    {
+			    while (!start.load(std::memory_order_acquire))
+			    {
+			    }
+			    for (int i = 0; i < kKeysPerWriter; ++i)
+			    {
+				    ASSERT_TRUE(db->Put(key_for(t, i), value_for(t, i)).ok());
+			    }
+		    });
+	}
+
+	for (int t = 0; t < kReaderThreads; ++t)
+	{
+		threads.emplace_back([&]
+		    {
+			    while (!start.load(std::memory_order_acquire))
+			    {
+			    }
+			    while (!writers_done.load(std::memory_order_acquire))
+			    {
+				    for (int w = 0; w < kWriterThreads; ++w)
+				    {
+					    for (int i = 0; i < kKeysPerWriter; i += 17)
+					    {
+						    auto r = db->Get(key_for(w, i));
+						    if (r.has_value())
+						    {
+							    ASSERT_EQ(r.value(), value_for(w, i));
+						    }
+						    else
+						    {
+							    ASSERT_TRUE(r.error().IsNotFound()) << r.error().ToString();
+						    }
+					    }
+				    }
+			    }
+		    });
+	}
+
+	start.store(true, std::memory_order_release);
+
+	for (int i = 0; i < kWriterThreads; ++i)
+	{
+		threads[i].join();
+	}
+	writers_done.store(true, std::memory_order_release);
+	for (int i = kWriterThreads; i < kWriterThreads + kReaderThreads; ++i)
+	{
+		threads[i].join();
+	}
+
+	for (int w = 0; w < kWriterThreads; ++w)
+	{
+		for (int i = 0; i < kKeysPerWriter; ++i)
+		{
+			auto r = db->Get(key_for(w, i));
+			ASSERT_TRUE(r.has_value());
+			ASSERT_EQ(r.value(), value_for(w, i));
+		}
+	}
 }
 
 int main(int argc, char** argv)

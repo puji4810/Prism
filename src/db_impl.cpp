@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 
 namespace prism
 {
@@ -421,6 +422,30 @@ namespace prism
 			std::string saved_value_;
 			Direction direction_;
 			bool valid_;
+		};
+
+		class LockedIterator final: public Iterator
+		{
+		public:
+			LockedIterator(std::shared_lock<std::shared_mutex> lock, std::unique_ptr<Iterator> iter)
+			    : lock_(std::move(lock))
+			    , iter_(std::move(iter))
+			{
+			}
+
+			bool Valid() const override { return iter_->Valid(); }
+			void SeekToFirst() override { iter_->SeekToFirst(); }
+			void SeekToLast() override { iter_->SeekToLast(); }
+			void Seek(const Slice& target) override { iter_->Seek(target); }
+			void Next() override { iter_->Next(); }
+			void Prev() override { iter_->Prev(); }
+			Slice key() const override { return iter_->key(); }
+			Slice value() const override { return iter_->value(); }
+			Status status() const override { return iter_->status(); }
+
+		private:
+			std::shared_lock<std::shared_mutex> lock_;
+			std::unique_ptr<Iterator> iter_;
 		};
 
 		Iterator* NewDBIterator(const Comparator* user_comparator, Iterator* internal_iter, SequenceNumber sequence)
@@ -976,6 +1001,8 @@ namespace prism
 
 	Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
 	{
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+
 		std::string value;
 		const SequenceNumber snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
 		LookupKey lkey(key, snapshot);
@@ -1018,6 +1045,8 @@ namespace prism
 
 	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch batch)
 	{
+		std::unique_lock<std::shared_mutex> lock(mutex_);
+
 		// TODO : Group commit
 		std::size_t count = WriteBatchInternal::Count(&batch);
 		if (!count)
@@ -1058,6 +1087,13 @@ namespace prism
 
 	std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& read_options)
 	{
+		// TODO : refactor with SuperVersion
+		// Now, we lock the mutex for the whole NewIterator call
+		// we block the writes during the iteration
+		// We need to get a snapshot after we implement the snapshot
+		// and then we just need to lock the mutex when we new the internal iterator
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+
 		if (read_options.snapshot != nullptr)
 		{
 			return std::make_unique<EmptyIterator>(Status::NotSupported("snapshot"));
@@ -1079,12 +1115,17 @@ namespace prism
 		}
 
 		Iterator* internal_iter = NewMergingIterator(&internal_comparator_, children.data(), static_cast<int>(children.size()));
-		return std::make_unique<DBIter>(internal_comparator_.user_comparator(), internal_iter, snapshot);
+		auto iter = std::make_unique<DBIter>(internal_comparator_.user_comparator(), internal_iter, snapshot);
+		return std::make_unique<LockedIterator>(std::move(lock), std::move(iter));
 	}
 
-	const Snapshot* DBImpl::GetSnapshot() { return nullptr; }
+	const Snapshot* DBImpl::GetSnapshot()
+	{
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+		return nullptr;
+	}
 
-	void DBImpl::ReleaseSnapshot(const Snapshot* /*snapshot*/) {}
+	void DBImpl::ReleaseSnapshot(const Snapshot* /*snapshot*/) { std::unique_lock<std::shared_mutex> lock(mutex_); }
 
 	Status DestroyDB(const std::string& dbname, const Options& options)
 	{

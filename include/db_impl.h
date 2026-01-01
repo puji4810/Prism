@@ -8,6 +8,7 @@
 #include "result.h"
 
 #include <string>
+#include <shared_mutex>
 #include <vector>
 
 namespace prism
@@ -47,6 +48,8 @@ namespace prism
 		Status RecoverTableFiles(std::vector<uint64_t>* log_numbers);
 		Status NewLogFile();
 		Status CloseLogFile();
+
+		mutable std::shared_mutex mutex_;
 
 		Env* env_;
 		Options options_;
