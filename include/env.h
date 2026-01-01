@@ -14,6 +14,7 @@
 #define PRISM_ENV_H
 
 #include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -146,7 +147,7 @@ namespace prism
 		virtual Status DeleteDir(const std::string& dirname);
 
 		// Store the size of fname in *file_size.
-		virtual Status GetFileSize(const std::string& fname, uint64_t* file_size) = 0;
+		virtual Result<std::size_t> GetFileSize(const std::string& fname) = 0;
 
 		// Rename file src to target.
 		virtual Status RenameFile(const std::string& src, const std::string& target) = 0;
@@ -350,7 +351,7 @@ namespace prism
 		Status RemoveFile(const std::string& f) override { return target_->RemoveFile(f); }
 		Status CreateDir(const std::string& d) override { return target_->CreateDir(d); }
 		Status RemoveDir(const std::string& d) override { return target_->RemoveDir(d); }
-		Status GetFileSize(const std::string& f, uint64_t* s) override { return target_->GetFileSize(f, s); }
+		Result<std::size_t> GetFileSize(const std::string& f) override { return target_->GetFileSize(f); }
 		Status RenameFile(const std::string& s, const std::string& t) override { return target_->RenameFile(s, t); }
 		Status LockFile(const std::string& f, FileLock** l) override { return target_->LockFile(f, l); }
 		Status UnlockFile(FileLock* l) override { return target_->UnlockFile(l); }

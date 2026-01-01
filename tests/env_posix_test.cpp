@@ -92,7 +92,9 @@ TEST(PosixEnvTest, FileAndDirectoryOps)
 	EXPECT_TRUE(env->FileExists(file_path));
 
 	uint64_t file_size = 0;
-	ASSERT_TRUE(env->GetFileSize(file_path, &file_size).ok());
+	auto file_size_result = env->GetFileSize(file_path);
+	ASSERT_TRUE(file_size_result.has_value());
+	file_size = file_size_result.value();
 	EXPECT_EQ(file_size, 5u);
 
 	SequentialFile* sf = nullptr;
