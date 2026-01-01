@@ -53,7 +53,7 @@ namespace prism
 		std::string dbname_;
 		TableCache* table_cache_ = nullptr;
 
-		FileLock* db_lock_ = nullptr;
+		std::unique_ptr<FileLock> db_lock_;
 
 		WritableFile* logfile_ = nullptr;
 		std::unique_ptr<log::Writer> log_;

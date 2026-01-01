@@ -40,9 +40,13 @@ namespace
 
 	static std::filesystem::path UniqueTestDir(Env* env)
 	{
-		std::string base_dir;
-		EXPECT_TRUE(env->GetTestDirectory(&base_dir).ok());
-		return std::filesystem::path(base_dir) / ("env_posix_test-" + std::to_string(env->NowMicros()));
+		auto base_dir = env->GetTestDirectory();
+		EXPECT_TRUE(base_dir.has_value());
+		if (!base_dir.has_value())
+		{
+			return {};
+		}
+		return std::filesystem::path(base_dir.value()) / ("env_posix_test-" + std::to_string(env->NowMicros()));
 	}
 
 	struct ScheduleState
@@ -147,21 +151,21 @@ TEST(PosixEnvTest, FileLock)
 	ASSERT_TRUE(env->CreateDir(test_dir.string()).ok());
 
 	const auto lock_path = (test_dir / "LOCK").string();
-	FileLock* lock1 = nullptr;
-	ASSERT_TRUE(env->LockFile(lock_path, &lock1).ok());
-	ASSERT_NE(lock1, nullptr);
+	auto lock1 = env->LockFile(lock_path);
+	ASSERT_TRUE(lock1.has_value());
+	auto lock1_handle = std::move(lock1.value());
+	ASSERT_NE(lock1_handle, nullptr);
 
-	FileLock* lock2 = nullptr;
-	Status s = env->LockFile(lock_path, &lock2);
-	EXPECT_FALSE(s.ok());
-	EXPECT_EQ(lock2, nullptr);
+	auto lock2 = env->LockFile(lock_path);
+	EXPECT_FALSE(lock2.has_value());
 
-	ASSERT_TRUE(env->UnlockFile(lock1).ok());
+	lock1_handle.reset();
 
-	FileLock* lock3 = nullptr;
-	ASSERT_TRUE(env->LockFile(lock_path, &lock3).ok());
-	ASSERT_NE(lock3, nullptr);
-	ASSERT_TRUE(env->UnlockFile(lock3).ok());
+	auto lock3 = env->LockFile(lock_path);
+	ASSERT_TRUE(lock3.has_value());
+	auto lock3_handle = std::move(lock3.value());
+	ASSERT_NE(lock3_handle, nullptr);
+	lock3_handle.reset();
 }
 
 TEST(PosixEnvTest, LoggerWrites)
@@ -173,11 +177,12 @@ TEST(PosixEnvTest, LoggerWrites)
 	ASSERT_TRUE(env->CreateDir(test_dir.string()).ok());
 
 	const auto log_path = (test_dir / "LOG").string();
-	Logger* logger = nullptr;
-	ASSERT_TRUE(env->NewLogger(log_path, &logger).ok());
-	ASSERT_NE(logger, nullptr);
-	Log(logger, "hello %d", 123);
-	delete logger;
+	auto logger = env->NewLogger(log_path);
+	ASSERT_TRUE(logger.has_value());
+	auto logger_handle = std::move(logger.value());
+	ASSERT_NE(logger_handle, nullptr);
+	Log(logger_handle.get(), "hello %d", 123);
+	logger_handle.reset();
 
 	std::string contents;
 	ASSERT_TRUE(ReadFileToString(env, log_path, &contents).ok());
