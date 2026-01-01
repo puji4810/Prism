@@ -1,4 +1,5 @@
 #include "env.h"
+#include "result.h"
 #include "slice.h"
 #include "status.h"
 #include "port/port_config.h"
@@ -34,6 +35,7 @@
 #include <cstring>
 #include <atomic>
 #include <utility>
+#include <vector>
 
 namespace prism
 {
@@ -601,21 +603,21 @@ namespace prism
 
 		bool FileExists(const std::string& fname) override { return (::access(fname.c_str(), F_OK) == 0); }
 
-		Status GetChildren(const std::string& dir_path, std::vector<std::string>* result) override
+		Result<std::vector<std::string>> GetChildren(const std::string& dir_path) override
 		{
-			result->clear();
+			std::vector<std::string> result;
 			::DIR* dir = ::opendir(dir_path.c_str());
 			if (dir == nullptr)
 			{
-				return PosixError(dir_path, errno);
+				return std::unexpected<Status>(PosixError(dir_path, errno));
 			}
 			::dirent* entry;
 			while ((entry = ::readdir(dir)) != nullptr)
 			{
-				result->emplace_back(entry->d_name);
+				result.emplace_back(entry->d_name);
 			}
 			::closedir(dir);
-			return Status::OK();
+			return result;
 		}
 
 		Status RemoveFile(const std::string& filename) override

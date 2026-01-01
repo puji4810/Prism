@@ -120,7 +120,9 @@ TEST(PosixEnvTest, FileAndDirectoryOps)
 	EXPECT_EQ(contents, "hello world");
 
 	std::vector<std::string> children;
-	ASSERT_TRUE(env->GetChildren(test_dir.string(), &children).ok());
+	auto children_result = env->GetChildren(test_dir.string());
+	ASSERT_TRUE(children_result.has_value());
+	children = std::move(children_result.value());
 	EXPECT_NE(std::find(children.begin(), children.end(), "a.txt"), children.end());
 
 	const auto renamed = (test_dir / "b.txt").string();
