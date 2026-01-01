@@ -56,7 +56,7 @@ namespace prism
 
 		// Return a heap-allocated iterator over the contents of the database.
 		// The caller must delete the iterator when it is no longer needed.
-		virtual Iterator* NewIterator(const ReadOptions& options) = 0;
+		virtual std::unique_ptr<Iterator> NewIterator(const ReadOptions& options) = 0;
 
 		virtual const Snapshot* GetSnapshot() = 0;
 		virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
