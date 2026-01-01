@@ -509,11 +509,7 @@ namespace prism
 			mem_->Unref();
 		}
 		CloseLogFile();
-		if (db_lock_ != nullptr)
-		{
-			env_->UnlockFile(db_lock_);
-			db_lock_ = nullptr;
-		}
+		db_lock_.reset();
 		delete table_cache_;
 	}
 
@@ -570,11 +566,12 @@ namespace prism
 		{
 			return Status::InvalidArgument("db lock already held");
 		}
-		s = env_->LockFile(LockFileName(dbname_), &db_lock_);
-		if (!s.ok())
+		auto lock = env_->LockFile(LockFileName(dbname_));
+		if (!lock.has_value())
 		{
-			return s;
+			return lock.error();
 		}
+		db_lock_ = std::move(lock.value());
 
 		std::vector<uint64_t> log_numbers;
 		s = RecoverTableFiles(&log_numbers);
@@ -1100,11 +1097,14 @@ namespace prism
 		}
 		Status result{};
 
-		FileLock* lock;
 		const std::string lockname = LockFileName(dbname);
-		result = env->LockFile(lockname, &lock);
-		if (result.ok())
+		auto lock = env->LockFile(lockname);
+		if (!lock.has_value())
 		{
+			return lock.error();
+		}
+		{
+			auto lock_handle = std::move(lock.value());
 			uint64_t number;
 			FileType type;
 			for (size_t i = 0; i < filenames.value().size(); i++)
@@ -1118,7 +1118,7 @@ namespace prism
 					}
 				}
 			}
-			env->UnlockFile(lock); // Ignore error since state is already gone
+			lock_handle.reset();
 			env->RemoveFile(lockname);
 			env->RemoveDir(dbname); // Ignore error in case dir contains other files
 		}

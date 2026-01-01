@@ -16,7 +16,9 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -38,8 +40,8 @@ namespace prism
 	public:
 		Env() = default;
 
-		//C.21: If you define or =delete any copy, move, or destructor function, define or =delete them all
-		//C.67: A polymorphic class should suppress public copy/move
+		// C.21: If you define or =delete any copy, move, or destructor function, define or =delete them all
+		// C.67: A polymorphic class should suppress public copy/move
 		Env(const Env&) = delete;
 		Env& operator=(const Env&) = delete;
 		Env(Env&&) noexcept = delete;
@@ -153,12 +155,10 @@ namespace prism
 		virtual Status RenameFile(const std::string& src, const std::string& target) = 0;
 
 		// Lock the specified file.  Used to prevent concurrent access to
-		// the same db by multiple processes.  On failure, stores nullptr in
-		// *lock and returns non-OK.
+		// the same db by multiple processes.
 		//
-		// On success, stores a pointer to the object that represents the
-		// acquired lock in *lock and returns OK.  The caller should call
-		// UnlockFile(*lock) to release the lock.  If the process exits,
+		// On success, returns an object that represents the acquired lock.
+		// Destroying the returned lock releases it. If the process exits,
 		// the lock will be automatically released.
 		//
 		// If somebody else already holds the lock, finishes immediately
@@ -166,12 +166,7 @@ namespace prism
 		// to go away.
 		//
 		// May create the named file if it does not already exist.
-		virtual Status LockFile(const std::string& fname, FileLock** lock) = 0;
-
-		// Release the lock acquired by a previous successful call to LockFile.
-		// REQUIRES: lock was returned by a successful LockFile() call
-		// REQUIRES: lock has not already been unlocked.
-		virtual Status UnlockFile(FileLock* lock) = 0;
+		virtual Result<std::unique_ptr<FileLock>> LockFile(const std::string& fname) = 0;
 
 		// Arrange to run "(*function)(arg)" once in a background thread.
 		//
@@ -189,10 +184,10 @@ namespace prism
 		// or may not have just been created. The directory may or may not differ
 		// between runs of the same process, but subsequent calls will return the
 		// same directory.
-		virtual Status GetTestDirectory(std::string* path) = 0;
+		virtual Result<std::string> GetTestDirectory() = 0;
 
 		// Create and return a log file for storing informational messages.
-		virtual Status NewLogger(const std::string& fname, Logger** result) = 0;
+		virtual Result<std::unique_ptr<Logger>> NewLogger(const std::string& fname) = 0;
 
 		// Returns the number of micro-seconds since some fixed point in time. Only
 		// useful for computing deltas of time.
@@ -244,7 +239,7 @@ namespace prism
 		RandomAccessFile(const RandomAccessFile&) = delete;
 		RandomAccessFile& operator=(const RandomAccessFile&) = delete;
 		RandomAccessFile(RandomAccessFile&&) = delete;
-    RandomAccessFile& operator=(RandomAccessFile&&) = delete;
+		RandomAccessFile& operator=(RandomAccessFile&&) = delete;
 
 		virtual ~RandomAccessFile() = default;
 
@@ -258,6 +253,31 @@ namespace prism
 		//
 		// Safe for concurrent use by multiple threads.
 		virtual Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const = 0;
+
+		// Read up to dst.size() bytes from the file starting at "offset" into dst.
+		// Returns the number of bytes read (0 indicates EOF).
+		//
+		// Default implementation calls Read() and copies into dst if necessary.
+		virtual Result<std::size_t> ReadAt(uint64_t offset, std::span<std::byte> dst) const
+		{
+			if (dst.empty())
+			{
+				return 0;
+			}
+
+			const auto scratch = reinterpret_cast<char*>(dst.data());
+			Slice result;
+			Status s = Read(offset, dst.size(), &result, scratch);
+			if (!s.ok())
+			{
+				return std::unexpected(s);
+			}
+			if (result.data() != scratch)
+			{
+				std::memcpy(dst.data(), result.data(), result.size());
+			}
+			return result.size();
+		}
 	};
 
 	// A file abstraction for sequential writing.  The implementation
@@ -309,6 +329,7 @@ namespace prism
 		FileLock(FileLock&&) = delete;
 		FileLock& operator=(FileLock&&) = delete;
 
+		// Destroying a FileLock releases it.
 		virtual ~FileLock() = default;
 	};
 
@@ -343,7 +364,10 @@ namespace prism
 
 		// The following text is boilerplate that forwards all methods to target().
 		Result<std::unique_ptr<SequentialFile>> NewSequentialFile(const std::string& f) override { return target_->NewSequentialFile(f); }
-		Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& f) override { return target_->NewRandomAccessFile(f); }
+		Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& f) override
+		{
+			return target_->NewRandomAccessFile(f);
+		}
 		Result<std::unique_ptr<WritableFile>> NewWritableFile(const std::string& f) override { return target_->NewWritableFile(f); }
 		Result<std::unique_ptr<WritableFile>> NewAppendableFile(const std::string& f) override { return target_->NewAppendableFile(f); }
 		bool FileExists(const std::string& f) override { return target_->FileExists(f); }
@@ -353,12 +377,11 @@ namespace prism
 		Status RemoveDir(const std::string& d) override { return target_->RemoveDir(d); }
 		Result<std::size_t> GetFileSize(const std::string& f) override { return target_->GetFileSize(f); }
 		Status RenameFile(const std::string& s, const std::string& t) override { return target_->RenameFile(s, t); }
-		Status LockFile(const std::string& f, FileLock** l) override { return target_->LockFile(f, l); }
-		Status UnlockFile(FileLock* l) override { return target_->UnlockFile(l); }
+		Result<std::unique_ptr<FileLock>> LockFile(const std::string& f) override { return target_->LockFile(f); }
 		void Schedule(void (*f)(void*), void* a) override { return target_->Schedule(f, a); }
 		void StartThread(void (*f)(void*), void* a) override { return target_->StartThread(f, a); }
-		Status GetTestDirectory(std::string* path) override { return target_->GetTestDirectory(path); }
-		Status NewLogger(const std::string& fname, Logger** result) override { return target_->NewLogger(fname, result); }
+		Result<std::string> GetTestDirectory() override { return target_->GetTestDirectory(); }
+		Result<std::unique_ptr<Logger>> NewLogger(const std::string& fname) override { return target_->NewLogger(fname); }
 		uint64_t NowMicros() override { return target_->NowMicros(); }
 		void SleepForMicroseconds(int micros) override { target_->SleepForMicroseconds(micros); }
 
