@@ -544,20 +544,17 @@ namespace prism
 				return std::make_unique<PosixRandomAccessFile>(fname, fd, &fd_limiter_);
 			}
 
-			uint64_t file_size;
-			Status status = GetFileSize(fname, &file_size);
-			if (status.ok())
+			Status status;
+			auto file_size = GetFileSize(fname);
+			if (!file_size.has_value())
 			{
-				void* mmap_base = ::mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
-				if (mmap_base != MAP_FAILED)
-				{
-					::close(fd);
-					return std::make_unique<PosixMmapReadableFile>(fname, reinterpret_cast<char*>(mmap_base), file_size, &mmap_limiter_);
-				}
-				else
-				{
-					status = PosixError(fname, errno);
-				}
+				return std::unexpected<Status>(PosixError(fname,errno));
+			}
+			void* mmap_base = ::mmap(nullptr, file_size.value(), PROT_READ, MAP_SHARED, fd, 0);
+			if (mmap_base != MAP_FAILED)
+			{
+				::close(fd);
+				return std::make_unique<PosixMmapReadableFile>(fname, reinterpret_cast<char*>(mmap_base), file_size.value(), &mmap_limiter_);
 			}
 
 			::close(fd);
@@ -655,16 +652,16 @@ namespace prism
 			return Status::OK();
 		}
 
-		Status GetFileSize(const std::string& fname, uint64_t* size) override
+		Result<std::size_t> GetFileSize(const std::string& fname) override
 		{
 			struct ::stat file_stat;
+			std::size_t file_size = 0;
 			if (::stat(fname.c_str(), &file_stat) != 0)
 			{
-				*size = 0;
-				return PosixError(fname, errno);
+				return std::unexpected<Status>(PosixError(fname, errno));
 			}
-			*size = static_cast<uint64_t>(file_stat.st_size);
-			return Status::OK();
+			file_size = static_cast<std::size_t>(file_stat.st_size);
+			return file_size;
 		}
 
 		Status RenameFile(const std::string& from, const std::string& to) override
