@@ -22,13 +22,11 @@
 #include <limits>
 #include <mutex>
 #include <queue>
-#include <sstream>
 #include <string>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <type_traits>
 #include <thread>
 #include <unistd.h>
 #include <cerrno>
@@ -559,12 +557,22 @@ namespace prism
 				return std::make_unique<PosixRandomAccessFile>(fname, fd, &fd_limiter_);
 			}
 
-			Status status{};
 			auto file_size = GetFileSize(fname);
 			if (!file_size.has_value())
 			{
-				return std::unexpected<Status>(PosixError(fname, errno));
+				// We acquired the mmap slot but cannot proceed. Release it.
+				mmap_limiter_.Release();
+				::close(fd);
+				return std::unexpected(file_size.error());
 			}
+
+			// mmap() with length 0 is invalid on many systems; just fall back.
+			if (file_size.value() == 0)
+			{
+				mmap_limiter_.Release();
+				return std::make_unique<PosixRandomAccessFile>(fname, fd, &fd_limiter_);
+			}
+
 			void* mmap_base = ::mmap(nullptr, file_size.value(), PROT_READ, MAP_SHARED, fd, 0);
 			if (mmap_base != MAP_FAILED)
 			{
@@ -573,14 +581,9 @@ namespace prism
 				    fname, reinterpret_cast<char*>(mmap_base), file_size.value(), &mmap_limiter_);
 			}
 
-			::close(fd);
-			if (!status.ok())
-			{
-				mmap_limiter_.Release();
-				return std::unexpected(status);
-			}
-
-			return std::unexpected(Status::Corruption("should not reach here"));
+			// mmap failed: release the mmap slot and fall back to normal random reads.
+			mmap_limiter_.Release();
+			return std::make_unique<PosixRandomAccessFile>(fname, fd, &fd_limiter_);
 		}
 
 		Result<std::unique_ptr<SequentialFile>> NewSequentialFile(const std::string& filename) override
