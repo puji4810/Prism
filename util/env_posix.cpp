@@ -481,23 +481,6 @@ namespace prism
 		return fcntl(fd, F_SETLK, &file_lock_info);
 	}
 
-	class PosixFileLock: public FileLock
-	{
-	public:
-		PosixFileLock(int fd, std::string fname)
-		    : fd_(fd)
-		    , filename_(std::move(fname))
-		{
-		}
-
-		int fd() const { return fd_; };
-		const std::string& filename() { return filename_; }
-
-	private:
-		const int fd_;
-		const std::string filename_;
-	};
-
 	class PosixLockTable
 	{
 	public:
@@ -518,6 +501,38 @@ namespace prism
 	private:
 		std::mutex mu_;
 		std::set<std::string> locked_files_ GUARDED_BY(mu_);
+	};
+
+	class PosixFileLock final: public FileLock
+	{
+	public:
+		PosixFileLock(int fd, std::string fname, PosixLockTable* lock_table)
+		    : fd_(fd)
+		    , filename_(std::move(fname))
+		    , lock_table_(lock_table)
+		{
+		}
+
+		~PosixFileLock() override
+		{
+			if (fd_ < 0)
+			{
+				return;
+			}
+
+			(void)LockOrUnlock(fd_, false);
+			if (lock_table_ != nullptr)
+			{
+				lock_table_->Remove(filename_);
+			}
+			::close(fd_);
+			fd_ = -1;
+		}
+
+	private:
+		int fd_ = -1;
+		const std::string filename_;
+		PosixLockTable* const lock_table_;
 	};
 
 	class PosixEnv: public Env
@@ -548,13 +563,14 @@ namespace prism
 			auto file_size = GetFileSize(fname);
 			if (!file_size.has_value())
 			{
-				return std::unexpected<Status>(PosixError(fname,errno));
+				return std::unexpected<Status>(PosixError(fname, errno));
 			}
 			void* mmap_base = ::mmap(nullptr, file_size.value(), PROT_READ, MAP_SHARED, fd, 0);
 			if (mmap_base != MAP_FAILED)
 			{
 				::close(fd);
-				return std::make_unique<PosixMmapReadableFile>(fname, reinterpret_cast<char*>(mmap_base), file_size.value(), &mmap_limiter_);
+				return std::make_unique<PosixMmapReadableFile>(
+				    fname, reinterpret_cast<char*>(mmap_base), file_size.value(), &mmap_limiter_);
 			}
 
 			::close(fd);
@@ -673,45 +689,29 @@ namespace prism
 			return Status::OK();
 		}
 
-		Status LockFile(const std::string& fname, FileLock** lock) override
+		Result<std::unique_ptr<FileLock>> LockFile(const std::string& fname) override
 		{
-			*lock = nullptr;
-
 			int fd = ::open(fname.c_str(), O_RDWR | O_CREAT | kOpenBaseFlags, 0644);
 			if (fd < 0)
 			{
-				return PosixError(fname, errno);
+				return std::unexpected<Status>(PosixError(fname, errno));
 			}
 
 			if (!locks_.Insert(fname))
 			{
 				::close(fd);
-				return Status::IOError("lock " + fname, "already held by process");
+				return std::unexpected<Status>(Status::IOError("lock " + fname, "already held by process"));
 			}
 
 			if (LockOrUnlock(fd, true) == -1)
 			{
-				int lock_errno = errno;
+				const int lock_errno = errno;
 				::close(fd);
 				locks_.Remove(fname);
-				return PosixError("lock " + fname, lock_errno);
+				return std::unexpected<Status>(PosixError("lock " + fname, lock_errno));
 			}
 
-			*lock = new PosixFileLock(fd, fname);
-			return Status::OK();
-		}
-
-		Status UnlockFile(FileLock* lock) override
-		{
-			PosixFileLock* posix_file_lock = static_cast<PosixFileLock*>(lock);
-			if (LockOrUnlock(posix_file_lock->fd(), false) == -1)
-			{
-				return PosixError("unlock " + posix_file_lock->filename(), errno);
-			}
-			locks_.Remove(posix_file_lock->filename());
-			::close(posix_file_lock->fd());
-			delete posix_file_lock;
-			return Status::OK();
+			return std::make_unique<PosixFileLock>(fd, fname, &locks_);
 		}
 
 		void Schedule(void (*background_work_function)(void* background_work_arg), void* background_work_arg) override;
@@ -722,45 +722,43 @@ namespace prism
 			new_thread.detach();
 		}
 
-		Status GetTestDirectory(std::string* result) override
+		Result<std::string> GetTestDirectory() override
 		{
+			std::string result;
 			const char* env = std::getenv("TEST_TMPDIR");
 			if (env && env[0] != '\0')
 			{
-				*result = env;
+				result = env;
 			}
 			else
 			{
 				char buf[100];
 				std::snprintf(buf, sizeof(buf), "/tmp/leveldbtest-%d", static_cast<int>(::geteuid()));
-				*result = buf;
+				result = buf;
 			}
 
 			// The CreateDir status is ignored because the directory may already exist.
-			CreateDir(*result);
+			CreateDir(result);
 
-			return Status::OK();
+			return result;
 		}
 
-		Status NewLogger(const std::string& fname, Logger** result) override
+		Result<std::unique_ptr<Logger>> NewLogger(const std::string& fname) override
 		{
 			int fd = ::open(fname.c_str(), O_APPEND | O_WRONLY | O_CREAT | kOpenBaseFlags, 0644);
 			if (fd < 0)
 			{
-				*result = nullptr;
-				return PosixError(fname, errno);
+				return std::unexpected<Status>(PosixError(fname, errno));
 			}
 
 			std::FILE* fp = ::fdopen(fd, "w");
 			if (fp == nullptr)
 			{
 				::close(fd);
-				*result = nullptr;
-				return PosixError(fname, errno);
+				return std::unexpected<Status>(PosixError(fname, errno));
 			}
 
-			*result = new PosixLogger(fp);
-			return Status::OK();
+			return std::make_unique<PosixLogger>(fp);
 		}
 
 		uint64_t NowMicros() override
