@@ -70,13 +70,13 @@ namespace prism
 
 	std::unique_ptr<Iterator> MemTable::NewUniqueIterator() const { return std::make_unique<MemTableIterator>(&table_); }
 
-	void MemTable::Ref() { ++refs_; }
+	void MemTable::Ref() { refs_.fetch_add(1, std::memory_order_relaxed); }
 
 	void MemTable::Unref()
 	{
-		--refs_;
-		assert(refs_ >= 0);
-		if (refs_ == 0)
+		const int old_refs = refs_.fetch_sub(1, std::memory_order_acq_rel);
+		assert(old_refs > 0);
+		if (old_refs == 1)
 		{
 			delete this;
 		}

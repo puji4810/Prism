@@ -1087,36 +1087,86 @@ namespace prism
 
 	std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& read_options)
 	{
-		// TODO : refactor with SuperVersion
-		// Now, we lock the mutex for the whole NewIterator call
-		// we block the writes during the iteration
-		// We need to get a snapshot after we implement the snapshot
-		// and then we just need to lock the mutex when we new the internal iterator
-		std::shared_lock<std::shared_mutex> lock(mutex_);
+		// Phase A (SuperVersion-lite): build a stable read view, then release the DB lock.
+		//
+		// TODO(phase-b): Replace this with a real Version/VersionSet + SuperVersion.
+		// - Needed for compaction and safe table file deletion (iterators must pin versions/files).
+		// TODO(snapshot): Implement Snapshot objects that pin the view (not just sequence).
+		// TODO(async-scan): Provide AsyncIterator / NextAsync() to avoid blocking scans.
+		struct SuperVersionLite
+		{
+			struct TableFileRef
+			{
+				uint64_t number;
+				uint64_t file_size;
+			};
+
+			MemTable* mem = nullptr;
+			MemTable* imm = nullptr;
+			std::vector<TableFileRef> files;
+			SequenceNumber snapshot = 0;
+		};
+
+		auto release_sv = [](void*, void* arg) {
+			auto* sv = reinterpret_cast<SuperVersionLite*>(arg);
+			if (sv->imm != nullptr)
+			{
+				sv->imm->Unref();
+			}
+			if (sv->mem != nullptr)
+			{
+				sv->mem->Unref();
+			}
+			delete sv;
+		};
 
 		if (read_options.snapshot != nullptr)
 		{
 			return std::make_unique<EmptyIterator>(Status::NotSupported("snapshot"));
 		}
 
-		const SequenceNumber snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
+		SuperVersionLite* sv = nullptr;
+		{
+			std::shared_lock<std::shared_mutex> lock(mutex_);
+			sv = new SuperVersionLite;
+			sv->snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
+
+			sv->mem = mem_;
+			if (sv->mem != nullptr)
+			{
+				sv->mem->Ref();
+			}
+
+			sv->imm = imm_;
+			if (sv->imm != nullptr)
+			{
+				sv->imm->Ref();
+			}
+
+			sv->files.reserve(files_.size());
+			for (const auto& file : files_)
+			{
+				sv->files.push_back(SuperVersionLite::TableFileRef{ file.number, file.file_size });
+			}
+		}
 
 		std::vector<Iterator*> children;
-		children.reserve(files_.size() + 2);
+		children.reserve(sv->files.size() + 2);
 
-		children.push_back(mem_->NewIterator());
-		if (imm_ != nullptr)
+		children.push_back(sv->mem->NewIterator());
+		if (sv->imm != nullptr)
 		{
-			children.push_back(imm_->NewIterator());
+			children.push_back(sv->imm->NewIterator());
 		}
-		for (const auto& file : files_)
+		for (const auto& file : sv->files)
 		{
 			children.push_back(table_cache_->NewIterator(read_options, file.number, file.file_size));
 		}
 
 		Iterator* internal_iter = NewMergingIterator(&internal_comparator_, children.data(), static_cast<int>(children.size()));
-		auto iter = std::make_unique<DBIter>(internal_comparator_.user_comparator(), internal_iter, snapshot);
-		return std::make_unique<LockedIterator>(std::move(lock), std::move(iter));
+		auto iter = std::make_unique<DBIter>(internal_comparator_.user_comparator(), internal_iter, sv->snapshot);
+		iter->RegisterCleanup(release_sv, nullptr, sv);
+		return iter;
 	}
 
 	const Snapshot* DBImpl::GetSnapshot()
