@@ -16,6 +16,8 @@ end
 -- include tests subdirectory targets
 includes("tests/xmake.lua")
 
+includes("benchmark/xmake.lua")
+
 target("prism")
     set_kind("binary")
     add_files(common_files)
