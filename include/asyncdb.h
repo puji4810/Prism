@@ -23,9 +23,9 @@ namespace prism
 		static AsyncOp<Result<std::unique_ptr<AsyncDB>>> OpenAsync(
 		    ThreadPoolScheduler& scheduler, const Options& options, std::string dbname);
 
-		// TODO(phase-b): Leaf-level async via AsyncEnv/Table/Log.
+		// TODO(phase-b): GetAsync should fast-path mem/imm without scheduling.
+		// TODO(phase-b): Offload only table/file IO via AsyncEnv/Table.
 		// TODO(async-scan): AsyncIterator for range scans.
-
 		AsyncOp<Status> PutAsync(WriteOptions options, std::string key, std::string value);
 
 		AsyncOp<Result<std::string>> GetAsync(ReadOptions options, std::string key);
