@@ -134,6 +134,8 @@ namespace prism
 				job = std::move(priority_queue_.top().job);
 			}
 
+			// Wait for idle worker. Only pop from queue after successful dispatch.
+			// This ensures tasks aren't lost if TryDispatch fails.
 			if (TryDispatch(std::move(job)))
 			{
 				std::lock_guard lock(priority_mutex_);
@@ -162,6 +164,7 @@ namespace prism
 			const auto now = std::chrono::steady_clock::now();
 			if (task.deadline <= now)
 			{
+				// Deadline expired, dispatch immediately
 				lazy_queue_.pop();
 				if (!lazy_queue_.empty())
 				{
@@ -171,11 +174,13 @@ namespace prism
 
 				if (!TryDispatch(std::move(task.job)))
 				{
+					// No idle workers, submit to priority queue with max priority
 					Submit(std::move(task.job), kLazyFallbackPriority);
 				}
 			}
 			else
 			{
+				// Wait until deadline or new task arrives (semaphore release)
 				const auto deadline = task.deadline;
 				lock.unlock();
 
@@ -244,6 +249,8 @@ namespace prism
 
 			job();
 
+			// Return to pending_list_ only if this task was dispatched from PriorityLoop/LazyLoop
+			// (not from direct Push/SubmitIn, which is for affinity and doesn't need re-registration)
 			if (return_to_pending_)
 			{
 				return_to_pending_ = false;
