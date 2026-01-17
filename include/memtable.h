@@ -6,6 +6,7 @@
 #include "dbformat.h"
 #include "status.h"
 #include "iterator.h"
+#include <atomic>
 #include <memory>
 
 // See docs/memtable.md for more details.
@@ -57,7 +58,8 @@ namespace prism
 
 		using Table = SkipList<const char*, KeyComparator>;
 		KeyComparator comparator_;
-		int refs_;
+		std::atomic<int> refs_;
+
 		Arena arena_;
 		Table table_;
 	};
