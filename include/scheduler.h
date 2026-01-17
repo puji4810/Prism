@@ -139,7 +139,8 @@ namespace prism
 			std::jthread thread_{};
 			std::mutex mutex_;
 			std::deque<Job> queue_;
-			bool return_to_pending_ = false; // If true, re-enter pending_list_ after next job
+			// Atomic: Written by dispatcher threads (PushDispatched), read by worker thread (Consume)
+			std::atomic<bool> return_to_pending_{ false };
 		};
 
 		struct PriorityTask

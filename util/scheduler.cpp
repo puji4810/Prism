@@ -124,21 +124,17 @@ namespace prism
 				break;
 			}
 
-			Job job;
+			std::lock_guard lock(priority_mutex_);
+			// Over-notification from worker threads may result in empty queue
+			if (priority_queue_.empty())
 			{
-				std::lock_guard lock(priority_mutex_);
-				if (priority_queue_.empty())
-				{
-					continue;
-				}
-				job = std::move(priority_queue_.top().job);
+				continue;
 			}
 
-			// Wait for idle worker. Only pop from queue after successful dispatch.
-			// This ensures tasks aren't lost if TryDispatch fails.
-			if (TryDispatch(std::move(job)))
+			// Try to dispatch top-priority task to idle worker.
+			// Only pop from queue after successful dispatch to ensure tasks aren't lost.
+			if (TryDispatch(std::move(priority_queue_.top().job)))
 			{
-				std::lock_guard lock(priority_mutex_);
 				priority_queue_.pop();
 			}
 		}
@@ -164,27 +160,30 @@ namespace prism
 			const auto now = std::chrono::steady_clock::now();
 			if (task.deadline <= now)
 			{
-				// Deadline expired, dispatch immediately
+				// Deadline expired: remove from queue and dispatch immediately
 				lazy_queue_.pop();
+				// Wake LazyLoop again if more tasks remain
 				if (!lazy_queue_.empty())
 				{
 					lazy_waiter_.release();
 				}
 				lock.unlock();
 
+				// Try direct dispatch to idle worker; fallback to priority queue if all busy
 				if (!TryDispatch(std::move(task.job)))
 				{
-					// No idle workers, submit to priority queue with max priority
 					Submit(std::move(task.job), kLazyFallbackPriority);
 				}
 			}
 			else
 			{
-				// Wait until deadline or new task arrives (semaphore release)
+				// Not yet ready: wait until deadline or new task insertion wakes us
 				const auto deadline = task.deadline;
 				lock.unlock();
 
+				// Wait with timeout; returns true if woken by new task, false if deadline expired
 				(void)lazy_waiter_.try_acquire_until(deadline);
+				// Unconditionally release to re-enter loop and check top task again
 				lazy_waiter_.release();
 			}
 		}
