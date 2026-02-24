@@ -510,12 +510,44 @@ namespace prism::bench
 		    ops_per_sec, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0);
 	}
 
+	static std::string RunName(const Config& cfg)
+	{
+		if (cfg.do_sync && cfg.do_async) return "both";
+		if (cfg.do_sync) return "sync";
+		return "async";
+	}
+
+	static std::string BenchName(BenchMode m)
+	{
+		return m == BenchMode::kMixed ? "mixed" : "disk_read";
+	}
+
 	static Config ParseArgs(int argc, char** argv)
 	{
 		Config cfg;
 		for (int i = 1; i < argc; ++i)
 		{
 			std::string_view arg(argv[i]);
+
+			if (arg == "--help")
+			{
+				std::printf("Usage: kv_bench [OPTIONS]\n");
+				std::printf("Options:\n");
+				std::printf("  --run=<sync|async|both>   Set run mode (default: both)\n");
+				std::printf("  --bench=<mixed|disk_read> Set benchmark mode (default: mixed)\n");
+				std::printf("  --clients=<n>             Number of concurrent clients (default: 4)\n");
+				std::printf("  --workers=<n>             Number of worker threads (default: 4)\n");
+				std::printf("  --ops=<n>                 Operations per client (default: 10000)\n");
+				std::printf("  --value_size=<n>          Value size in bytes (default: 100)\n");
+				std::printf("  --read_ratio=<n>          Read ratio 0-100 (default: 0)\n");
+				std::printf("  --rounds=<n>              Number of rounds (default: 3)\n");
+				std::printf("  --write_buffer_size=<n>   Write buffer size (default: 4MB)\n");
+				std::printf("  --sync                    Run only sync benchmark\n");
+				std::printf("  --async                   Run only async benchmark\n");
+				std::printf("  --help                    Show this message\n");
+				exit(0);
+			}
+
 			auto parse_int = [&](std::string_view key, int& out) {
 				if (!arg.starts_with(key))
 				{
@@ -550,13 +582,49 @@ namespace prism::bench
 				cfg.do_sync = false;
 				cfg.do_async = true;
 			}
+
+			if (arg.starts_with("--run="))
+			{
+				std::string_view run_val = arg.substr(6);
+				if (run_val == "sync")
+				{
+					cfg.do_sync = true;
+					cfg.do_async = false;
+				}
+				else if (run_val == "async")
+				{
+					cfg.do_sync = false;
+					cfg.do_async = true;
+				}
+				else if (run_val == "both")
+				{
+					cfg.do_sync = true;
+					cfg.do_async = true;
+				}
+				else
+				{
+					std::fprintf(stderr, "invalid --run value: %s; allowed: sync|async|both\n", std::string(run_val).c_str());
+					exit(1);
+				}
+			}
+
+			bool bench_flag_handled = false;
 			if (arg == "--bench=mixed")
 			{
 				cfg.mode = BenchMode::kMixed;
+				bench_flag_handled = true;
 			}
 			if (arg == "--bench=disk_read")
 			{
 				cfg.mode = BenchMode::kDiskRead;
+				bench_flag_handled = true;
+			}
+
+			if (arg.starts_with("--bench=") && !bench_flag_handled)
+			{
+				std::string_view bench_val = arg.substr(8);
+				std::fprintf(stderr, "unknown --bench value: %s; allowed: mixed|disk_read; did you mean --async?\n", std::string(bench_val).c_str());
+				exit(1);
 			}
 		}
 
@@ -593,6 +661,9 @@ int main(int argc, char** argv)
 	Config cfg = ParseArgs(argc, argv);
 	const auto keys = MakeKeys(cfg.clients, cfg.ops_per_client);
 
+	std::printf("config: run=%s bench=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n",
+	    RunName(cfg).c_str(), BenchName(cfg.mode).c_str(), cfg.clients, cfg.workers, cfg.ops_per_client,
+	    cfg.value_size, cfg.read_ratio);
 	if (cfg.do_sync)
 	{
 		const std::string dir = MakeTempDir("bench_sync");
