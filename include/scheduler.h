@@ -80,7 +80,9 @@ namespace prism
 		using Job = std::function<void()>;
 
 		// Constructs thread pool with `num_threads` workers.
-		// If num_threads == 0, defaults to max(hardware_concurrency, 2).
+		// If num_threads == 0, defaults to max(hardware_concurrency, kMinThreads).
+		// If num_threads > 0, uses exactly max(num_threads, kMinThreads) workers.
+
 		explicit ThreadPoolScheduler(std::size_t num_threads = 0);
 		~ThreadPoolScheduler();
 
@@ -104,6 +106,9 @@ namespace prism
 
 		// Submit job to specific worker thread (for cache locality).
 		void SubmitIn(Context ctx, Job job);
+
+		// Returns the number of worker threads in the pool.
+		std::size_t WorkerCount() const { return work_threads_.size(); }
 
 	private:
 		// WorkThread: Worker with its own task queue.

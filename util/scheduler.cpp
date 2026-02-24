@@ -13,7 +13,9 @@ namespace prism
 		std::size_t DefaultThreadCount(std::size_t requested)
 		{
 			const std::size_t hw = std::max<std::size_t>(std::thread::hardware_concurrency(), 1);
-			return std::max<std::size_t>({ hw, requested, kMinThreads });
+			if (requested > 0)
+				return std::max<std::size_t>(requested, kMinThreads);
+			return std::max<std::size_t>(hw, kMinThreads);
 		}
 	}
 
