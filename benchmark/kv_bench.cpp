@@ -175,12 +175,19 @@ namespace prism::bench
 		std::size_t write_buffer_size = 4 * 1024 * 1024;
 		bool do_sync = true;
 		bool do_async = true;
+		int inflight_per_client = 1;
+		int warmup_rounds = 0;
+		bool no_latency = false;
+		int prefill = -1; // -1=auto, 0=off, 1=force
+		std::string db_dir = "";
+		bool keep_db = false;
 	};
 
 	struct Stats
 	{
 		double seconds = 0;
 		std::vector<uint64_t> latency_ns;
+		std::size_t max_inflight_observed = 0;
 	};
 
 	static uint64_t PercentileNs(std::vector<uint64_t> v, double p)
@@ -213,7 +220,10 @@ namespace prism::bench
 	static Stats RunSyncMixed(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
-		out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
+		if (!cfg.no_latency)
+		{
+			out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
+		}
 
 		std::atomic<bool> start{ false };
 		std::atomic<int> ready_count{ 0 };
@@ -233,7 +243,10 @@ namespace prism::bench
 			threads.emplace_back([&, t] {
 				std::mt19937_64 rng(static_cast<uint64_t>(t + 1));
 				std::vector<uint64_t> local_lat;
-				local_lat.reserve(cfg.ops_per_client);
+				if (!cfg.no_latency)
+				{
+					local_lat.reserve(cfg.ops_per_client);
+				}
 				uint64_t local_sink = 0;
 
 				const int prev_ready = ready_count.fetch_add(1, std::memory_order_acq_rel);
@@ -268,15 +281,21 @@ namespace prism::bench
 						}
 					}
 					const uint64_t end = NowNs();
-					local_lat.push_back(end - begin);
+					if (!cfg.no_latency)
+					{
+						local_lat.push_back(end - begin);
+					}
 				}
 
 				(void)sink.fetch_add(local_sink, std::memory_order_relaxed);
-				std::lock_guard lock(lat_mutex);
-				auto it = out.latency_ns.insert(out.latency_ns.end(), local_lat.begin(), local_lat.end());
-				if (it == out.latency_ns.end())
+				if (!cfg.no_latency)
 				{
-					std::terminate();
+					std::lock_guard lock(lat_mutex);
+					auto it = out.latency_ns.insert(out.latency_ns.end(), local_lat.begin(), local_lat.end());
+					if (it == out.latency_ns.end())
+					{
+						std::terminate();
+					}
 				}
 			});
 		}
@@ -305,7 +324,10 @@ namespace prism::bench
 	static Stats RunSyncDiskRead(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
-		out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
+		if (!cfg.no_latency)
+		{
+			out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
+		}
 
 		std::atomic<bool> start{ false };
 		std::atomic<int> ready_count{ 0 };
@@ -321,7 +343,10 @@ namespace prism::bench
 		{
 			threads.emplace_back([&, t] {
 				std::vector<uint64_t> local_lat;
-				local_lat.reserve(cfg.ops_per_client);
+				if (!cfg.no_latency)
+				{
+					local_lat.reserve(cfg.ops_per_client);
+				}
 				uint64_t local_sink = 0;
 				const int prev_ready = ready_count.fetch_add(1, std::memory_order_acq_rel);
 				if (prev_ready + 1 == cfg.clients)
@@ -343,15 +368,21 @@ namespace prism::bench
 						local_sink += r.value().size();
 					}
 					const uint64_t end = NowNs();
-					local_lat.push_back(end - begin);
+					if (!cfg.no_latency)
+					{
+						local_lat.push_back(end - begin);
+					}
 				}
 
 				(void)sink.fetch_add(local_sink, std::memory_order_relaxed);
-				std::lock_guard lock(lat_mutex);
-				auto it = out.latency_ns.insert(out.latency_ns.end(), local_lat.begin(), local_lat.end());
-				if (it == out.latency_ns.end())
+				if (!cfg.no_latency)
 				{
-					std::terminate();
+					std::lock_guard lock(lat_mutex);
+					auto it = out.latency_ns.insert(out.latency_ns.end(), local_lat.begin(), local_lat.end());
+					if (it == out.latency_ns.end())
+					{
+						std::terminate();
+					}
 				}
 			});
 		}
@@ -377,18 +408,32 @@ namespace prism::bench
 	}
 
 	static Detached RunAsyncMixedWorker(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int id, std::string value, std::vector<uint64_t>& lat)
-
+	    const std::vector<std::vector<std::string>>& keys, int id, std::string value, std::vector<uint64_t>& lat,
+	    std::atomic<std::size_t>& inflight_counter, std::atomic<std::size_t>& max_inflight_observed)
 	{
 		try
 		{
 			std::mt19937_64 rng(static_cast<uint64_t>(id + 1));
 			co_await gate;
-			lat.reserve(cfg.ops_per_client);
+			if (!cfg.no_latency)
+			{
+				lat.reserve(cfg.ops_per_client);
+			}
 			for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
 			{
 				const bool do_read = (cfg.read_ratio > 0) && (static_cast<int>(rng() % 100) < cfg.read_ratio);
 				const uint64_t begin = NowNs();
+				// Track inflight
+				const std::size_t cur = inflight_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+				// CAS loop to update max_inflight_observed
+				std::size_t observed = max_inflight_observed.load(std::memory_order_relaxed);
+				while (cur > observed)
+				{
+					if (max_inflight_observed.compare_exchange_weak(observed, cur, std::memory_order_relaxed))
+					{
+						break;
+					}
+				}
 				if (do_read)
 				{
 					(void)co_await db.GetAsync(ReadOptions(), keys[static_cast<std::size_t>(id)][i]);
@@ -397,8 +442,12 @@ namespace prism::bench
 				{
 					(void)co_await db.PutAsync(WriteOptions(), keys[static_cast<std::size_t>(id)][i], value);
 				}
+				inflight_counter.fetch_sub(1, std::memory_order_relaxed);
 				const uint64_t end = NowNs();
-				lat.push_back(end - begin);
+				if (!cfg.no_latency)
+				{
+					lat.push_back(end - begin);
+				}
 			}
 		}
 		catch (...)
@@ -410,18 +459,37 @@ namespace prism::bench
 	}
 
 	static Detached RunAsyncDiskReadWorker(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int id, std::vector<uint64_t>& lat)
+	    const std::vector<std::vector<std::string>>& keys, int id, std::vector<uint64_t>& lat, std::atomic<std::size_t>& inflight_counter,
+	    std::atomic<std::size_t>& max_inflight_observed)
 	{
 		try
 		{
 			co_await gate;
-			lat.reserve(cfg.ops_per_client);
+			if (!cfg.no_latency)
+			{
+				lat.reserve(cfg.ops_per_client);
+			}
 			for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
 			{
 				const uint64_t begin = NowNs();
+				// Track inflight
+				const std::size_t cur = inflight_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+				// CAS loop to update max_inflight_observed
+				std::size_t observed = max_inflight_observed.load(std::memory_order_relaxed);
+				while (cur > observed)
+				{
+					if (max_inflight_observed.compare_exchange_weak(observed, cur, std::memory_order_relaxed))
+					{
+						break;
+					}
+				}
 				(void)co_await db.GetAsync(ReadOptions(), keys[static_cast<std::size_t>(id)][i]);
+				inflight_counter.fetch_sub(1, std::memory_order_relaxed);
 				const uint64_t end = NowNs();
-				lat.push_back(end - begin);
+				if (!cfg.no_latency)
+				{
+					lat.push_back(end - begin);
+				}
 			}
 		}
 		catch (...)
@@ -441,10 +509,12 @@ namespace prism::bench
 		std::vector<std::vector<uint64_t>> lat;
 		lat.resize(static_cast<std::size_t>(cfg.clients));
 		const std::string value = MakeValue(cfg.value_size);
+		std::atomic<std::size_t> inflight_counter{ 0 };
+		std::atomic<std::size_t> max_inflight{ 0 };
 
 		for (int t = 0; t < cfg.clients; ++t)
 		{
-			RunAsyncMixedWorker(db, gate, done, cfg, keys, t, value, lat[static_cast<std::size_t>(t)]);
+			RunAsyncMixedWorker(db, gate, done, cfg, keys, t, value, lat[static_cast<std::size_t>(t)], inflight_counter, max_inflight);
 		}
 
 		const uint64_t begin_ns = NowNs();
@@ -458,10 +528,14 @@ namespace prism::bench
 		}
 
 		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
-		for (auto& v : lat)
+		out.max_inflight_observed = max_inflight.load(std::memory_order_relaxed);
+		if (!cfg.no_latency)
 		{
-			out.latency_ns.insert(out.latency_ns.end(), v.begin(), v.end());
+			out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
+			for (auto& v : lat)
+			{
+				out.latency_ns.insert(out.latency_ns.end(), v.begin(), v.end());
+			}
 		}
 		return out;
 	}
@@ -474,10 +548,12 @@ namespace prism::bench
 		DoneState done(cfg.clients);
 		std::vector<std::vector<uint64_t>> lat;
 		lat.resize(static_cast<std::size_t>(cfg.clients));
+		std::atomic<std::size_t> inflight_counter{ 0 };
+		std::atomic<std::size_t> max_inflight{ 0 };
 
 		for (int t = 0; t < cfg.clients; ++t)
 		{
-			RunAsyncDiskReadWorker(db, gate, done, cfg, keys, t, lat[static_cast<std::size_t>(t)]);
+			RunAsyncDiskReadWorker(db, gate, done, cfg, keys, t, lat[static_cast<std::size_t>(t)], inflight_counter, max_inflight);
 		}
 
 		const uint64_t begin_ns = NowNs();
@@ -491,36 +567,67 @@ namespace prism::bench
 		}
 
 		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
-		for (auto& v : lat)
+		out.max_inflight_observed = max_inflight.load(std::memory_order_relaxed);
+		if (!cfg.no_latency)
 		{
-			out.latency_ns.insert(out.latency_ns.end(), v.begin(), v.end());
+			out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
+			for (auto& v : lat)
+			{
+				out.latency_ns.insert(out.latency_ns.end(), v.begin(), v.end());
+			}
 		}
 		return out;
 	}
 
-	static void PrintLine(std::string_view name, const Config& cfg, int round, const Stats& stats)
+	static void PrintLine(std::string_view name, const Config& cfg, int round, const Stats& stats, std::size_t max_inflight = 0)
 	{
 		const double total_ops = static_cast<double>(cfg.clients) * static_cast<double>(cfg.ops_per_client);
 		const double ops_per_sec = total_ops / stats.seconds;
-		const uint64_t p50_ns = PercentileNs(stats.latency_ns, 0.50);
-		const uint64_t p95_ns = PercentileNs(stats.latency_ns, 0.95);
-		std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f p50_us=%.2f p95_us=%.2f\n",
-		    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio, stats.seconds,
-		    ops_per_sec, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0);
+		if (cfg.no_latency)
+		{
+			if (max_inflight > 0)
+			{
+				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f max_inflight=%zu\n",
+				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
+				    stats.seconds, ops_per_sec, max_inflight);
+			}
+			else
+			{
+				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f\n",
+				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
+				    stats.seconds, ops_per_sec);
+			}
+		}
+		else
+		{
+			const uint64_t p50_ns = PercentileNs(stats.latency_ns, 0.50);
+			const uint64_t p95_ns = PercentileNs(stats.latency_ns, 0.95);
+			if (max_inflight > 0)
+			{
+				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f max_inflight=%zu "
+				            "p50_us=%.2f p95_us=%.2f\n",
+				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
+				    stats.seconds, ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0);
+			}
+			else
+			{
+				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f p50_us=%.2f p95_us=%.2f\n",
+				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
+				    stats.seconds, ops_per_sec, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0);
+			}
+		}
 	}
 
 	static std::string RunName(const Config& cfg)
 	{
-		if (cfg.do_sync && cfg.do_async) return "both";
-		if (cfg.do_sync) return "sync";
+		if (cfg.do_sync && cfg.do_async)
+			return "both";
+		if (cfg.do_sync)
+			return "sync";
 		return "async";
 	}
 
-	static std::string BenchName(BenchMode m)
-	{
-		return m == BenchMode::kMixed ? "mixed" : "disk_read";
-	}
+	static std::string BenchName(BenchMode m) { return m == BenchMode::kMixed ? "mixed" : "disk_read"; }
 
 	static Config ParseArgs(int argc, char** argv)
 	{
@@ -533,18 +640,24 @@ namespace prism::bench
 			{
 				std::printf("Usage: kv_bench [OPTIONS]\n");
 				std::printf("Options:\n");
-				std::printf("  --run=<sync|async|both>   Set run mode (default: both)\n");
-				std::printf("  --bench=<mixed|disk_read> Set benchmark mode (default: mixed)\n");
-				std::printf("  --clients=<n>             Number of concurrent clients (default: 4)\n");
-				std::printf("  --workers=<n>             Number of worker threads (default: 4)\n");
-				std::printf("  --ops=<n>                 Operations per client (default: 10000)\n");
-				std::printf("  --value_size=<n>          Value size in bytes (default: 100)\n");
-				std::printf("  --read_ratio=<n>          Read ratio 0-100 (default: 0)\n");
-				std::printf("  --rounds=<n>              Number of rounds (default: 3)\n");
-				std::printf("  --write_buffer_size=<n>   Write buffer size (default: 4MB)\n");
-				std::printf("  --sync                    Run only sync benchmark\n");
-				std::printf("  --async                   Run only async benchmark\n");
-				std::printf("  --help                    Show this message\n");
+				std::printf("  --run=<sync|async|both>      Set run mode (default: both)\n");
+				std::printf("  --bench=<mixed|disk_read>    Set benchmark mode (default: mixed)\n");
+				std::printf("  --clients=<n>                Number of concurrent clients (default: 4)\n");
+				std::printf("  --workers=<n>                Number of worker threads (default: 4)\n");
+				std::printf("  --ops=<n>                    Operations per client (default: 10000)\n");
+				std::printf("  --value_size=<n>             Value size in bytes (default: 100)\n");
+				std::printf("  --read_ratio=<n>             Read ratio 0-100 (default: 0)\n");
+				std::printf("  --rounds=<n>                 Number of rounds (default: 3)\n");
+				std::printf("  --write_buffer_size=<n>      Write buffer size (default: 4MB)\n");
+				std::printf("  --sync                       Run only sync benchmark\n");
+				std::printf("  --async                      Run only async benchmark\n");
+				std::printf("  --inflight_per_client=<n>    Inflight ops per client (default: 1)\n");
+				std::printf("  --warmup_rounds=<n>          Warmup rounds before measurement (default: 0)\n");
+				std::printf("  --no_latency                 Skip p50/p95 latency collection (default: off)\n");
+				std::printf("  --prefill=<-1|0|1>           Prefill: -1=auto, 0=off, 1=force (default: -1)\n");
+				std::printf("  --db_dir=<path>              Use existing dir for async DB (default: temp)\n");
+				std::printf("  --keep_db=<0|1>              Keep DB dir after run (default: 0)\n");
+				std::printf("  --help                       Show this message\n");
 				exit(0);
 			}
 
@@ -571,6 +684,26 @@ namespace prism::bench
 			parse_size("--value_size=", cfg.value_size);
 			parse_size("--write_buffer_size=", cfg.write_buffer_size);
 			parse_int("--read_ratio=", cfg.read_ratio);
+			parse_int("--inflight_per_client=", cfg.inflight_per_client);
+			parse_int("--warmup_rounds=", cfg.warmup_rounds);
+			parse_int("--prefill=", cfg.prefill);
+
+			if (arg == "--no_latency")
+			{
+				cfg.no_latency = true;
+			}
+
+			if (arg.starts_with("--keep_db="))
+			{
+				int tmp = 0;
+				parse_int("--keep_db=", tmp);
+				cfg.keep_db = (tmp != 0);
+			}
+
+			if (arg.starts_with("--db_dir="))
+			{
+				cfg.db_dir = std::string(arg.substr(9));
+			}
 
 			if (arg == "--sync")
 			{
@@ -623,7 +756,8 @@ namespace prism::bench
 			if (arg.starts_with("--bench=") && !bench_flag_handled)
 			{
 				std::string_view bench_val = arg.substr(8);
-				std::fprintf(stderr, "unknown --bench value: %s; allowed: mixed|disk_read; did you mean --async?\n", std::string(bench_val).c_str());
+				std::fprintf(
+				    stderr, "unknown --bench value: %s; allowed: mixed|disk_read; did you mean --async?\n", std::string(bench_val).c_str());
 				exit(1);
 			}
 		}
@@ -648,6 +782,18 @@ namespace prism::bench
 		{
 			cfg.read_ratio = 100;
 		}
+		if (cfg.inflight_per_client < 1)
+		{
+			cfg.inflight_per_client = 1;
+		}
+		if (cfg.warmup_rounds < 0)
+		{
+			cfg.warmup_rounds = 0;
+		}
+		if (cfg.prefill < -1 || cfg.prefill > 1)
+		{
+			cfg.prefill = -1;
+		}
 
 		return cfg;
 	}
@@ -661,9 +807,8 @@ int main(int argc, char** argv)
 	Config cfg = ParseArgs(argc, argv);
 	const auto keys = MakeKeys(cfg.clients, cfg.ops_per_client);
 
-	std::printf("config: run=%s bench=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n",
-	    RunName(cfg).c_str(), BenchName(cfg.mode).c_str(), cfg.clients, cfg.workers, cfg.ops_per_client,
-	    cfg.value_size, cfg.read_ratio);
+	std::printf("config: run=%s bench=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n", RunName(cfg).c_str(),
+	    BenchName(cfg.mode).c_str(), cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio);
 	if (cfg.do_sync)
 	{
 		const std::string dir = MakeTempDir("bench_sync");
@@ -684,7 +829,9 @@ int main(int argc, char** argv)
 		}
 		auto db = std::move(db_res.value());
 
-		if (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0)
+		const bool should_prefill_sync
+		    = (cfg.prefill == 1) || (cfg.prefill == -1 && (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0));
+		if (should_prefill_sync)
 		{
 			Prefill(*db, keys, cfg.ops_per_client, cfg.value_size);
 		}
@@ -719,10 +866,13 @@ int main(int argc, char** argv)
 			}
 
 			total_seconds += stats.seconds;
-			auto it = all_lat.insert(all_lat.end(), stats.latency_ns.begin(), stats.latency_ns.end());
-			if (it == all_lat.end())
+			if (!cfg.no_latency)
 			{
-				std::terminate();
+				auto it = all_lat.insert(all_lat.end(), stats.latency_ns.begin(), stats.latency_ns.end());
+				if (it == all_lat.end())
+				{
+					std::terminate();
+				}
 			}
 		}
 
@@ -736,7 +886,7 @@ int main(int argc, char** argv)
 
 	if (cfg.do_async)
 	{
-		const std::string dir = MakeTempDir("bench_async");
+		const std::string dir = cfg.db_dir.empty() ? MakeTempDir("bench_async") : cfg.db_dir;
 		ThreadPoolScheduler scheduler(static_cast<std::size_t>(cfg.workers));
 		Options options;
 		options.create_if_missing = true;
@@ -747,6 +897,9 @@ int main(int argc, char** argv)
 			options.write_buffer_size = std::min<std::size_t>(options.write_buffer_size, 4 * 1024);
 		}
 
+		const bool should_prefill = (cfg.prefill == 1) || (cfg.prefill == -1 && (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0));
+
+		if (should_prefill)
 		{
 			auto pre = DB::Open(options, dir);
 			if (!pre.has_value())
@@ -755,10 +908,7 @@ int main(int argc, char** argv)
 				return 1;
 			}
 			auto pre_db = std::move(pre.value());
-			if (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0)
-			{
-				Prefill(*pre_db, keys, cfg.ops_per_client, cfg.value_size);
-			}
+			Prefill(*pre_db, keys, cfg.ops_per_client, cfg.value_size);
 		}
 
 		auto open_sem = std::binary_semaphore(0);
@@ -792,6 +942,21 @@ int main(int argc, char** argv)
 
 		auto adb = std::move(opened->value());
 
+		std::printf("scheduler_threads=%zu inflight_per_client=%d\n", scheduler.WorkerCount(), cfg.inflight_per_client);
+
+		// Warmup rounds (discard stats)
+		for (int w = 0; w < cfg.warmup_rounds; ++w)
+		{
+			if (cfg.mode == BenchMode::kDiskRead)
+			{
+				(void)RunAsyncDiskRead(*adb, scheduler, cfg, keys);
+			}
+			else
+			{
+				(void)RunAsyncMixed(*adb, scheduler, cfg, keys);
+			}
+		}
+
 		std::vector<uint64_t> all_lat;
 		double total_seconds = 0;
 
@@ -801,19 +966,22 @@ int main(int argc, char** argv)
 			if (cfg.mode == BenchMode::kDiskRead)
 			{
 				stats = RunAsyncDiskRead(*adb, scheduler, cfg, keys);
-				PrintLine("async_disk", cfg, r, stats);
+				PrintLine("async_disk", cfg, r, stats, stats.max_inflight_observed);
 			}
 			else
 			{
 				stats = RunAsyncMixed(*adb, scheduler, cfg, keys);
-				PrintLine("async", cfg, r, stats);
+				PrintLine("async", cfg, r, stats, stats.max_inflight_observed);
 			}
 
 			total_seconds += stats.seconds;
-			auto it = all_lat.insert(all_lat.end(), stats.latency_ns.begin(), stats.latency_ns.end());
-			if (it == all_lat.end())
+			if (!cfg.no_latency)
 			{
-				std::terminate();
+				auto it = all_lat.insert(all_lat.end(), stats.latency_ns.begin(), stats.latency_ns.end());
+				if (it == all_lat.end())
+				{
+					std::terminate();
+				}
 			}
 		}
 
@@ -822,7 +990,10 @@ int main(int argc, char** argv)
 		total.latency_ns = std::move(all_lat);
 		PrintLine(cfg.mode == BenchMode::kDiskRead ? "async_disk_total" : "async_total", cfg, 0, total);
 
-		(void)std::filesystem::remove_all(dir);
+		if (!cfg.keep_db)
+		{
+			(void)std::filesystem::remove_all(dir);
+		}
 	}
 
 	return 0;
