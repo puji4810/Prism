@@ -3,6 +3,7 @@
 
 #include "scheduler.h"
 
+#include <atomic>
 #include <coroutine>
 #include <exception>
 #include <memory>
@@ -31,11 +32,43 @@ namespace prism
 	//   }
 	//
 	// Lifecycle:
-	// 1. Construction: Captures scheduler and work lambda in shared State
-	// 2. co_await: Triggers operator co_await(), returns Awaiter
-	// 3. Suspension: Awaiter::await_suspend() submits work to thread pool
-	// 4. Execution: Work runs on background thread, stores result in State
-	// 5. Resumption: Thread pool resumes coroutine, Awaiter::await_resume() returns result
+	// 1. Construction: Captures scheduler and work lambda in shared State.
+	//    Precondition: scheduler must remain valid until the operation completes.
+	// 2. co_await: Triggers operator co_await(), returns Awaiter.
+	//    AsyncOp object itself is temporary; its State is managed by Awaiter.
+	// 3. Suspension: Awaiter::await_suspend() submits work to thread pool.
+	//    Precondition: The awaiting coroutine must remain alive until resumption.
+	// 4. Execution: Work runs on background thread, stores result in State.
+	// 5. Resumption: Thread pool resumes coroutine, Awaiter::await_resume() returns result.
+	//
+	// Suspend/Resume Handshake (race safety):
+	// There is a classic race between the worker completing and the coroutine suspending:
+	//
+	//   Thread A (coroutine): enters await_suspend(), submits work, then sets state to kSuspended.
+	//   Thread B (worker):    completes work, then attempts to resume the coroutine.
+	//
+	// If Thread B runs to completion BEFORE Thread A transitions state to kSuspended,
+	// calling handle.resume() before the coroutine is actually suspended is UB.
+	//
+	// Protocol (atomic state machine, three states):
+	//   kSuspending → either kCompleted (worker wins) or kSuspended (coroutine wins)
+	//
+	//   await_suspend():
+	//     1. Submit work.
+	//     2. Try CAS: kSuspending → kSuspended.
+	//        - If success: coroutine is now fully suspended; worker will call resume() later. Return true.
+	//        - If fail (state is already kCompleted): worker finished first; do NOT suspend. Return false.
+	//
+	//   Worker lambda:
+	//     1. Execute work (store result/exception).
+	//     2. Try CAS: kSuspending → kCompleted.
+	//        - If success: coroutine is not yet suspended; await_suspend will return false. Do NOT resume.
+	//        - If fail (state is kSuspended): coroutine is suspended; call handle.resume().
+	//
+	// This guarantees:
+	//   - Exactly-once resume (either CAS succeeds; the other path handles the "other won" case).
+	//   - No resume-before-suspend (worker only resumes if coroutine has already transitioned to kSuspended).
+	//   - No lost wakeup (if worker finishes first, await_suspend returns false and coroutine continues immediately).
 	//
 	// Thread Safety:
 	// - State is shared via std::shared_ptr to ensure lifetime across thread boundaries
@@ -51,47 +84,58 @@ namespace prism
 		using ValueType = T;
 		using Work = std::function<T()>;
 
-		// Constructs an AsyncOp that will execute `work` on `scheduler` when awaited.
-		// Work is captured by value (via std::function), so lifetime is managed automatically.
-		AsyncOp(ThreadPoolScheduler& scheduler, Work work)
-		    : state_(std::make_shared<State>(State{ &scheduler, std::move(work) }))
+		AsyncOp(IScheduler& scheduler, Work work)
+			    : state_(std::make_shared<State>(&scheduler, std::move(work)))
 		{
 		}
 
-		// Awaiter: Implements the C++20 awaitable protocol.
-		// This is what the compiler interacts with when you write "co_await asyncOp".
 		struct Awaiter
 		{
 			std::shared_ptr<State> state;
 
-			// await_ready(): Should we suspend the coroutine?
-			// Always returns false because we always need to offload work to thread pool.
-			// (Future optimization: could return true if result is cached/fast-path available)
 			bool await_ready() const noexcept { return false; }
 
-			// await_suspend(): Called when coroutine suspends. This is where work gets scheduled.
-			// - Submits work to thread pool
-			// - When work completes, thread pool thread resumes the coroutine via handle.resume()
-			// - Captures shared_ptr<State> to keep state alive until work completes
-			void await_suspend(std::coroutine_handle<> handle) const
+			// Returns true to suspend the coroutine, or false if worker already finished.
+			// See class-level protocol comment for the full CAS handshake.
+			bool await_suspend(std::coroutine_handle<> handle) const
 			{
 				auto st = state;
-				st->scheduler->Submit([st, handle] {
+				st->handle = handle;
+
+				st->scheduler->Submit([st] {
 					try
 					{
-						st->value = st->work(); // Execute the actual work
+						st->value = st->work();
 					}
 					catch (...)
 					{
-						st->exception = std::current_exception(); // Capture exceptions
+						st->exception = std::current_exception();
 					}
-					handle.resume(); // Resume the coroutine on this thread pool thread
+
+					// Worker tries to win the handshake: kSuspending → kCompleted.
+					auto expected = State::kSuspending;
+					if (st->status.compare_exchange_strong(
+					        expected, State::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
+					{
+						// Won: coroutine not yet suspended; await_suspend will return false.
+						return;
+					}
+					// Lost: coroutine is suspended (kSuspended); safe to resume exactly once.
+					st->handle.resume();
 				});
+
+				// Coroutine tries to win the handshake: kSuspending → kSuspended.
+				auto expected = State::kSuspending;
+				if (state->status.compare_exchange_strong(
+				        expected, State::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
+				{
+					// Won: worker has not finished; suspend and let worker resume us.
+					return true;
+				}
+				// Lost: worker already finished (kCompleted); skip suspension.
+				return false;
 			}
 
-			// await_resume(): Called when coroutine resumes. Returns the result to caller.
-			// - Rethrows exception if work threw
-			// - Otherwise returns the computed value
 			T await_resume() const
 			{
 				if (state->exception)
@@ -102,26 +146,34 @@ namespace prism
 			}
 		};
 
-		// operator co_await(): Enables "co_await asyncOp" syntax.
-		// Rvalue-qualified (&&) to ensure AsyncOp is only awaited once (move-only semantics).
 		Awaiter operator co_await() && noexcept { return Awaiter{ std::move(state_) }; }
 
 	private:
-		// State: Shared state between AsyncOp, Awaiter, and thread pool worker.
-		// Lifetime managed by shared_ptr to survive across thread boundaries.
 		struct State
 		{
-			ThreadPoolScheduler* scheduler; // Where to submit work
-			Work work; // The actual work to execute
-			std::optional<T> value; // Result storage (set by worker thread)
-			std::exception_ptr exception; // Exception storage (if work throws)
+			static constexpr int kSuspending = 0;
+			static constexpr int kCompleted = 1;
+			static constexpr int kSuspended = 2;
+
+			State(IScheduler* sched, Work w)
+			    : scheduler(sched)
+			    , work(std::move(w))
+			{
+			}
+
+			IScheduler* scheduler;
+			Work work;
+			std::optional<T> value;
+			std::exception_ptr exception;
+			std::coroutine_handle<> handle;
+			std::atomic<int> status{ kSuspending };
 		};
 
 		std::shared_ptr<State> state_;
 	};
 
 	// Specialization for AsyncOp<void>: Operations that don't return a value.
-	// Same design as AsyncOp<T>, but without value storage/return.
+	// Same design as AsyncOp<T> including the identical suspend/resume handshake.
 	template <>
 	class AsyncOp<void>
 	{
@@ -131,8 +183,8 @@ namespace prism
 	public:
 		using Work = std::function<void()>;
 
-		AsyncOp(ThreadPoolScheduler& scheduler, Work work)
-		    : state_(std::make_shared<State>(State{ &scheduler, std::move(work) }))
+		AsyncOp(IScheduler& scheduler, Work work)
+			    : state_(std::make_shared<State>(&scheduler, std::move(work)))
 		{
 		}
 
@@ -142,10 +194,12 @@ namespace prism
 
 			bool await_ready() const noexcept { return false; }
 
-			void await_suspend(std::coroutine_handle<> handle) const
+			bool await_suspend(std::coroutine_handle<> handle) const
 			{
 				auto st = state;
-				st->scheduler->Submit([st, handle] {
+				st->handle = handle;
+
+				st->scheduler->Submit([st] {
 					try
 					{
 						st->work();
@@ -154,8 +208,27 @@ namespace prism
 					{
 						st->exception = std::current_exception();
 					}
-					handle.resume();
+
+					auto expected = State::kSuspending;
+					if (st->status.compare_exchange_strong(
+					        expected, State::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
+					{
+						// Worker wins: coroutine not yet suspended.
+						return;
+					}
+					// Coroutine wins: it is suspended; resume it now.
+					st->handle.resume();
 				});
+
+				auto expected = State::kSuspending;
+				if (state->status.compare_exchange_strong(
+				        expected, State::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
+				{
+					// Coroutine wins: suspend and wait for worker.
+					return true;
+				}
+				// Worker wins: already done; don't suspend.
+				return false;
 			}
 
 			void await_resume() const
@@ -172,9 +245,21 @@ namespace prism
 	private:
 		struct State
 		{
-			ThreadPoolScheduler* scheduler;
+			static constexpr int kSuspending = 0;
+			static constexpr int kCompleted = 1;
+			static constexpr int kSuspended = 2;
+
+			State(IScheduler* sched, Work w)
+			    : scheduler(sched)
+			    , work(std::move(w))
+			{
+			}
+
+			IScheduler* scheduler;
 			Work work;
 			std::exception_ptr exception;
+			std::coroutine_handle<> handle;
+			std::atomic<int> status{ kSuspending };
 		};
 
 		std::shared_ptr<State> state_;
