@@ -5,7 +5,10 @@
 #include "env.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 
@@ -27,7 +30,7 @@ namespace prism
 	class AsyncRandomAccessFile
 	{
 	public:
-		AsyncRandomAccessFile(ThreadPoolScheduler& scheduler, std::unique_ptr<RandomAccessFile> file);
+		AsyncRandomAccessFile(ThreadPoolScheduler& scheduler, std::shared_ptr<RandomAccessFile> file);
 		~AsyncRandomAccessFile();
 
 		AsyncRandomAccessFile(const AsyncRandomAccessFile&) = delete;
@@ -36,6 +39,8 @@ namespace prism
 		AsyncRandomAccessFile& operator=(AsyncRandomAccessFile&&) = default;
 
 		// ReadAtAsync: Zero-copy read into caller-owned buffer.
+		// Precondition: dst buffer must remain valid until the AsyncOp completes.
+		// (i.e., until the awaiting coroutine resumes).
 		// Returns number of bytes actually read.
 		AsyncOp<Result<std::size_t>> ReadAtAsync(uint64_t offset, std::span<std::byte> dst) const;
 
@@ -45,10 +50,17 @@ namespace prism
 
 	private:
 		ThreadPoolScheduler* scheduler_;
-		std::unique_ptr<RandomAccessFile> file_;
+		std::shared_ptr<RandomAccessFile> file_;
 	};
 
 	// AsyncWritableFile: Asynchronous wrapper for writable files (append-only).
+	//
+	// Serialization Contract:
+	// - All async operations execute in FIFO (submission) order regardless of thread scheduling.
+	// - A ticket-based SerialState ensures each lambda waits until prior ops complete before running.
+	// - After CloseAsync completes, subsequent Append/Flush/Sync ops return IOError("file closed").
+	//
+	// Lifetime: file_ is held via shared_ptr; wrapper may be destroyed while ops are in-flight.
 	class AsyncWritableFile
 	{
 	public:
@@ -67,8 +79,19 @@ namespace prism
 		AsyncOp<Status> CloseAsync();
 
 	private:
+		// SerialState: Ticket-queue for FIFO ordering. Shared by all lambdas submitted from this wrapper.
+		struct SerialState
+		{
+			std::mutex mu;
+			std::condition_variable cv;
+			uint64_t next_ticket{ 0 };   // incremented at call-time (under mu)
+			uint64_t now_serving{ 0 };   // incremented after each op completes
+			bool closed{ false };
+		};
+
 		ThreadPoolScheduler* scheduler_;
-		std::unique_ptr<WritableFile> file_;
+		std::shared_ptr<WritableFile> file_;
+		std::shared_ptr<SerialState> serial_;
 	};
 
 	// AsyncEnv: Asynchronous filesystem operations.
