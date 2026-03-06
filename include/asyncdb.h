@@ -29,13 +29,16 @@ namespace prism
 	// - Con: Extra thread context switches (user thread -> pool thread -> I/O)
 	//
 	// Thread Safety:
+	// - DB instance is protected by its internal shared_mutex.
+	// - Multiple concurrent async operations are safe.
+	// - Scheduler manages thread pool lifetime. Must outlive all awaiting AsyncOps.
 	// - DB instance is protected by its internal shared_mutex
 	// - Multiple concurrent async operations are safe
 	// - Scheduler manages thread pool lifetime
 	class AsyncDB
 	{
 	public:
-		AsyncDB(ThreadPoolScheduler& scheduler, std::unique_ptr<DB> db);
+		AsyncDB(ThreadPoolScheduler& scheduler, std::shared_ptr<DB> db);
 		~AsyncDB();
 
 		AsyncDB(const AsyncDB&) = delete;
@@ -51,18 +54,18 @@ namespace prism
 		// TODO(phase-b): GetAsync should fast-path mem/imm without scheduling.
 		// TODO(phase-b): Offload only table/file IO via AsyncEnv/Table.
 		// TODO(async-scan): AsyncIterator for range scans.
-		AsyncOp<Status> PutAsync(WriteOptions options, std::string key, std::string value);
+		AsyncOp<Status> PutAsync(const WriteOptions& options, std::string key, std::string value);
 
-		AsyncOp<Result<std::string>> GetAsync(ReadOptions options, std::string key);
-		AsyncOp<Status> DeleteAsync(WriteOptions options, std::string key);
-		AsyncOp<Status> WriteAsync(WriteOptions options, WriteBatch batch);
+		AsyncOp<Result<std::string>> GetAsync(const ReadOptions& options, std::string key);
+		AsyncOp<Status> DeleteAsync(const WriteOptions& options, std::string key);
+		AsyncOp<Status> WriteAsync(const WriteOptions& options, WriteBatch batch);
 
 		// Access to underlying synchronous DB (for mixed sync/async usage).
 		DB* SyncDB() const noexcept { return db_.get(); }
 
 	private:
 		ThreadPoolScheduler* scheduler_;
-		std::unique_ptr<DB> db_;
+		std::shared_ptr<DB> db_;
 	};
 }
 

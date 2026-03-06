@@ -7,7 +7,7 @@
 
 namespace prism
 {
-	AsyncDB::AsyncDB(ThreadPoolScheduler& scheduler, std::unique_ptr<DB> db)
+	AsyncDB::AsyncDB(ThreadPoolScheduler& scheduler, std::shared_ptr<DB> db)
 	    : scheduler_(&scheduler)
 	    , db_(std::move(db))
 	{
@@ -24,31 +24,35 @@ namespace prism
 			    {
 				    return std::unexpected(db.error());
 			    }
-			    return std::make_unique<AsyncDB>(scheduler, std::move(db.value()));
+			    return std::make_unique<AsyncDB>(scheduler, std::shared_ptr<DB>(std::move(db.value())));
 		    });
 	}
 
-	AsyncOp<Status> AsyncDB::PutAsync(WriteOptions options, std::string key, std::string value)
+	AsyncOp<Status> AsyncDB::PutAsync(const WriteOptions& options, std::string key, std::string value)
 	{
-		return AsyncOp<Status>(*scheduler_, [this, options, key = std::move(key), value = std::move(value)]() mutable {
-			return db_->Put(options, Slice(key), Slice(value));
+		auto db = db_;
+		return AsyncOp<Status>(*scheduler_, [db, opts = options, key = std::move(key), value = std::move(value)]() {
+			return db->Put(opts, Slice(key), Slice(value));
 		});
 	}
 
-	AsyncOp<Result<std::string>> AsyncDB::GetAsync(ReadOptions options, std::string key)
+	AsyncOp<Result<std::string>> AsyncDB::GetAsync(const ReadOptions& options, std::string key)
 	{
+		auto db = db_;
 		return AsyncOp<Result<std::string>>(
-		    *scheduler_, [this, options, key = std::move(key)]() mutable { return db_->Get(options, Slice(key)); });
+		    *scheduler_, [db, opts = options, key = std::move(key)]() { return db->Get(opts, Slice(key)); });
 	}
 
-	AsyncOp<Status> AsyncDB::DeleteAsync(WriteOptions options, std::string key)
+	AsyncOp<Status> AsyncDB::DeleteAsync(const WriteOptions& options, std::string key)
 	{
-		return AsyncOp<Status>(*scheduler_, [this, options, key = std::move(key)]() mutable { return db_->Delete(options, Slice(key)); });
+		auto db = db_;
+		return AsyncOp<Status>(*scheduler_, [db, opts = options, key = std::move(key)]() { return db->Delete(opts, Slice(key)); });
 	}
 
-	AsyncOp<Status> AsyncDB::WriteAsync(WriteOptions options, WriteBatch batch)
+	AsyncOp<Status> AsyncDB::WriteAsync(const WriteOptions& options, WriteBatch batch)
 	{
+		auto db = db_;
 		return AsyncOp<Status>(
-		    *scheduler_, [this, options, batch = std::move(batch)]() mutable { return db_->Write(options, std::move(batch)); });
+		    *scheduler_, [db, opts = options, batch = std::move(batch)]() mutable { return db->Write(opts, std::move(batch)); });
 	}
 }

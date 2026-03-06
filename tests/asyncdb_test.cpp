@@ -7,166 +7,13 @@
 #include <semaphore>
 #include <stdexcept>
 
-#include <gtest/gtest.h>
+#include "coro_task.h"
 
 using namespace prism;
+using namespace prism::tests;
 
 namespace
 {
-	template <typename T>
-	class Task
-	{
-	public:
-		struct promise_type
-		{
-			std::binary_semaphore done{ 0 };
-			std::optional<T> value;
-			std::exception_ptr exception;
-
-			Task get_return_object() { return Task(std::coroutine_handle<promise_type>::from_promise(*this)); }
-			std::suspend_never initial_suspend() noexcept { return {}; }
-			auto final_suspend() noexcept
-			{
-				struct Awaiter
-				{
-					promise_type* promise;
-					bool await_ready() noexcept { return false; }
-					void await_suspend(std::coroutine_handle<>) noexcept { promise->done.release(); }
-					void await_resume() noexcept {}
-				};
-				return Awaiter{ this };
-			}
-			void unhandled_exception() { exception = std::current_exception(); }
-			void return_value(T v) { value = std::move(v); }
-		};
-
-		explicit Task(std::coroutine_handle<promise_type> handle)
-		    : handle_(handle)
-		{
-		}
-
-		Task(Task&& rhs) noexcept
-		    : handle_(rhs.handle_)
-		{
-			rhs.handle_ = {};
-		}
-
-		Task& operator=(Task&& rhs) noexcept
-		{
-			if (this == &rhs)
-			{
-				return *this;
-			}
-			if (handle_)
-			{
-				handle_.destroy();
-			}
-			handle_ = rhs.handle_;
-			rhs.handle_ = {};
-			return *this;
-		}
-
-		Task(const Task&) = delete;
-		Task& operator=(const Task&) = delete;
-
-		~Task()
-		{
-			if (handle_)
-			{
-				handle_.destroy();
-			}
-		}
-
-		T SyncWait()
-		{
-			handle_.promise().done.acquire();
-			if (handle_.promise().exception)
-			{
-				std::rethrow_exception(handle_.promise().exception);
-			}
-			return std::move(*handle_.promise().value);
-		}
-
-	private:
-		std::coroutine_handle<promise_type> handle_;
-	};
-
-	template <>
-	class Task<void>
-	{
-	public:
-		struct promise_type
-		{
-			std::binary_semaphore done{ 0 };
-			std::exception_ptr exception;
-
-			Task get_return_object() { return Task(std::coroutine_handle<promise_type>::from_promise(*this)); }
-			std::suspend_never initial_suspend() noexcept { return {}; }
-			auto final_suspend() noexcept
-			{
-				struct Awaiter
-				{
-					promise_type* promise;
-					bool await_ready() noexcept { return false; }
-					void await_suspend(std::coroutine_handle<>) noexcept { promise->done.release(); }
-					void await_resume() noexcept {}
-				};
-				return Awaiter{ this };
-			}
-			void unhandled_exception() { exception = std::current_exception(); }
-			void return_void() {}
-		};
-
-		explicit Task(std::coroutine_handle<promise_type> handle)
-		    : handle_(handle)
-		{
-		}
-
-		Task(Task&& rhs) noexcept
-		    : handle_(rhs.handle_)
-		{
-			rhs.handle_ = {};
-		}
-
-		Task& operator=(Task&& rhs) noexcept
-		{
-			if (this == &rhs)
-			{
-				return *this;
-			}
-			if (handle_)
-			{
-				handle_.destroy();
-			}
-			handle_ = rhs.handle_;
-			rhs.handle_ = {};
-			return *this;
-		}
-
-		Task(const Task&) = delete;
-		Task& operator=(const Task&) = delete;
-
-		~Task()
-		{
-			if (handle_)
-			{
-				handle_.destroy();
-			}
-		}
-
-		void SyncWait()
-		{
-			handle_.promise().done.acquire();
-#include <gtest/gtest.h>
-			if (handle_.promise().exception)
-			{
-				std::rethrow_exception(handle_.promise().exception);
-			}
-		}
-
-	private:
-		std::coroutine_handle<promise_type> handle_;
-	};
 
 	class AsyncDBTest: public ::testing::Test
 	{
@@ -183,6 +30,7 @@ namespace
 			std::filesystem::remove_all("test_async_db", ec);
 		}
 	};
+
 }
 
 TEST_F(AsyncDBTest, BasicPutGet)
@@ -213,6 +61,53 @@ TEST_F(AsyncDBTest, BasicPutGet)
 	auto r = get.SyncWait();
 	ASSERT_TRUE(r.has_value()) << r.error().ToString();
 	EXPECT_EQ(r.value(), "v");
+}
+
+TEST_F(AsyncDBTest, OpenAsyncFailure)
+{
+	ThreadPoolScheduler scheduler(4);
+	Options options;
+	options.create_if_missing = false; // do NOT create - path doesn't exist so Open must fail
+
+	// Use a path that cannot be created to force DB::Open failure.
+	auto open_task = [&]() -> Task<void> {
+		auto db_res = co_await AsyncDB::OpenAsync(scheduler, options, "/nonexistent_path/no_db");
+		EXPECT_FALSE(db_res.has_value()) << "Expected Open to fail on nonexistent path without create_if_missing";
+	}();
+	open_task.SyncWait();
+}
+
+TEST_F(AsyncDBTest, DestroyBeforeAwait)
+{
+	ThreadPoolScheduler scheduler(4);
+	Options options;
+	options.create_if_missing = true;
+
+	// Obtain an AsyncOp from PutAsync, then destroy the AsyncDB before awaiting.
+	// With shared_ptr capture the lambda keeps DB alive - must not UAF.
+	AsyncOp<Status> put_op = [&]() {
+		auto open_task = [&]() -> Task<std::unique_ptr<AsyncDB>> {
+			auto db_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+			if (!db_res.has_value())
+			{
+				throw std::runtime_error(db_res.error().ToString());
+			}
+			co_return std::move(db_res.value());
+		}();
+		auto adb = open_task.SyncWait();
+
+		// Capture AsyncOp before adb is destroyed
+		auto op = adb->PutAsync(WriteOptions(), "destroy_key", "destroy_val");
+		// adb goes out of scope here -> AsyncDB destroyed
+		return op;
+	}();
+
+	// Await after AsyncDB already destroyed - DB kept alive by shared_ptr in lambda
+	auto task = [&]() -> Task<void> {
+		Status s = co_await std::move(put_op);
+		EXPECT_TRUE(s.ok()) << s.ToString();
+	}();
+	task.SyncWait();
 }
 
 int main(int argc, char** argv)
