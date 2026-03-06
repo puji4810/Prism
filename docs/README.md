@@ -11,6 +11,16 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
   - Component interactions
   - Memory management hierarchy
   - Future roadmap
+### Async & Coroutines
+
+- **[Coroutine API Design](coroutine_api_design.md)** - High-level async/coroutine architecture and layer design
+  - Task-agnostic awaitables (`AsyncOp<T>`)
+  - Suspend/resume handshake logic
+  - Async environment and database interfaces
+- **[Thread Pool Scheduler](thread_pool.md)** - Low-level execution engine and runtime for async operations
+  - Multi-queue dispatch architecture
+  - Priority and lazy (timer) dispatchers
+  - Thread affinity and shutdown handling
 
 ### Data Formats
 
@@ -141,6 +151,7 @@ Reads:   App → MemTable → Imm → L0 → L1 → ... → L6
 2. Read [Database Format](dbformat.md) for key encoding
 3. Study [MemTable Format](memtable_format.md) for in-memory structure
 4. Review [WriteBatch Format](writebatch_format.md) and [Log Format](log_format.md)
+5. Explore [Coroutine API Design](coroutine_api_design.md) and [Thread Pool Scheduler](thread_pool.md) for async operations
 
 ### For Implementation
 
