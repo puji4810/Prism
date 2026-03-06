@@ -14,10 +14,25 @@
 
 namespace prism
 {
-	// ThreadPoolScheduler: Work-stealing thread pool with priority and delayed task support.
+	// IScheduler: Minimal abstract scheduler interface.
+	// Allows AsyncOp and other components to submit work without depending on
+	// the concrete ThreadPoolScheduler. Enables deterministic test doubles.
+	class IScheduler
+	{
+	public:
+		using Job = std::function<void()>;
+
+		virtual ~IScheduler() = default;
+
+		// Submit a job with the given priority (higher = sooner).
+		// Thread-safe. Must be callable from any thread.
+		virtual void Submit(Job job, std::size_t priority = 0) = 0;
+	};
+
+	// ThreadPoolScheduler: Multi-queue dispatch thread pool with priority and delayed task support.
 	//
-	// Architecture:
-	// - N worker threads (WorkThread), each with its own task queue (work-stealing source)
+	// Architecture (push-based multi-queue dispatch):
+	// - N worker threads (WorkThread), each with its own task queue
 	// - 1 priority dispatcher thread: processes priority_queue_, dispatches to idle workers
 	// - 1 lazy dispatcher thread: processes delayed tasks (lazy_queue_), dispatches when ready
 	// - pending_list_: tracks idle workers ready to accept tasks
@@ -37,16 +52,20 @@ namespace prism
 	//    - Directly pushes to that worker's queue (bypasses dispatchers)
 	//    - Used for continuation on same thread (cache locality)
 	//
-	// Work-Stealing Mechanism:
+	// Idle Worker Registration & Dispatch:
 	// - Each worker has its own queue (mutex-protected deque)
 	// - When a worker becomes idle, it re-enters pending_list_
 	// - Dispatchers assign new tasks to idle workers (PushDispatched)
-	// - return_to_pending_ flag: worker re-enters pending_list_ after consuming dispatched task
+	// - QueuedJob: per-task metadata; `dispatched` flag drives pending re-registration.
 	//
-	// Shutdown Protocol:
-	// - Exit() sets exit_flag_, wakes all threads
-	// - Dispatcher threads exit their loops
-	// - Worker threads drain their queues and exit
+	// - Shutdown Protocol:
+	// - Exit() sets exit_flag_, wakes all threads.
+	// - Draining: Dispatcher threads and worker threads drain their respective queues before exiting.
+	// - Late Submissions: Submissions during shutdown from threads *external* to this scheduler are unsupported.
+	//   However, submissions from jobs already running on this scheduler's worker threads are supported and drained.
+	// - Delayed Tasks: Pending SubmitAfter tasks are promoted to immediate execution during shutdown.
+	// - Destruction: Destructor calls Exit() and joins all threads. It is an error to call Submit*() concurrently during destruction.
+	// - Exception Policy: Any exception escaping a Job is a bug; the scheduler catches and calls std::terminate() (fail-fast).
 	// - Destructor joins all threads (safe cleanup)
 	//
 	// Thread Safety:
@@ -55,7 +74,7 @@ namespace prism
 	// - lazy_queue_: protected by lazy_mutex_
 	// - Each WorkThread's queue_: protected by its own mutex_
 	// - Semaphores (priority_waiter_, lazy_waiter_, WorkThread::semaphore_) for coordination
-	class ThreadPoolScheduler
+	class ThreadPoolScheduler : public IScheduler
 	{
 	public:
 		// Context: Opaque handle to a worker thread, captured by CaptureContext().
@@ -68,16 +87,21 @@ namespace prism
 			Context() = default;
 			bool operator==(const Context& rhs) const = default;
 
+			// Returns true if this context was captured from a worker thread of its scheduler instance.
+			bool IsValid() const noexcept { return scheduler_ != nullptr; }
+
 		private:
-			explicit Context(std::thread::id id)
-			    : thread_id_(id)
+			explicit Context(const ThreadPoolScheduler* scheduler, std::size_t worker_index)
+			    : scheduler_(scheduler)
+			    , worker_index_(worker_index)
 			{
 			}
 
-			std::thread::id thread_id_;
+			const ThreadPoolScheduler* scheduler_{ nullptr };
+			std::size_t worker_index_{ 0 };
 		};
 
-		using Job = std::function<void()>;
+		using Job = IScheduler::Job;
 
 		// Constructs thread pool with `num_threads` workers.
 		// If num_threads == 0, defaults to max(hardware_concurrency, kMinThreads).
@@ -92,10 +116,12 @@ namespace prism
 		ThreadPoolScheduler& operator=(ThreadPoolScheduler&&) = delete;
 
 		// Captures current thread context for SubmitIn().
-		static Context CaptureContext();
+		// Returns a valid Context only if called from a worker thread of THIS scheduler instance.
+		// Returns an invalid Context if called from any other thread (including workers of other schedulers).
+		Context CaptureContext() const;
 
 		// Submit job with priority (higher number = higher priority).
-		void Submit(Job job, std::size_t priority = 0);
+		void Submit(Job job, std::size_t priority = 0) override;
 
 		// Submit job to execute after deadline/delay.
 		void SubmitAfter(std::chrono::steady_clock::time_point deadline, Job job);
@@ -105,8 +131,9 @@ namespace prism
 		}
 
 		// Submit job to specific worker thread (for cache locality).
+		// Precondition: ctx must be valid (captured via CaptureContext on a worker thread of this scheduler).
+		// If ctx is invalid or from a different scheduler, the job is submitted via the default priority path.
 		void SubmitIn(Context ctx, Job job);
-
 		// Returns the number of worker threads in the pool.
 		std::size_t WorkerCount() const { return work_threads_.size(); }
 
@@ -124,28 +151,36 @@ namespace prism
 			WorkThread(WorkThread&&) = delete;
 			WorkThread& operator=(WorkThread&&) = delete;
 
-			void Start(ThreadPoolScheduler& scheduler);
+			void Start(ThreadPoolScheduler& scheduler, std::size_t worker_index);
 			void Join();
 			std::thread::id Id() const;
 
 			// Push: Direct submission (used by SubmitIn for affinity)
 			void Push(Job job);
 
-			// PushDispatched: Submission from dispatcher (sets return_to_pending_ flag)
+			// PushDispatched: Submission from dispatcher (marks job as dispatched=true)
 			void PushDispatched(Job job);
 
 			// Wake: Signal semaphore (used during shutdown)
 			void Wake();
 
+			// DrainRemaining: Execute all tasks left in queue after thread has stopped.
+			// Called from destructor after Join(), so no concurrency.
+			// Returns true if any tasks were drained.
+			bool DrainRemaining() noexcept;
+
 		private:
-			void Consume(ThreadPoolScheduler& scheduler) noexcept;
+			void Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept;
 
 			std::counting_semaphore<> semaphore_{ 0z };
 			std::jthread thread_{};
 			std::mutex mutex_;
-			std::deque<Job> queue_;
-			// Atomic: Written by dispatcher threads (PushDispatched), read by worker thread (Consume)
-			std::atomic<bool> return_to_pending_{ false };
+			struct QueuedJob
+			{
+				Job job;
+				bool dispatched{ false };
+			};
+			std::deque<QueuedJob> queue_;
 		};
 
 		struct PriorityTask

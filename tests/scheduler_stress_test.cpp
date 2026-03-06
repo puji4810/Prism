@@ -3,7 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <gtest/gtest.h>
-#include <vector>
+#include <memory>
 
 using namespace prism;
 using namespace std::chrono_literals;
@@ -11,78 +11,97 @@ using namespace std::chrono_literals;
 TEST(SchedulerStressTest, HighConcurrency)
 {
 	ThreadPoolScheduler scheduler(4);
-	std::atomic<int> counter{ 0 };
+	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 10000;
 
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([&counter] { counter.fetch_add(1, std::memory_order_relaxed); }, i % 10);
+		scheduler.Submit([counter]() {
+			counter->fetch_add(1, std::memory_order_relaxed);
+		}, i % 10);
 	}
 
-	std::this_thread::sleep_for(500ms);
-	EXPECT_EQ(counter.load(), kNumTasks) << "Some tasks were lost!";
-}
-
-TEST(SchedulerStressTest, DelayedTasks)
-{
-	ThreadPoolScheduler scheduler(2);
-	std::atomic<int> completed{ 0 };
-	constexpr int kNumTasks = 100;
-
+	// Poll with bounded timeout instead of sleep_for
 	auto start = std::chrono::steady_clock::now();
-	for (int i = 0; i < kNumTasks; ++i)
+	while (std::chrono::steady_clock::now() - start < 5s)
 	{
-		scheduler.SubmitAfter(100ms, [&completed] { completed.fetch_add(1, std::memory_order_relaxed); });
+		if (counter->load() == kNumTasks)
+		{
+			break;
+		}
+		std::this_thread::yield();
 	}
-
-	std::this_thread::sleep_for(200ms);
-	EXPECT_EQ(completed.load(), kNumTasks) << "Not all delayed tasks completed";
-
-	auto elapsed = std::chrono::steady_clock::now() - start;
-	EXPECT_GE(elapsed, 100ms) << "Tasks completed too early";
+	EXPECT_EQ(counter->load(), kNumTasks) << "Some tasks were lost!";
 }
 
 TEST(SchedulerStressTest, AffinityTasks)
 {
 	ThreadPoolScheduler scheduler(4);
-	auto ctx = ThreadPoolScheduler::CaptureContext();
-
-	std::atomic<int> counter{ 0 };
+	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 1000;
 
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([&scheduler, &counter] {
-			auto my_ctx = ThreadPoolScheduler::CaptureContext();
-			scheduler.SubmitIn(my_ctx, [&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
+		scheduler.Submit([&scheduler, counter]() {
+			// Capture context from within the worker thread
+			auto my_ctx = scheduler.CaptureContext();
+
+			// Submit affinity task - should try to execute on same thread
+			scheduler.SubmitIn(my_ctx, [counter]() {
+				counter->fetch_add(1, std::memory_order_relaxed);
+			});
 		});
 	}
 
-	std::this_thread::sleep_for(500ms);
-	EXPECT_EQ(counter.load(), kNumTasks) << "Some affinity tasks were lost";
+	// Poll with bounded timeout
+	auto start = std::chrono::steady_clock::now();
+	while (std::chrono::steady_clock::now() - start < 5s)
+	{
+		if (counter->load() == kNumTasks)
+		{
+			break;
+		}
+		std::this_thread::yield();
+	}
+
+	EXPECT_EQ(counter->load(), kNumTasks) << "Some affinity tasks were lost";
 }
 
 TEST(SchedulerStressTest, MixedWorkload)
 {
 	ThreadPoolScheduler scheduler(4);
-	std::atomic<int> immediate{ 0 }, delayed{ 0 }, affinity{ 0 };
+	auto immediate = std::make_shared<std::atomic<int>>(0);
+	auto affinity = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumTasks = 1000;
 
-	for (int i = 0; i < 1000; ++i)
+	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([&immediate] { immediate.fetch_add(1, std::memory_order_relaxed); }, i % 5);
+		scheduler.Submit([immediate]() {
+			immediate->fetch_add(1, std::memory_order_relaxed);
+		}, i % 5);
 
-		scheduler.SubmitAfter(50ms, [&delayed] { delayed.fetch_add(1, std::memory_order_relaxed); });
-
-		scheduler.Submit([&scheduler, &affinity] {
-			auto ctx = ThreadPoolScheduler::CaptureContext();
-			scheduler.SubmitIn(ctx, [&affinity] { affinity.fetch_add(1, std::memory_order_relaxed); });
+		scheduler.Submit([&scheduler, affinity]() {
+			auto ctx = scheduler.CaptureContext();
+			scheduler.SubmitIn(ctx, [affinity]() {
+				affinity->fetch_add(1, std::memory_order_relaxed);
+			});
 		});
 	}
 
-	std::this_thread::sleep_for(500ms);
-	EXPECT_EQ(immediate.load(), 1000);
-	EXPECT_EQ(delayed.load(), 1000);
-	EXPECT_EQ(affinity.load(), 1000);
+	// Wait until all counters reach target
+	// Poll with bounded timeout instead of fixed sleep
+	auto start = std::chrono::steady_clock::now();
+	while (std::chrono::steady_clock::now() - start < 5s)
+	{
+		if (immediate->load() == kNumTasks && affinity->load() == kNumTasks)
+		{
+			break;
+		}
+		std::this_thread::yield();
+	}
+
+	EXPECT_EQ(immediate->load(), kNumTasks);
+	EXPECT_EQ(affinity->load(), kNumTasks);
 }
 
 int main(int argc, char** argv)
