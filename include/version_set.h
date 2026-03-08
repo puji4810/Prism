@@ -32,8 +32,12 @@ namespace prism
 		Version();
 		~Version();
 
-		void Ref();
-		void Unref();
+	void Ref();
+	void Unref();
+
+	// Test-only: returns the current reference count.
+	int TEST_Refs() const { return refs_; }
+
 
 		void AddFile(int level, FileMetaData* file);
 		const std::vector<FileMetaData*>& files(int level) const;
@@ -45,8 +49,11 @@ namespace prism
 	private:
 		friend class VersionSet;
 
-		int refs_;
-		std::vector<FileMetaData*> files_[kNumLevels];
+	int refs_;
+	Version* prev_ = nullptr;
+	Version* next_ = nullptr;
+	std::vector<FileMetaData*> files_[kNumLevels];
+
 		double compaction_score_;
 		int compaction_level_;
 	};
@@ -135,7 +142,7 @@ namespace prism
 		TableCache* table_cache_;
 		const InternalKeyComparator* icmp_;
 		Env* env_;
-		Version* current_;
+	Version* current_;
 
 		std::unique_ptr<WritableFile> descriptor_file_;
 		std::unique_ptr<log::Writer> descriptor_log_;

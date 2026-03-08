@@ -31,6 +31,11 @@ namespace prism
 		const Snapshot* GetSnapshot() override;
 		void ReleaseSnapshot(const Snapshot* snapshot) override;
 
+		// ── Test-only accessors ──────────────────────────────────────────────
+		// Returns the current Version pointer (no additional Ref).
+		Version* TEST_CurrentVersion() const;
+		// Returns the current ref count of the current Version.
+		int TEST_CurrentVersionRefs() const;
 	private:
 		friend class DB;
 

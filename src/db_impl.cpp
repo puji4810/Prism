@@ -29,6 +29,41 @@ namespace prism
 	{
 		constexpr int kNumNonTableCacheFiles = 10;
 
+		// ─────────────────────────────────────────────────────────────────────────
+		// ReadView – a pinned snapshot of the DB read state.
+		//
+		// Captured while holding mutex_; refs on mem, imm, and current version are
+		// bumped atomically so that all three survive independently of background
+		// compaction and obsolete-file cleanup for the lifetime of an iterator or
+		// point-read.
+		// ─────────────────────────────────────────────────────────────────────────
+		struct ReadView
+		{
+			MemTable* mem = nullptr;   // Ref()-ed on capture, Unref()-ed on release.
+			MemTable* imm = nullptr;   // May be nullptr; Ref()-ed if non-null.
+			Version*  current = nullptr; // Ref()-ed on capture.
+			SequenceNumber snapshot = 0; // Visible sequence number for this read.
+		};
+
+		// Release all resources captured in a ReadView and delete it.
+		void ReleaseReadView(void* /*arg1*/, void* arg2)
+		{
+			auto* rv = reinterpret_cast<ReadView*>(arg2);
+			if (rv->current != nullptr)
+			{
+				rv->current->Unref();
+			}
+			if (rv->imm != nullptr)
+			{
+				rv->imm->Unref();
+			}
+			if (rv->mem != nullptr)
+			{
+				rv->mem->Unref();
+			}
+			delete rv;
+		}
+
 		int TableCacheEntries(const Options& options)
 		{
 			const int entries = options.max_open_files - kNumNonTableCacheFiles;
@@ -961,51 +996,77 @@ namespace prism
 		return Write(write_options, std::move(batch));
 	}
 
-	Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
+Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
 	{
-		std::shared_lock<std::shared_mutex> lock(mutex_);
+		// Phase 1: Capture a pinned read view under the lock.
+		MemTable* mem = nullptr;
+		MemTable* imm = nullptr;
+		Version*  current = nullptr;
+		SequenceNumber snapshot = 0;
+		{
+			std::shared_lock<std::shared_mutex> lock(mutex_);
+			snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
+			mem = mem_;
+			if (mem != nullptr) mem->Ref();
+			imm = imm_;
+			if (imm != nullptr) imm->Ref();
+			current = versions_->current();
+			current->Ref();
+		}
 
+		// Phase 2: Look up key without holding the lock.
 		std::string value;
-		const SequenceNumber snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
 		LookupKey lkey(key, snapshot);
 		Status s;
-		if (mem_->Get(lkey, &value, &s))
+		bool done = false;
+
+		if (mem->Get(lkey, &value, &s))
 		{
-			if (s.ok())
-			{
-				return value;
-			}
-			return std::unexpected(s); // hit: OK or NotFound
+			done = true;
 		}
-		if (imm_ && imm_->Get(lkey, &value, &s))
+		else if (imm != nullptr && imm->Get(lkey, &value, &s))
 		{
-			if (s.ok())
+			done = true;
+		}
+		else
+		{
+			InternalKey ikey(key, snapshot, kValueTypeForSeek);
+			Slice internal_key = ikey.Encode();
+			TableGetState state{ internal_comparator_.user_comparator(), key, &value };
+			for (int level = 0; level < kNumLevels; ++level)
 			{
-				return value;
+				const auto& files = current->files(level);
+				for (const FileMetaData* file : files)
+				{
+					s = table_cache_->Get(read_options, file->number, file->file_size, internal_key, &state, &SaveValue);
+					if (!s.ok())
+					{
+						done = true;
+						break;
+					}
+					if (state.value_found)
+					{
+						done = true;
+						break;
+					}
+				}
+				if (done) break;
 			}
+		}
+
+		// Phase 3: Release all pinned resources.
+		current->Unref();
+		if (imm != nullptr) imm->Unref();
+		mem->Unref();
+
+
+		if (!s.ok())
+		{
 			return std::unexpected(s);
 		}
-
-		InternalKey ikey(key, snapshot, kValueTypeForSeek);
-		Slice internal_key = ikey.Encode();
-
-		TableGetState state{ internal_comparator_.user_comparator(), key, &value };
-		Version* current = versions_->current();
-		for (int level = 0; level < kNumLevels; ++level)
+		if (!value.empty())
 		{
-			const auto& files = current->files(level);
-			for (const FileMetaData* file : files)
-			{
-				s = table_cache_->Get(read_options, file->number, file->file_size, internal_key, &state, &SaveValue);
-				if (!s.ok())
-				{
-					return std::unexpected(s);
-				}
-				if (state.value_found)
-				{
-					return value;
-				}
-			}
+			return value;
 		}
 		return std::unexpected(Status::NotFound(Slice()));
 	}
@@ -1159,6 +1220,18 @@ namespace prism
 	}
 
 	void DBImpl::ReleaseSnapshot(const Snapshot* /*snapshot*/) { std::unique_lock<std::shared_mutex> lock(mutex_); }
+
+	Version* DBImpl::TEST_CurrentVersion() const
+	{
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+		return versions_->current();
+	}
+
+	int DBImpl::TEST_CurrentVersionRefs() const
+	{
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+		return versions_->current()->TEST_Refs();
+	}
 
 	Status DestroyDB(const std::string& dbname, const Options& options)
 	{
