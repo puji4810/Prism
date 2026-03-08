@@ -10,8 +10,9 @@
 
 #include <condition_variable>
 #include <set>
+#include <mutex>
 #include <string>
-#include <shared_mutex>
+#include <atomic>
 
 namespace prism
 {
@@ -38,6 +39,10 @@ namespace prism
 		int TEST_CurrentVersionRefs() const;
 		void TEST_RemoveObsoleteFiles() { RemoveObsoleteFiles(); }
 		void TEST_AddPendingOutput(uint64_t number) { pending_outputs_.insert(number); }
+		bool TEST_HasImmutableMemTable() const;
+		int TEST_NumLevelFiles(int level) const;
+		void TEST_SetBackgroundError(const Status& status);
+		void TEST_SignalBackgroundWorkFinished();
 
 	private:
 		friend class DB;
@@ -46,14 +51,20 @@ namespace prism
 
 		Status Recover();
 		Status ApplyBatch(WriteBatch& batch);
-		Status FlushMemTable();
+		Status MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lock);
+		void MaybeScheduleCompaction();
+		void BackgroundCall();
+		static void BGWork(void* db);
+		void BackgroundCompaction();
+		void CompactMemTable();
+		Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base);
 		Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers);
 		void RemoveObsoleteFiles();
 		Status NewLogFile();
 		Status CloseLogFile();
 
-		mutable std::shared_mutex mutex_;
-		std::condition_variable_any background_work_finished_signal_;
+		mutable std::mutex mutex_;
+		std::condition_variable background_work_finished_signal_;
 
 		Env* env_;
 		Options options_;
@@ -78,6 +89,7 @@ namespace prism
 		std::set<uint64_t> pending_outputs_;
 		Status bg_error_;
 		bool bg_compaction_scheduled_ = false;
+		std::atomic<bool> shutting_down_{ false };
 	};
 } // namespace prism
 

@@ -460,30 +460,6 @@ namespace prism
 			bool valid_;
 		};
 
-		class LockedIterator final: public Iterator
-		{
-		public:
-			LockedIterator(std::shared_lock<std::shared_mutex> lock, std::unique_ptr<Iterator> iter)
-			    : lock_(std::move(lock))
-			    , iter_(std::move(iter))
-			{
-			}
-
-			bool Valid() const override { return iter_->Valid(); }
-			void SeekToFirst() override { iter_->SeekToFirst(); }
-			void SeekToLast() override { iter_->SeekToLast(); }
-			void Seek(const Slice& target) override { iter_->Seek(target); }
-			void Next() override { iter_->Next(); }
-			void Prev() override { iter_->Prev(); }
-			Slice key() const override { return iter_->key(); }
-			Slice value() const override { return iter_->value(); }
-			Status status() const override { return iter_->status(); }
-
-		private:
-			std::shared_lock<std::shared_mutex> lock_;
-			std::unique_ptr<Iterator> iter_;
-		};
-
 		Iterator* NewDBIterator(const Comparator* user_comparator, Iterator* internal_iter, SequenceNumber sequence)
 		{
 			return new DBIter(user_comparator, internal_iter, sequence);
@@ -564,6 +540,15 @@ namespace prism
 
 	DBImpl::~DBImpl()
 	{
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			shutting_down_.store(true, std::memory_order_release);
+			while (bg_compaction_scheduled_)
+			{
+				background_work_finished_signal_.wait(lock);
+			}
+			background_work_finished_signal_.notify_all();
+		}
 		if (imm_)
 		{
 			imm_->Unref();
@@ -688,10 +673,8 @@ namespace prism
 			new_db.SetComparatorName(internal_comparator_.user_comparator()->Name());
 			new_db.SetLogNumber(0);
 			new_db.SetPrevLogNumber(0);
-			std::mutex manifest_mu;
-			manifest_mu.lock();
-			s = versions_->LogAndApply(&new_db, &manifest_mu);
-			manifest_mu.unlock();
+			std::unique_lock<std::mutex> lock(mutex_);
+			s = versions_->LogAndApply(&new_db, &mutex_);
 			if (!s.ok())
 			{
 				return s;
@@ -729,10 +712,8 @@ namespace prism
 			{
 				VersionEdit edit;
 				edit.SetLogNumber(logfile_number_);
-				std::mutex manifest_mu;
-				manifest_mu.lock();
-				s = versions_->LogAndApply(&edit, &manifest_mu);
-				manifest_mu.unlock();
+				std::unique_lock<std::mutex> lock(mutex_);
+				s = versions_->LogAndApply(&edit, &mutex_);
 			}
 		}
 		return s;
@@ -795,99 +776,189 @@ namespace prism
 		}
 	}
 
-	Status DBImpl::FlushMemTable()
+	Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version*)
 	{
-		if (imm_ != nullptr)
-		{
-			return Status::InvalidArgument("immutable memtable already set");
-		}
-		if (log_ == nullptr || logfile_ == nullptr)
-		{
-			return Status::InvalidArgument("log file not open");
-		}
-
-		const uint64_t new_log_number = versions_->NewFileNumber();
-		Status s;
-		auto result = env_->NewWritableFile(LogFileName(dbname_, new_log_number));
-		if (!result.has_value())
-		{
-			return result.error();
-		}
-		auto new_log_file = std::move(result.value()).release();
-
-		const uint64_t old_log_number = logfile_number_;
-		WritableFile* old_log_file = logfile_;
-		auto old_log = std::move(log_);
-
-		logfile_ = new_log_file;
-		logfile_number_ = new_log_number;
-		log_ = std::make_unique<log::Writer>(new_log_file);
-
-		imm_ = mem_;
-		mem_ = new MemTable(internal_comparator_);
-		mem_->Ref();
+		assert(mem != nullptr);
+		assert(edit != nullptr);
 
 		const uint64_t table_number = versions_->NewFileNumber();
 		pending_outputs_.insert(table_number);
-		std::unique_ptr<Iterator> iter(imm_->NewIterator());
+		std::unique_ptr<Iterator> iter(mem->NewIterator());
 
 		uint64_t file_size = 0;
 		InternalKey smallest;
 		InternalKey largest;
-		s = BuildTable(dbname_, env_, options_, table_cache_, table_number, iter.get(), &file_size, &smallest, &largest);
+		mutex_.unlock();
+		Status s = BuildTable(dbname_, env_, options_, table_cache_, table_number, iter.get(), &file_size, &smallest, &largest);
+		mutex_.lock();
+
 		pending_outputs_.erase(table_number);
-		if (!s.ok())
+		if (s.ok() && file_size > 0)
 		{
-			log_.reset();
-			Status close_status = logfile_->Close();
-			delete logfile_;
-			logfile_ = nullptr;
-			logfile_number_ = 0;
-			env_->RemoveFile(LogFileName(dbname_, new_log_number));
-
-			mem_->Unref();
-			mem_ = imm_;
-			imm_ = nullptr;
-
-			logfile_ = old_log_file;
-			logfile_number_ = old_log_number;
-			log_ = std::move(old_log);
-			if (!close_status.ok())
-			{
-				return close_status;
-			}
-			return s;
+			edit->AddFile(0, table_number, file_size, smallest, largest);
 		}
+		return s;
+	}
 
+	void DBImpl::CompactMemTable()
+	{
+		assert(imm_ != nullptr);
 		VersionEdit edit;
-		edit.SetLogNumber(new_log_number);
-		if (file_size > 0)
+		Version* base = versions_->current();
+		base->Ref();
+		Status s = WriteLevel0Table(imm_, &edit, base);
+		base->Unref();
+
+		if (s.ok() && shutting_down_.load(std::memory_order_acquire))
 		{
-			edit.AddFile(0, table_number, file_size, smallest, largest);
+			s = Status::IOError("Deleting DB during memtable compaction");
 		}
-		versions_->SetLastSequence(sequence_ - 1);
-		std::mutex manifest_mu;
-		manifest_mu.lock();
-		s = versions_->LogAndApply(&edit, &manifest_mu);
-		manifest_mu.unlock();
-		if (!s.ok())
+
+		if (s.ok())
+		{
+			edit.SetPrevLogNumber(0);
+			edit.SetLogNumber(logfile_number_);
+			versions_->SetLastSequence(sequence_ - 1);
+			s = versions_->LogAndApply(&edit, &mutex_);
+		}
+
+		if (s.ok())
+		{
+			imm_->Unref();
+			imm_ = nullptr;
+			RemoveObsoleteFiles();
+		}
+		else if (bg_error_.ok())
 		{
 			bg_error_ = s;
-			return s;
 		}
+	}
 
-		imm_->Unref();
-		imm_ = nullptr;
-
-		old_log.reset();
-		Status old_close = old_log_file->Close();
-		delete old_log_file;
-		if (old_close.ok())
+	void DBImpl::BackgroundCompaction()
+	{
+		if (imm_ != nullptr)
 		{
-			env_->RemoveFile(LogFileName(dbname_, old_log_number));
-			return Status::OK();
+			CompactMemTable();
 		}
-		return old_close;
+	}
+
+	void DBImpl::MaybeScheduleCompaction()
+	{
+		if (bg_compaction_scheduled_)
+		{
+			return;
+		}
+		if (shutting_down_.load(std::memory_order_acquire))
+		{
+			return;
+		}
+		if (!bg_error_.ok())
+		{
+			return;
+		}
+		if (imm_ == nullptr)
+		{
+			return;
+		}
+
+		bg_compaction_scheduled_ = true;
+		env_->Schedule(&DBImpl::BGWork, this);
+	}
+
+	void DBImpl::BGWork(void* db) { reinterpret_cast<DBImpl*>(db)->BackgroundCall(); }
+
+	void DBImpl::BackgroundCall()
+	{
+		std::unique_lock<std::mutex> lock(mutex_);
+		if (shutting_down_.load(std::memory_order_acquire))
+		{
+		}
+		else if (!bg_error_.ok())
+		{
+		}
+		else
+		{
+			BackgroundCompaction();
+		}
+
+		bg_compaction_scheduled_ = false;
+		background_work_finished_signal_.notify_all();
+		MaybeScheduleCompaction();
+	}
+
+	Status DBImpl::MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lock)
+	{
+		Status s;
+		bool allow_delay = !force;
+		while (true)
+		{
+			if (!bg_error_.ok())
+			{
+				s = bg_error_;
+				break;
+			}
+			if (log_ == nullptr || logfile_ == nullptr)
+			{
+				s = Status::InvalidArgument("log file not open");
+				break;
+			}
+			if (allow_delay && static_cast<int>(versions_->current()->files(0).size()) >= config::kL0_SlowdownWritesTrigger)
+			{
+				lock.unlock();
+				env_->SleepForMicroseconds(1000);
+				allow_delay = false;
+				lock.lock();
+			}
+			else if (imm_ != nullptr)
+			{
+				background_work_finished_signal_.wait(lock);
+			}
+			else if (static_cast<int>(versions_->current()->files(0).size()) >= config::kL0_StopWritesTrigger)
+			{
+				background_work_finished_signal_.wait(lock);
+			}
+			else if (!force && mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)
+			{
+				break;
+			}
+			else
+			{
+				assert(versions_->PrevLogNumber() == 0);
+				const uint64_t new_log_number = versions_->NewFileNumber();
+				auto new_log_file = env_->NewWritableFile(LogFileName(dbname_, new_log_number));
+				if (!new_log_file.has_value())
+				{
+					versions_->ReuseFileNumber(new_log_number);
+					s = new_log_file.error();
+					break;
+				}
+
+				const Status close_status = logfile_->Close();
+				delete logfile_;
+				logfile_ = new_log_file.value().release();
+				logfile_number_ = new_log_number;
+				log_ = std::make_unique<log::Writer>(logfile_);
+
+				if (!close_status.ok())
+				{
+					if (bg_error_.ok())
+					{
+						bg_error_ = close_status;
+					}
+					s = close_status;
+					break;
+				}
+
+				imm_ = mem_;
+				mem_ = new MemTable(internal_comparator_);
+				mem_->Ref();
+				force = false;
+				MaybeScheduleCompaction();
+				break;
+			}
+		}
+
+		return s;
 	}
 
 	Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers)
@@ -974,10 +1045,8 @@ namespace prism
 						VersionEdit edit;
 						edit.AddFile(0, table_number, file_size, smallest, largest);
 						versions_->SetLastSequence(sequence_ - 1);
-						std::mutex manifest_mu;
-						manifest_mu.lock();
-						s = versions_->LogAndApply(&edit, &manifest_mu);
-						manifest_mu.unlock();
+						std::unique_lock<std::mutex> lock(mutex_);
+						s = versions_->LogAndApply(&edit, &mutex_);
 					}
 					mem_->Unref();
 					mem_ = new MemTable(internal_comparator_);
@@ -1019,10 +1088,8 @@ namespace prism
 					VersionEdit edit;
 					edit.AddFile(0, table_number, file_size, smallest, largest);
 					versions_->SetLastSequence(sequence_ - 1);
-					std::mutex manifest_mu;
-					manifest_mu.lock();
-					s = versions_->LogAndApply(&edit, &manifest_mu);
-					manifest_mu.unlock();
+					std::unique_lock<std::mutex> lock(mutex_);
+					s = versions_->LogAndApply(&edit, &mutex_);
 				}
 				mem_->Unref();
 				mem_ = new MemTable(internal_comparator_);
@@ -1061,7 +1128,7 @@ namespace prism
 		Version* current = nullptr;
 		SequenceNumber snapshot = 0;
 		{
-			std::shared_lock<std::shared_mutex> lock(mutex_);
+			std::lock_guard<std::mutex> lock(mutex_);
 			snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
 			mem = mem_;
 			if (mem != nullptr)
@@ -1133,17 +1200,18 @@ namespace prism
 
 	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch batch)
 	{
-		std::unique_lock<std::shared_mutex> lock(mutex_);
-		if (!bg_error_.ok())
-		{
-			return bg_error_;
-		}
+		std::unique_lock<std::mutex> lock(mutex_);
 
-		// TODO : Group commit
 		std::size_t count = WriteBatchInternal::Count(&batch);
 		if (!count)
 		{
 			return Status::OK();
+		}
+
+		Status s = MakeRoomForWrite(false, lock);
+		if (!s.ok())
+		{
+			return s;
 		}
 		if (log_ == nullptr || logfile_ == nullptr)
 		{
@@ -1155,7 +1223,7 @@ namespace prism
 		versions_->SetLastSequence(sequence_ - 1);
 
 		Slice record = WriteBatchInternal::Contents(&batch);
-		Status s = log_->AddRecord(record);
+		s = log_->AddRecord(record);
 		if (s.ok() && write_options.sync)
 		{
 			s = logfile_->Sync();
@@ -1169,11 +1237,6 @@ namespace prism
 		if (!s.ok())
 		{
 			return s;
-		}
-
-		if (mem_->ApproximateMemoryUsage() > options_.write_buffer_size)
-		{
-			return FlushMemTable();
 		}
 		return Status::OK();
 	}
@@ -1225,7 +1288,7 @@ namespace prism
 
 		SuperVersionLite* sv = nullptr;
 		{
-			std::shared_lock<std::shared_mutex> lock(mutex_);
+			std::lock_guard<std::mutex> lock(mutex_);
 			sv = new SuperVersionLite;
 			sv->snapshot = sequence_ - 1;
 
@@ -1275,22 +1338,50 @@ namespace prism
 
 	const Snapshot* DBImpl::GetSnapshot()
 	{
-		std::shared_lock<std::shared_mutex> lock(mutex_);
+		std::lock_guard<std::mutex> lock(mutex_);
 		return nullptr;
 	}
 
-	void DBImpl::ReleaseSnapshot(const Snapshot* /*snapshot*/) { std::unique_lock<std::shared_mutex> lock(mutex_); }
+	void DBImpl::ReleaseSnapshot(const Snapshot* /*snapshot*/) { std::lock_guard<std::mutex> lock(mutex_); }
 
 	Version* DBImpl::TEST_CurrentVersion() const
 	{
-		std::shared_lock<std::shared_mutex> lock(mutex_);
+		std::lock_guard<std::mutex> lock(mutex_);
 		return versions_->current();
 	}
 
 	int DBImpl::TEST_CurrentVersionRefs() const
 	{
-		std::shared_lock<std::shared_mutex> lock(mutex_);
+		std::lock_guard<std::mutex> lock(mutex_);
 		return versions_->current()->TEST_Refs();
+	}
+
+	bool DBImpl::TEST_HasImmutableMemTable() const
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		return imm_ != nullptr;
+	}
+
+	int DBImpl::TEST_NumLevelFiles(int level) const
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (level < 0 || level >= kNumLevels)
+		{
+			return 0;
+		}
+		return static_cast<int>(versions_->current()->files(level).size());
+	}
+
+	void DBImpl::TEST_SetBackgroundError(const Status& status)
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		bg_error_ = status;
+	}
+
+	void DBImpl::TEST_SignalBackgroundWorkFinished()
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		background_work_finished_signal_.notify_all();
 	}
 
 	Status DestroyDB(const std::string& dbname, const Options& options)
