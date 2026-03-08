@@ -93,6 +93,7 @@ namespace prism
 		Version* current() const { return current_; }
 
 		Status LogAndApply(VersionEdit* edit, std::mutex* mu);
+		Status Recover(bool* save_manifest);
 		Status WriteSnapshot(log::Writer* log);
 
 		void Finalize(Version* v) const;
@@ -100,6 +101,13 @@ namespace prism
 
 		uint64_t ManifestFileNumber() const { return manifest_file_number_; }
 		uint64_t NewFileNumber() { return next_file_number_++; }
+		void MarkFileNumberUsed(uint64_t number)
+		{
+			if (next_file_number_ <= number)
+			{
+				next_file_number_ = number + 1;
+			}
+		}
 		void ReuseFileNumber(uint64_t file_number)
 		{
 			if (next_file_number_ == file_number + 1)
@@ -114,6 +122,7 @@ namespace prism
 			last_sequence_ = s;
 		}
 		uint64_t LogNumber() const { return log_number_; }
+		uint64_t PrevLogNumber() const { return prev_log_number_; }
 		uint64_t NextFileNumber() const { return next_file_number_; }
 
 		const std::string& compact_pointer(int level) const;
@@ -135,6 +144,7 @@ namespace prism
 		uint64_t manifest_file_number_;
 		uint64_t last_sequence_;
 		uint64_t log_number_;
+		uint64_t prev_log_number_;
 
 		std::string compact_pointer_[kNumLevels];
 	};

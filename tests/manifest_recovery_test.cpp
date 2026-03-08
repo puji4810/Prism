@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 #include <filesystem>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -137,7 +138,51 @@ static bool PlantLegacyDirectory(const std::string& db_path)
 	if (!s.ok())
 		return false;
 	s = wf->Close();
-	return s.ok();
+	if (!s.ok())
+		return false;
+
+	auto legacy_table = env->NewWritableFile(TableFileName(db_path, 10));
+	if (!legacy_table.has_value())
+		return false;
+	Status table_status = legacy_table.value()->Append(Slice("legacy_table_placeholder"));
+	if (!table_status.ok())
+		return false;
+	return legacy_table.value()->Close().ok();
+}
+
+static Status CreatePlaceholderFile(const std::string& fname)
+{
+	auto writable = Env::Default()->NewWritableFile(fname);
+	if (!writable.has_value())
+	{
+		return writable.error();
+	}
+	Status s = writable.value()->Append(Slice("placeholder"));
+	if (!s.ok())
+	{
+		return s;
+	}
+	return writable.value()->Close();
+}
+
+static Status ApplyEdit(VersionSet* version_set, VersionEdit* edit)
+{
+	std::mutex mu;
+	mu.lock();
+	Status s = version_set->LogAndApply(edit, &mu);
+	mu.unlock();
+	return s;
+}
+
+static std::vector<uint64_t> CollectFileNumbers(const Version* version, int level)
+{
+	std::vector<uint64_t> numbers;
+	for (const FileMetaData* file : version->files(level))
+	{
+		numbers.push_back(file->number);
+	}
+	std::sort(numbers.begin(), numbers.end());
+	return numbers;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,41 +327,105 @@ TEST_F(ManifestRecoveryTest, WriteSnapshotContainsAllLiveFiles)
 //    When bootstrap is implemented, path (a) will also verify CURRENT+MANIFEST exist.
 TEST_F(ManifestRecoveryTest, LegacyDirectoryBootstrap)
 {
-	std::error_code ec;
-	fs::remove_all(db_path_, ec);
-	fs::create_directories(db_path_, ec);
-	ASSERT_FALSE(ec);
+	ASSERT_TRUE(PlantLegacyDirectory(db_path_));
+	ASSERT_FALSE(HasCurrentFile());
 
-	bool planted = PlantLegacyDirectory(db_path_);
-	ASSERT_TRUE(planted) << "Failed to plant legacy directory";
+	Options options;
+	options.env = Env::Default();
+	options.comparator = BytewiseComparator();
 
-	ASSERT_FALSE(HasCurrentFile()) << "should not have CURRENT before bootstrap";
+	TableCache table_cache(db_path_, options, 16);
+	InternalKeyComparator icmp(options.comparator);
+	VersionSet version_set(db_path_, &options, &table_cache, &icmp);
 
-	Options opts;
-	opts.create_if_missing = true;
-	auto res = DB::Open(opts, db_path_);
+	bool save_manifest = false;
+	Status s = version_set.Recover(&save_manifest);
+	ASSERT_TRUE(s.ok()) << s.ToString();
+	EXPECT_TRUE(save_manifest);
+	EXPECT_TRUE(HasCurrentFile());
+	EXPECT_TRUE(HasManifestFile());
 
-	if (res.has_value())
+	const std::vector<uint64_t> l0_files = CollectFileNumbers(version_set.current(), 0);
+	ASSERT_EQ(1u, l0_files.size());
+	EXPECT_EQ(10u, l0_files[0]);
+
+	ASSERT_TRUE(CreatePlaceholderFile(TableFileName(db_path_, 999)).ok());
+
+	VersionSet reopen(db_path_, &options, &table_cache, &icmp);
+	bool reopen_save_manifest = false;
+	s = reopen.Recover(&reopen_save_manifest);
+	ASSERT_TRUE(s.ok()) << s.ToString();
+	const std::vector<uint64_t> reopened_l0 = CollectFileNumbers(reopen.current(), 0);
+	EXPECT_EQ(l0_files, reopened_l0);
+	EXPECT_TRUE(reopen.NextFileNumber() > 999u);
+}
+
+TEST_F(ManifestRecoveryTest, RecoverUsesManifestAsSourceOfTruth)
+{
+	Options options;
+	options.env = Env::Default();
+	options.comparator = BytewiseComparator();
+
+	TableCache table_cache(db_path_, options, 16);
+	InternalKeyComparator icmp(options.comparator);
+
+	VersionSet writer(db_path_, &options, &table_cache, &icmp);
+	VersionEdit base;
+	base.AddFile(0, 5, 1024, InternalKey("a", 9, kTypeValue), InternalKey("b", 9, kTypeValue));
+	ASSERT_TRUE(ApplyEdit(&writer, &base).ok());
+
+	while (writer.NextFileNumber() <= 8)
 	{
-		db_ = std::move(res.value());
-
-		EXPECT_TRUE(HasLockFile()) << "LOCK missing after open on legacy directory";
-		EXPECT_TRUE(HasLogFile()) << "WAL log missing after open on legacy directory";
-
-		if (HasCurrentFile())
-			EXPECT_TRUE(HasManifestFile()) << "CURRENT exists but MANIFEST does not";
-
-		EXPECT_TRUE(db_->Put("boot_key", "boot_val").ok());
-		auto get_res = db_->Get("boot_key");
-		EXPECT_TRUE(get_res.has_value());
-		EXPECT_EQ("boot_val", get_res.value());
+		writer.NewFileNumber();
 	}
-	else
-	{
-		GTEST_SUCCEED() << "DB::Open returned non-OK on legacy directory (expected until "
-		                   "bootstrap is implemented): "
-		                << res.error().ToString();
-	}
+	writer.SetLastSequence(123);
+
+	VersionEdit with_metadata;
+	with_metadata.SetLogNumber(7);
+	with_metadata.SetPrevLogNumber(6);
+	with_metadata.AddFile(1, 12, 2048, InternalKey("c", 9, kTypeValue), InternalKey("d", 9, kTypeValue));
+	ASSERT_TRUE(ApplyEdit(&writer, &with_metadata).ok());
+
+	ASSERT_TRUE(CreatePlaceholderFile(TableFileName(db_path_, 900)).ok());
+	ASSERT_TRUE(CreatePlaceholderFile(LogFileName(db_path_, 901)).ok());
+
+	VersionSet recovered(db_path_, &options, &table_cache, &icmp);
+	bool save_manifest = false;
+	Status s = recovered.Recover(&save_manifest);
+	ASSERT_TRUE(s.ok()) << s.ToString();
+
+	EXPECT_EQ(7u, recovered.LogNumber());
+	EXPECT_EQ(6u, recovered.PrevLogNumber());
+	EXPECT_EQ(123u, recovered.LastSequence());
+	EXPECT_TRUE(recovered.NextFileNumber() > 901u);
+
+	const std::vector<uint64_t> l0_files = CollectFileNumbers(recovered.current(), 0);
+	const std::vector<uint64_t> l1_files = CollectFileNumbers(recovered.current(), 1);
+	EXPECT_EQ((std::vector<uint64_t>{ 5 }), l0_files);
+	EXPECT_EQ((std::vector<uint64_t>{ 12 }), l1_files);
+	EXPECT_TRUE(save_manifest);
+}
+
+TEST_F(ManifestRecoveryTest, ReuseLogsDisabledDuringManifestRollout)
+{
+	Options options;
+	options.env = Env::Default();
+	options.comparator = BytewiseComparator();
+	options.reuse_logs = true;
+
+	TableCache table_cache(db_path_, options, 16);
+	InternalKeyComparator icmp(options.comparator);
+
+	VersionSet writer(db_path_, &options, &table_cache, &icmp);
+	VersionEdit edit;
+	edit.AddFile(0, 4, 100, InternalKey("a", 7, kTypeValue), InternalKey("a", 6, kTypeValue));
+	ASSERT_TRUE(ApplyEdit(&writer, &edit).ok());
+
+	VersionSet recovered(db_path_, &options, &table_cache, &icmp);
+	bool save_manifest = false;
+	Status s = recovered.Recover(&save_manifest);
+	ASSERT_TRUE(s.ok()) << s.ToString();
+	EXPECT_TRUE(save_manifest);
 }
 
 int main(int argc, char** argv)

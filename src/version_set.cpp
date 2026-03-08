@@ -6,6 +6,7 @@
 
 #include "env.h"
 #include "filename.h"
+#include "log_reader.h"
 #include "table_cache.h"
 
 namespace prism
@@ -87,6 +88,7 @@ namespace prism
 	    , manifest_file_number_(1)
 	    , last_sequence_(0)
 	    , log_number_(0)
+	    , prev_log_number_(0)
 	{
 		if (env_ == nullptr)
 		{
@@ -212,6 +214,268 @@ namespace prism
 		}
 
 		return s;
+	}
+
+	Status VersionSet::Recover(bool* save_manifest)
+	{
+		if (save_manifest == nullptr)
+		{
+			return Status::InvalidArgument("save_manifest is null");
+		}
+		*save_manifest = false;
+
+		std::string current;
+		Status s = ReadFileToString(env_, CurrentFileName(dbname_), &current);
+		if (!s.ok())
+		{
+			if (!s.IsNotFound())
+			{
+				return s;
+			}
+
+			auto children = env_->GetChildren(dbname_);
+			if (!children.has_value())
+			{
+				return children.error();
+			}
+
+			bool has_manifest = false;
+			bool has_legacy_files = false;
+			uint64_t max_file_number = 0;
+			uint64_t max_log_number = 0;
+
+			VersionEdit bootstrap_edit;
+			bootstrap_edit.SetComparatorName(icmp_->user_comparator()->Name());
+			bootstrap_edit.SetPrevLogNumber(0);
+
+			for (const std::string& name : children.value())
+			{
+				uint64_t number = 0;
+				FileType type;
+				if (!ParseFileName(name, &number, &type))
+				{
+					continue;
+				}
+
+				if (number > max_file_number)
+				{
+					max_file_number = number;
+				}
+
+				if (type == FileType::kDescriptorFile)
+				{
+					has_manifest = true;
+					continue;
+				}
+
+				if (type == FileType::kTableFile)
+				{
+					has_legacy_files = true;
+					auto file_size = env_->GetFileSize(dbname_ + "/" + name);
+					if (!file_size.has_value())
+					{
+						if (file_size.error().IsNotFound())
+						{
+							continue;
+						}
+						return file_size.error();
+					}
+
+					const InternalKey boundary_key("", kMaxSequenceNumber, kValueTypeForSeek);
+					bootstrap_edit.AddFile(0, number, static_cast<uint64_t>(file_size.value()), boundary_key, boundary_key);
+					continue;
+				}
+
+				if (type == FileType::kLogFile)
+				{
+					has_legacy_files = true;
+					if (number > max_log_number)
+					{
+						max_log_number = number;
+					}
+				}
+			}
+
+			if (has_manifest)
+			{
+				return Status::Corruption("CURRENT missing while MANIFEST exists");
+			}
+
+			if (!has_legacy_files)
+			{
+				return s;
+			}
+
+			MarkFileNumberUsed(max_file_number);
+			bootstrap_edit.SetLogNumber(max_log_number);
+
+			std::mutex mu;
+			mu.lock();
+			s = LogAndApply(&bootstrap_edit, &mu);
+			mu.unlock();
+			if (!s.ok())
+			{
+				return s;
+			}
+
+			*save_manifest = true;
+			return Status::OK();
+		}
+
+		if (current.empty() || current.back() != '\n')
+		{
+			return Status::Corruption("CURRENT file does not end with newline");
+		}
+		current.pop_back();
+
+		uint64_t manifest_number = 0;
+		FileType manifest_type;
+		if (!ParseFileName(current, &manifest_number, &manifest_type) || manifest_type != FileType::kDescriptorFile)
+		{
+			return Status::Corruption("CURRENT points to invalid MANIFEST");
+		}
+
+		auto file_res = env_->NewSequentialFile(dbname_ + "/" + current);
+		if (!file_res.has_value())
+		{
+			if (file_res.error().IsNotFound())
+			{
+				return Status::Corruption("CURRENT points to a missing MANIFEST");
+			}
+			return file_res.error();
+		}
+
+		struct LogReporter: public log::Reader::Reporter
+		{
+			Status* status = nullptr;
+
+			void Corruption(size_t, const Status& s) override
+			{
+				if (status != nullptr && status->ok())
+				{
+					*status = s;
+				}
+			}
+		};
+
+		bool have_log_number = false;
+		bool have_prev_log_number = false;
+		bool have_next_file = false;
+		bool have_last_sequence = false;
+		uint64_t log_number = 0;
+		uint64_t prev_log_number = 0;
+		uint64_t next_file = 0;
+		uint64_t last_sequence = 0;
+
+		Builder builder(this, current_);
+		LogReporter reporter;
+		reporter.status = &s;
+		log::Reader reader(file_res.value().get(), &reporter, true, 0);
+
+		Slice record;
+		std::string scratch;
+		while (reader.ReadRecord(&record, &scratch) && s.ok())
+		{
+			VersionEdit edit;
+			s = edit.DecodeFrom(record);
+			if (!s.ok())
+			{
+				break;
+			}
+
+			if (edit.HasComparator() && edit.GetComparator() != icmp_->user_comparator()->Name())
+			{
+				s = Status::Corruption("comparator name mismatch");
+				break;
+			}
+
+			builder.Apply(&edit);
+
+			if (edit.HasLogNumber())
+			{
+				have_log_number = true;
+				log_number = edit.GetLogNumber();
+			}
+			if (edit.HasPrevLogNumber())
+			{
+				have_prev_log_number = true;
+				prev_log_number = edit.GetPrevLogNumber();
+			}
+			if (edit.HasNextFileNumber())
+			{
+				have_next_file = true;
+				next_file = edit.GetNextFileNumber();
+			}
+			if (edit.HasLastSequence())
+			{
+				have_last_sequence = true;
+				last_sequence = edit.GetLastSequence();
+			}
+		}
+
+		if (s.ok() && !reader.status().ok())
+		{
+			s = reader.status();
+		}
+
+		if (s.ok())
+		{
+			if (!have_next_file)
+			{
+				s = Status::Corruption("no next file number in MANIFEST");
+			}
+			else if (!have_log_number)
+			{
+				s = Status::Corruption("no log number in MANIFEST");
+			}
+			else if (!have_last_sequence)
+			{
+				s = Status::Corruption("no last sequence in MANIFEST");
+			}
+		}
+
+		if (!s.ok())
+		{
+			return s;
+		}
+
+		if (!have_prev_log_number)
+		{
+			prev_log_number = 0;
+		}
+
+		Version* recovered = NewVersion();
+		builder.SaveTo(recovered);
+		Finalize(recovered);
+		AppendVersion(recovered);
+
+		manifest_file_number_ = manifest_number;
+		next_file_number_ = next_file + 1;
+		last_sequence_ = last_sequence;
+		log_number_ = log_number;
+		prev_log_number_ = prev_log_number;
+
+		MarkFileNumberUsed(prev_log_number_);
+		MarkFileNumberUsed(log_number_);
+
+		auto children = env_->GetChildren(dbname_);
+		if (!children.has_value())
+		{
+			return children.error();
+		}
+		for (const std::string& name : children.value())
+		{
+			uint64_t number = 0;
+			FileType type;
+			if (!ParseFileName(name, &number, &type))
+			{
+				continue;
+			}
+			MarkFileNumberUsed(number);
+		}
+
+		*save_manifest = true;
+		return Status::OK();
 	}
 
 	Status VersionSet::WriteSnapshot(log::Writer* log)
