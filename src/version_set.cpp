@@ -4,6 +4,10 @@
 #include <cassert>
 #include <cstdint>
 
+#include "env.h"
+#include "filename.h"
+#include "table_cache.h"
+
 namespace prism
 {
 	static int64_t TotalFileSize(const std::vector<FileMetaData*>& files)
@@ -72,13 +76,172 @@ namespace prism
 		return files_[level];
 	}
 
-	VersionSet::VersionSet(const Options* options, const InternalKeyComparator& icmp)
+	VersionSet::VersionSet(const std::string& dbname, const Options* options, TableCache* table_cache, const InternalKeyComparator* cmp)
 	    : options_(options)
-	    , icmp_(icmp)
+	    , dbname_(dbname)
+	    , table_cache_(table_cache)
+	    , icmp_(cmp)
+	    , env_(options != nullptr ? options->env : nullptr)
+	    , current_(nullptr)
+	    , next_file_number_(2)
+	    , manifest_file_number_(1)
+	    , last_sequence_(0)
+	    , log_number_(0)
 	{
+		if (env_ == nullptr)
+		{
+			env_ = Env::Default();
+		}
+		current_ = new Version();
+		current_->Ref();
+	}
+
+	VersionSet::~VersionSet()
+	{
+		descriptor_log_.reset();
+		if (descriptor_file_ != nullptr)
+		{
+			descriptor_file_->Close();
+			descriptor_file_.reset();
+		}
+		if (current_ != nullptr)
+		{
+			current_->Unref();
+			current_ = nullptr;
+		}
 	}
 
 	Version* VersionSet::NewVersion() const { return new Version(); }
+
+	void VersionSet::AppendVersion(Version* v)
+	{
+		assert(v != nullptr);
+		Version* old = current_;
+		current_ = v;
+		current_->Ref();
+		if (old != nullptr)
+		{
+			old->Unref();
+		}
+	}
+
+	Status VersionSet::LogAndApply(VersionEdit* edit, std::mutex* mu)
+	{
+		assert(edit != nullptr);
+		assert(mu != nullptr);
+
+		if (edit->HasLogNumber())
+		{
+			assert(edit->GetLogNumber() >= log_number_);
+			assert(edit->GetLogNumber() < next_file_number_);
+		}
+		else
+		{
+			edit->SetLogNumber(log_number_);
+		}
+
+		edit->SetNextFile(next_file_number_);
+		edit->SetLastSequence(last_sequence_);
+
+		std::unique_ptr<Version> v(NewVersion());
+		{
+			Builder builder(this, current_);
+			builder.Apply(edit);
+			builder.SaveTo(v.get());
+		}
+		Finalize(v.get());
+
+		std::string new_manifest_file;
+		Status s;
+		if (!descriptor_log_)
+		{
+			new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
+			auto descriptor_result = env_->NewWritableFile(new_manifest_file);
+			if (!descriptor_result.has_value())
+			{
+				s = descriptor_result.error();
+			}
+			else
+			{
+				descriptor_file_ = std::move(descriptor_result.value());
+				descriptor_log_ = std::make_unique<log::Writer>(descriptor_file_.get());
+				s = WriteSnapshot(descriptor_log_.get());
+			}
+		}
+
+		mu->unlock();
+
+		if (s.ok())
+		{
+			std::string record;
+			edit->EncodeTo(&record);
+			s = descriptor_log_->AddRecord(record);
+			if (s.ok())
+			{
+				s = descriptor_file_->Sync();
+			}
+			if (!s.ok())
+			{
+				Log(options_->info_log, "MANIFEST write: %s\n", s.ToString().c_str());
+			}
+		}
+
+		if (s.ok() && !new_manifest_file.empty())
+		{
+			s = SetCurrentFile(env_, dbname_, manifest_file_number_);
+		}
+
+		mu->lock();
+
+		if (s.ok())
+		{
+			AppendVersion(v.release());
+			log_number_ = edit->GetLogNumber();
+			next_file_number_ = edit->GetNextFileNumber();
+			last_sequence_ = edit->GetLastSequence();
+		}
+		else if (!new_manifest_file.empty())
+		{
+			descriptor_log_.reset();
+			if (descriptor_file_)
+			{
+				descriptor_file_->Close();
+				descriptor_file_.reset();
+			}
+			env_->RemoveFile(new_manifest_file);
+		}
+
+		return s;
+	}
+
+	Status VersionSet::WriteSnapshot(log::Writer* log)
+	{
+		VersionEdit edit;
+		edit.SetComparatorName(icmp_->user_comparator()->Name());
+
+		for (int level = 0; level < kNumLevels; ++level)
+		{
+			if (!compact_pointer_[level].empty())
+			{
+				InternalKey key;
+				key.DecodeFrom(compact_pointer_[level]);
+				edit.SetCompactPointer(level, key);
+			}
+		}
+
+		for (int level = 0; level < kNumLevels; ++level)
+		{
+			const std::vector<FileMetaData*>& files = current_->files(level);
+			for (const FileMetaData* file : files)
+			{
+				edit.AddFile(level, file->number, file->file_size, file->smallest, file->largest);
+			}
+		}
+
+		std::string record;
+		edit.EncodeTo(&record);
+		return log->AddRecord(record);
+	}
 
 	double VersionSet::MaxBytesForLevel(int level) const
 	{
@@ -147,7 +310,7 @@ namespace prism
 	{
 		base_->Ref();
 		BySmallestKey cmp;
-		cmp.internal_comparator = &vset_->icmp_;
+		cmp.internal_comparator = vset_->icmp_;
 		for (int level = 0; level < kNumLevels; ++level)
 		{
 			levels_[level].added_files = new FileSet(cmp);
@@ -230,7 +393,7 @@ namespace prism
 			else
 			{
 				std::sort(files.begin(), files.end(), [this](const FileMetaData* lhs, const FileMetaData* rhs) {
-					const int compare = vset_->icmp_.Compare(lhs->smallest.Encode(), rhs->smallest.Encode());
+					const int compare = vset_->icmp_->Compare(lhs->smallest.Encode(), rhs->smallest.Encode());
 					if (compare != 0)
 					{
 						return compare < 0;
@@ -240,7 +403,7 @@ namespace prism
 
 				for (size_t i = 1; i < files.size(); ++i)
 				{
-					assert(vset_->icmp_.Compare(files[i - 1]->largest.Encode(), files[i]->smallest.Encode()) < 0);
+					assert(vset_->icmp_->Compare(files[i - 1]->largest.Encode(), files[i]->smallest.Encode()) < 0);
 				}
 			}
 		}

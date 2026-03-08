@@ -2,16 +2,22 @@
 #define PRISM_VERSION_SET_H
 
 #include <cstdint>
-#include <string>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <string>
 #include <vector>
 
+#include "env.h"
 #include "dbformat.h"
+#include "log_writer.h"
 #include "options.h"
 #include "version_edit.h"
 
 namespace prism
 {
+	class TableCache;
+
 	namespace config
 	{
 		static constexpr int kL0_CompactionTrigger = 4;
@@ -48,7 +54,14 @@ namespace prism
 	class VersionSet
 	{
 	public:
-		explicit VersionSet(const Options* options, const InternalKeyComparator& icmp);
+		explicit VersionSet(const Options* options, const InternalKeyComparator& icmp)
+		    : VersionSet("", options, nullptr, &icmp)
+		{
+		}
+		VersionSet(const std::string& dbname, const Options* options, TableCache* table_cache, const InternalKeyComparator* cmp);
+		VersionSet(const VersionSet&) = delete;
+		VersionSet& operator=(const VersionSet&) = delete;
+		~VersionSet();
 
 		class Builder
 		{
@@ -77,14 +90,52 @@ namespace prism
 		};
 
 		Version* NewVersion() const;
+		Version* current() const { return current_; }
+
+		Status LogAndApply(VersionEdit* edit, std::mutex* mu);
+		Status WriteSnapshot(log::Writer* log);
+
 		void Finalize(Version* v) const;
 		double MaxBytesForLevel(int level) const;
+
+		uint64_t ManifestFileNumber() const { return manifest_file_number_; }
+		uint64_t NewFileNumber() { return next_file_number_++; }
+		void ReuseFileNumber(uint64_t file_number)
+		{
+			if (next_file_number_ == file_number + 1)
+			{
+				next_file_number_ = file_number;
+			}
+		}
+		uint64_t LastSequence() const { return last_sequence_; }
+		void SetLastSequence(uint64_t s)
+		{
+			assert(s >= last_sequence_);
+			last_sequence_ = s;
+		}
+		uint64_t LogNumber() const { return log_number_; }
+		uint64_t NextFileNumber() const { return next_file_number_; }
 
 		const std::string& compact_pointer(int level) const;
 
 	private:
+		void AppendVersion(Version* v);
+
 		const Options* options_;
-		InternalKeyComparator icmp_;
+		std::string dbname_;
+		TableCache* table_cache_;
+		const InternalKeyComparator* icmp_;
+		Env* env_;
+		Version* current_;
+
+		std::unique_ptr<WritableFile> descriptor_file_;
+		std::unique_ptr<log::Writer> descriptor_log_;
+
+		uint64_t next_file_number_;
+		uint64_t manifest_file_number_;
+		uint64_t last_sequence_;
+		uint64_t log_number_;
+
 		std::string compact_pointer_[kNumLevels];
 	};
 

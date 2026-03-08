@@ -5,11 +5,17 @@
 #include "db.h"
 #include "env.h"
 #include "filename.h"
+#include "log_reader.h"
+#include "log_writer.h"
 #include "options.h"
 #include "status.h"
+#include "table_cache.h"
+#include "version_edit.h"
+#include "version_set.h"
 
 #include <gtest/gtest.h>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -141,6 +147,53 @@ class ManifestRecoveryTest: public DbTestBase
 {
 };
 
+namespace
+{
+	struct TestManifestReporter: public log::Reader::Reporter
+	{
+		Status status = Status::OK();
+
+		void Corruption(size_t, const Status& s) override
+		{
+			if (status.ok())
+			{
+				status = s;
+			}
+		}
+	};
+
+	Status ReadManifestEdits(const std::string& manifest_path, std::vector<VersionEdit>* edits)
+	{
+		auto file_res = Env::Default()->NewSequentialFile(manifest_path);
+		if (!file_res.has_value())
+		{
+			return file_res.error();
+		}
+
+		TestManifestReporter reporter;
+		log::Reader reader(file_res.value().get(), &reporter, true, 0);
+
+		Slice record;
+		std::string scratch;
+		while (reader.ReadRecord(&record, &scratch))
+		{
+			VersionEdit edit;
+			Status s = edit.DecodeFrom(record);
+			if (!s.ok())
+			{
+				return s;
+			}
+			edits->push_back(std::move(edit));
+		}
+
+		if (!reporter.status.ok())
+		{
+			return reporter.status;
+		}
+		return reader.status();
+	}
+}
+
 // ── Test 1: A fresh DB::Open must succeed and create the DB directory with
 //    at least a LOCK file and a WAL log file. This tests the current
 //    implementation. When MANIFEST/VersionSet is added (later tasks), the
@@ -171,6 +224,55 @@ TEST_F(ManifestRecoveryTest, ReopenPreservesManifest)
 	auto get_res = db_->Get("reopen_key");
 	ASSERT_TRUE(get_res.has_value()) << "key missing after reopen";
 	EXPECT_EQ("reopen_val", get_res.value());
+}
+
+TEST_F(ManifestRecoveryTest, WriteSnapshotContainsAllLiveFiles)
+{
+	Options options;
+	options.create_if_missing = true;
+	options.env = Env::Default();
+	options.comparator = BytewiseComparator();
+
+	TableCache table_cache(db_path_, options, 16);
+	InternalKeyComparator icmp(options.comparator);
+	VersionSet version_set(db_path_, &options, &table_cache, &icmp);
+
+	VersionEdit install_edit;
+	install_edit.SetCompactPointer(1, InternalKey("k", 100, kTypeValue));
+	install_edit.AddFile(0, 100, 4 * 1024, InternalKey("a", 100, kTypeValue), InternalKey("b", 100, kTypeValue));
+	install_edit.AddFile(1, 200, 8 * 1024, InternalKey("c", 100, kTypeValue), InternalKey("d", 100, kTypeValue));
+
+	std::mutex mu;
+	mu.lock();
+	Status s = version_set.LogAndApply(&install_edit, &mu);
+	mu.unlock();
+	ASSERT_TRUE(s.ok()) << s.ToString();
+
+	auto manifest_res = Env::Default()->NewWritableFile(db_path_ + "/snapshot-test-manifest");
+	ASSERT_TRUE(manifest_res.has_value()) << manifest_res.error().ToString();
+	auto writable = std::move(manifest_res.value());
+	log::Writer writer(writable.get());
+
+	ASSERT_TRUE(version_set.WriteSnapshot(&writer).ok());
+	ASSERT_TRUE(writable->Sync().ok());
+	ASSERT_TRUE(writable->Close().ok());
+
+	std::vector<VersionEdit> edits;
+	s = ReadManifestEdits(db_path_ + "/snapshot-test-manifest", &edits);
+	ASSERT_TRUE(s.ok()) << s.ToString();
+	ASSERT_EQ(1u, edits.size());
+
+	const VersionEdit& snapshot = edits[0];
+	ASSERT_TRUE(snapshot.HasComparator());
+	EXPECT_EQ(std::string(options.comparator->Name()), snapshot.GetComparator());
+	EXPECT_EQ(1u, snapshot.GetCompactPointers().size());
+
+	const auto& files = snapshot.GetNewFiles();
+	ASSERT_EQ(2u, files.size());
+	EXPECT_EQ(0, files[0].first);
+	EXPECT_EQ(100u, files[0].second.number);
+	EXPECT_EQ(1, files[1].first);
+	EXPECT_EQ(200u, files[1].second.number);
 }
 
 // ── Test 3: A directory without CURRENT or MANIFEST ("legacy" directory)

@@ -5,14 +5,20 @@
 // here to keep the footprint minimal.
 
 #include "env.h"
+#include "filename.h"
+#include "comparator.h"
+#include "options.h"
 #include "status.h"
 #include "slice.h"
+#include "table_cache.h"
+#include "version_edit.h"
+#include "version_set.h"
 
 #include <gtest/gtest.h>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_set>
 #include <filesystem>
 
 using namespace prism;
@@ -336,6 +342,33 @@ TEST_F(FaultInjectionTest, ResetFaultsClearsAllFlags)
 	EXPECT_TRUE(wf->Append(Slice("data")).ok());
 	EXPECT_TRUE(wf->Sync().ok());
 	wf->Close();
+}
+
+TEST_F(FaultInjectionTest, CrashAfterManifestSyncBeforeCurrent)
+{
+	Options options;
+	options.env = env_.get();
+	options.comparator = BytewiseComparator();
+	options.create_if_missing = true;
+
+	TableCache table_cache(tmp_path_, options, 16);
+	InternalKeyComparator icmp(options.comparator);
+	VersionSet version_set(tmp_path_, &options, &table_cache, &icmp);
+
+	VersionEdit edit;
+	edit.AddFile(0, 101, 4096, InternalKey("a", 100, kTypeValue), InternalKey("z", 100, kTypeValue));
+
+	std::mutex mu;
+	mu.lock();
+	env_->SetFailRename(true);
+	Status s = version_set.LogAndApply(&edit, &mu);
+	env_->SetFailRename(false);
+	mu.unlock();
+
+	EXPECT_FALSE(s.ok());
+	EXPECT_TRUE(s.IsIOError());
+	EXPECT_FALSE(Env::Default()->FileExists(CurrentFileName(tmp_path_)));
+	EXPECT_EQ(0u, version_set.current()->files(0).size());
 }
 
 int main(int argc, char** argv)
