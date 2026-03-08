@@ -1,5 +1,10 @@
 # Prism Architecture Overview
 
+- **[Compaction Architecture](compaction.md)** - LSM-Tree compaction, background flushes, and metadata authority
+  - Metadata truth and recovery ordering
+  - Background flush/compaction flows
+  - v1 tombstone policy and deferred backlog
+
 ## System Components
 
 ```plaintext
@@ -14,13 +19,13 @@
 │  - Manages MemTable (mem_ / imm_)                          │
 │  - Coordinates WAL (Write-Ahead Log)                       │
 │  - Sequence number management                              │
-│  - Background compaction (future)                          │
+│  - Background compaction                                    │
 └────────────────────────────────────────────────────────────┘
           │                    │                    │
           ▼                    ▼                    ▼
     ┌──────────┐        ┌──────────┐        ┌──────────┐
     │ MemTable │        │   WAL    │        │ SSTable  │
-    │          │        │ (Log)    │        │ (future) │
+    │          │        │ (Log)    │        │          │
     └──────────┘        └──────────┘        └──────────┘
           │
           ▼
@@ -81,12 +86,12 @@
    - If deleted → return NotFound
          │
          ▼
-4. Search Immutable MemTable (imm_) [future]
+4. Search Immutable MemTable (imm_)
    - imm_->Get(lookup_key, &value, &s)
    - If found → return value
          │
          ▼
-5. Search SSTables (Level 0 → Level N) [future]
+5. Search SSTables (Level 0 → Level N)
    - Seek in bloom filters
    - Binary search in index blocks
    - Read data blocks
@@ -438,7 +443,7 @@ Compaction:
 
 ---
 
-## Future Components
+## Component Details
 
 ### SSTable (Sorted String Table)
 
@@ -459,28 +464,29 @@ SSTable := Data Blocks | Meta Block | Index Block | Footer
 
 ### Version and VersionSet
 
-**Purpose:** Manage multiple SSTable versions
+**Purpose:** Manage multiple SSTable versions and track metadata changes over time.
 
 **Responsibilities:**
 
-- Track active SSTables per level
-- Coordinate compaction
-- Provide consistent snapshots
+- **Authority**: The sole source of truth for the database's live file set.
+- **Manifest**: Persists changes to the version as a log of `VersionEdit` records.
+- **Compaction Picker**: Selects levels and key ranges for background compaction.
+- **Snapshot Support**: Provides a consistent, immutable `Version` for each read operation.
 
 ### Compaction
 
-**Purpose:** Merge MemTable/SSTables, remove old versions
+**Purpose:** Merge MemTable/SSTables, remove old versions, and optimize the LSM-Tree structure.
 
 **Types:**
 
-- Minor compaction: MemTable → Level 0 SSTable
-- Major compaction: Level N → Level N+1
+- **Minor Compaction**: Flushes an immutable MemTable to a Level 0 SSTable.
+- **Major Compaction**: Merges files from Level N and overlapping files from Level N+1 into new files in Level N+1.
 
 **Goals:**
 
-- Reclaim space (remove deleted/overwritten keys)
-- Maintain LSM-tree invariants
-- Bound read amplification
+- **Space Reclamation**: (Planned for v2) Remove deleted/overwritten keys once they are no longer visible to any snapshot.
+- **Read Optimization**: Maintain the leveled structure to bound read amplification.
+- **Write Performance**: Ensure L0 does not accumulate too many files, which could stall writes.
 
 ---
 
