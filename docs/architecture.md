@@ -1,171 +1,151 @@
 # Prism Architecture Overview
 
-- **[Compaction Architecture](compaction.md)** - LSM-Tree compaction, background flushes, and metadata authority
-  - Metadata truth and recovery ordering
-  - Background flush/compaction flows
-  - v1 tombstone policy and deferred backlog
+Prism is a high performance key-value store based on the Log-Structured Merge-Tree (LSM-Tree) architecture. It provides atomic batch updates, multi-version concurrency control (MVCC), and crash consistency through write-ahead logging. This document outlines the core components, data flow, and design principles of the system.
+
+- **[Compaction Architecture](compaction.md)** - LSM-Tree compaction, background flushes, and metadata authority. Understanding compaction is critical for managing write amplification and read latency.
+  - Metadata truth and recovery ordering.
+  - Background flush/compaction flows.
+  - v1 tombstone policy and deferred backlog.
 
 ## System Components
 
-```plaintext
-┌────────────────────────────────────────────────────────────┐
-│                      User API Layer                        │
-│  DB::Open(), DB::Put(), DB::Get(), DB::Delete()            │
-└────────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-┌────────────────────────────────────────────────────────────┐
-│                        DBImpl                              │
-│  - Manages MemTable (mem_ / imm_)                          │
-│  - Coordinates WAL (Write-Ahead Log)                       │
-│  - Sequence number management                              │
-│  - Background compaction                                    │
-└────────────────────────────────────────────────────────────┘
-          │                    │                    │
-          ▼                    ▼                    ▼
-    ┌──────────┐        ┌──────────┐        ┌──────────┐
-    │ MemTable │        │   WAL    │        │ SSTable  │
-    │          │        │ (Log)    │        │          │
-    └──────────┘        └──────────┘        └──────────┘
-          │
-          ▼
-    ┌──────────┐
-    │ SkipList │
-    │  + Arena │
-    └──────────┘
+The Prism architecture is divided into three primary layers: the User API, the Core Engine (DBImpl), and the Persistence Layer. The Core Engine coordinates between in-memory structures and on-disk storage to ensure consistency and performance.
+
+```mermaid
+flowchart TD
+    subgraph API [User API Layer]
+        direction LR
+        Open["DB::Open()"] --> Ops["Put() / Get() / Delete()"]
+    end
+
+    API --> DBImpl
+
+    subgraph Core [DBImpl - Core Engine]
+        direction TB
+        Mem[MemTable] -- active --> MemA[Arena / SkipList]
+        Imm[Immutable MemTable] -- pending flush --> MemB[Arena / SkipList]
+        Seq[Sequence Number Manager]
+        BG[Background Compaction]
+    end
+
+    DBImpl --> WAL[Write-Ahead Log]
+    DBImpl --> SST[SSTables - On-disk Storage]
+    BG -. schedules .-> SST
+    Imm -. flushes to .-> SST
 ```
 
 ---
 
 ## Write Path
 
-```plaintext
-1. User calls DB::Put(key, value)
-         │
-         ▼
-2. DBImpl creates WriteBatch
-   - batch.Put(key, value)
-   - batch.sequence = current_seq++
-         │
-         ▼
-3. DBImpl::Write(batch)
-   - Encode batch to bytes
-   - Write to WAL (log_writer_)
-   - Sync to disk (optional)
-         │
-         ▼
-4. DBImpl::ApplyBatch(batch)
-   - mem_->Add(seq, kTypeValue, key, value)
-   - Updates in-memory SkipList
-         │
-         ▼
-5. Return Status::OK()
+The write path is designed for high throughput by performing sequential I/O to the Write-Ahead Log (WAL) before updating the in-memory MemTable. This ensures that even if the system crashes immediately after a write, the data can be recovered during the next startup.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as User Application
+    participant DB as DBImpl
+    participant WAL as Write-Ahead Log (Disk)
+    participant Mem as MemTable (RAM)
+
+    User->>DB: Put(key, value)
+    Note over DB: Create WriteBatch
+    Note over DB: Assign Sequence Number (current_seq++)
+    DB->>WAL: Append encoded batch
+    Note over WAL: Optional: fsync() for strict durability
+    DB->>Mem: ApplyBatch(batch) to SkipList
+    Note over Mem: Update sequence number index
+    DB-->>User: Return Status::OK()
 ```
 
-**Key points:**
+**Why this matters:**
+- **WAL first**: Ensures durability before in-memory update. If a crash occurs, the WAL is the source of truth for pending writes.
+- **Batch atomic**: Multiple operations within a `WriteBatch` commit together. Either all operations are visible, or none are.
+- **Sequence number**: Monotonically increasing for MVCC. This allows readers to see a consistent snapshot of the data even while writes are in progress.
+- **Performance**: Writes are never blocked by disk seeks, as the WAL is append-only and the MemTable update is O(log N).
 
-- **WAL first**: Ensures durability before in-memory update
-- **Batch atomic**: Multiple operations commit together
-- **Sequence number**: Monotonically increasing for MVCC
-
+---
 ---
 
 ## Read Path
 
-```plaintext
-1. User calls DB::Get(key)
-         │
-         ▼
-2. DBImpl::Get(key)
-   - Create LookupKey(key, current_seq)
-         │
-         ▼
-3. Search MemTable (mem_)
-   - mem_->Get(lookup_key, &value, &s)
-   - If found → return value
-   - If deleted → return NotFound
-         │
-         ▼
-4. Search Immutable MemTable (imm_)
-   - imm_->Get(lookup_key, &value, &s)
-   - If found → return value
-         │
-         ▼
-5. Search SSTables (Level 0 → Level N)
-   - Seek in bloom filters
-   - Binary search in index blocks
-   - Read data blocks
-         │
-         ▼
-6. Return Result<std::string> or NotFound
+Prism employs a tiered read strategy, searching from the most recent data (in-memory) to the oldest data (on-disk). This ensures that the most up-to-date version of a key is always returned.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as User Application
+    participant DB as DBImpl
+    participant Mem as MemTable (Active)
+    participant Imm as Immutable MemTable
+    participant SST as SSTables (L0 -> LN)
+
+    User->>DB: Get(key)
+    Note over DB: Create LookupKey(key, last_seq)
+    DB->>Mem: Get(LookupKey)
+    alt Found in MemTable
+        Mem-->>DB: Value / Deleted Tag
+    else Not Found
+        DB->>Imm: Get(LookupKey)
+        alt Found in Immutable MemTable
+            Imm-->>DB: Value / Deleted Tag
+        else Not Found
+            DB->>SST: Search Levels (Bloom Filters -> Index)
+            SST-->>DB: Value / NotFound
+        end
+    end
+    DB-->>User: Return Result<std::string>
 ```
 
-**Key points:**
-
-- **Newest first**: MemTable → Immutable MemTable → SSTables
-- **Short-circuit**: Return immediately on first match
-- **Snapshot isolation**: LookupKey includes sequence number
-
----
+**Why this matters:**
+- **Newest first**: Searching MemTable → Immutable MemTable → SSTables ensures version consistency. New versions "shadow" older ones.
+- **Short-circuit**: The read returns immediately upon finding a match, minimizing unnecessary disk I/O.
+- **Snapshot isolation**: Every read uses the `last_sequence` at the time the call was made, providing a consistent view of the database.
+- **Performance Implications**: Frequent reads to keys that don't exist are optimized via Bloom Filters in the SSTables, preventing expensive disk seeks.
 
 ## Recovery Path
 
-```plaintext
-1. DB::Open(path)
-         │
-         ▼
-2. DBImpl constructor
-   - Open WAL file for reading
-         │
-         ▼
-3. Replay WAL records
-   for each log record:
-     - Decode WriteBatch
-     - Extract sequence number
-     - mem_->Add() for each operation
-     - Update last_sequence
-         │
-         ▼
-4. Resume normal operation
-   - Start from last_sequence + 1
-   - Reopen WAL for appending
+The recovery process restores the database state by replaying the Write-Ahead Log (WAL) into a new MemTable. This process is triggered automatically during `DB::Open()`.
+,
+```mermaid
+flowchart TD
+    Start([DB::Open]) --> OpenWAL[Open WAL File]
+    OpenWAL --> ReadRecord[Read Next Log Record]
+    ReadRecord -- EOF --> Finish([Resume Normal Operations])
+    ReadRecord -- Record Found --> Decode[Decode WriteBatch]
+    Decode --> UpdateSeq[Update Last Sequence Number]
+    UpdateSeq --> ApplyMem[Apply Batch to MemTable]
+    ApplyMem --> ReadRecord
 ```
 
-**Key points:**
-
-- **Idempotent**: Replaying same record multiple times is safe
-- **Sequence tracking**: Ensures monotonicity after restart
-- **No data loss**: All committed writes are in WAL
-
----
+**Why this matters:**
+- **Idempotent**: Replaying the same record multiple times is safe because each operation is tagged with a unique, monotonically increasing sequence number.
+- **Sequence tracking**: Prism ensures that the `last_sequence_` after recovery is strictly greater than any sequence number used before the crash.
+- **No data loss**: As long as the WAL record was successfully flushed to disk (controlled by `Options::sync`), the write is guaranteed to be recovered.
 
 ## Data Structures
 
 ### MemTable
 
-**Purpose:** In-memory write buffer
-
+**Purpose:** The MemTable serves as the primary in-memory buffer for all incoming writes. It provides sorted storage, which facilitates fast range scans and eventual flushing to sorted SSTables.
+,
 **Implementation:**
-
-- SkipList (sorted map)
-- Arena allocator (memory pool)
-- InternalKey encoding (MVCC)
-
-**Characteristics:**
-
-- Fast writes: O(log N)
-- Fast reads: O(log N)
-- Sorted iteration
-- Memory-only (volatile)
-
-**Size limit:** Configured by `write_buffer_size` (default 4MB in LevelDB)
-
+- **SkipList**: A probabilistic data structure that provides O(log N) search and insertion while being simpler to implement than balanced trees.
+- **Arena Allocator**: A custom memory pool that minimizes allocation overhead and improves cache locality by allocating large blocks and using bump-pointers.
+- **InternalKey**: Keys are encoded with their sequence number and type (Value/Deletion) to support MVCC. Refer to **[Database Format](dbformat.md)** for encoding details.
+,
+**Performance Insights:**
+- Writes are O(log N) due to the SkipList structure. Since all memory is allocated from the Arena, there is zero `malloc` overhead on the critical write path.
+- Once a MemTable reaches a certain size (e.g., 4MB), it is converted to an **Immutable MemTable** and a new active MemTable is created. This allows background flushing to disk without blocking incoming writes.
+,
 **State transitions:**
-
-```plaintext
-mem_ (active) → imm_ (immutable) → compacted to SSTable → deleted
+```mermaid
+stateDiagram-v2
+    [*] --> Active: Created
+    Active --> Immutable: Reaches write_buffer_size
+    Immutable --> SSTable: Flushed by background thread
+    SSTable --> [*]: Deleted after major compaction
 ```
-
 ### SkipList
 
 **Purpose:** Ordered in-memory index
@@ -248,34 +228,23 @@ Record := checksum | length | type | data
 
 ## Memory Management Hierarchy
 
-```plaintext
-DBImpl
-  │
-  ├─> MemTable (mem_)
-  │     ├─> Arena
-  │     │     ├─> Block 1 (4KB)
-  │     │     ├─> Block 2 (4KB)
-  │     │     └─> Block N (4KB)
-  │     └─> SkipList
-  │           ├─> head_ (allocated from Arena)
-  │           └─> nodes (allocated from Arena)
-  │
-  ├─> MemTable (imm_) [optional]
-  │     └─> Arena (separate instance)
-  │
-  └─> LogWriter (log_)
-        └─> File handle
+Prism uses a hierarchical memory ownership model centered around the `Arena` allocator. This design ensures fast allocation and simplifies object lifetime management by tying the memory's lifecycle to the `MemTable`.
+,
+```mermaid
+flowchart TD
+    DBImpl --> Mem[MemTable - active]
+    DBImpl --> Imm[MemTable - immutable]
+    Mem --> ArenaA[Arena]
+    Imm --> ArenaB[Arena]
+    ArenaA --> BlocksA[4KB Memory Blocks] -- contains --> NodesA[SkipList Nodes]
+    ArenaB --> BlocksB[4KB Memory Blocks] -- contains --> NodesB[SkipList Nodes]
+    DBImpl --> LogW[LogWriter] --> File[WAL File Handle]
 ```
-
-**Lifetime management:**
-
-- **MemTable**: Reference counted (Ref/Unref)
-- **Arena**: Owned by MemTable, destroyed with it
-- **SkipList**: Embedded in MemTable
-- **LogWriter**: Owned by DBImpl
-
----
-
+,
+**Why this matters:**
+- **MemTable**: Reference counted (`Ref()`/`Unref()`). This is crucial because a MemTable might be accessed by both the foreground write thread and a background flush thread.
+- **Arena**: Owned exclusively by its `MemTable`. When the MemTable's reference count reaches zero, the Arena is destroyed, instantly freeing all associated memory blocks without individual `free()` calls.
+- **SkipList**: Embedded within the MemTable; its nodes are allocated directly from the Arena.
 ## Encoding Strategies
 
 ### Varint Encoding
@@ -318,29 +287,22 @@ DBImpl
 ---
 
 ## Comparator Hierarchy
-
-```plaintext
-User provides:
-  Comparator (user_comparator)
-    └─> Compare(user_key_a, user_key_b)
-
-Database creates:
-  InternalKeyComparator
-    ├─> user_comparator
-    └─> Compare(internal_key_a, internal_key_b)
-          - Compare user_key (ASC)
-          - Compare sequence (DESC)
-          - Compare type (DESC)
-
-MemTable uses:
-  KeyComparator
-    ├─> InternalKeyComparator
-    └─> operator()(const char* a, const char* b)
-          - Decode length-prefixed keys
-          - Delegate to InternalKeyComparator
+,
+Comparators define the sort order of keys within Prism. Since Prism stores multiple versions of the same user key, the comparison logic must handle both user-defined ordering and internal metadata (sequence numbers).
+,
+```mermaid
+flowchart BT
+    UC[User Comparator] -- "1. Compare User Keys (ASC)" --> IK[InternalKeyComparator]
+    IK -- "2. Compare Sequence (DESC)" --> IK
+    IK -- "3. Compare Type (DESC)" --> IK
+    IK --> KC[MemTable KeyComparator]
+    KC -- "Decode length-prefixed keys" --> KC
 ```
-
----
+,
+**Why this matters:**
+1. **User Key (ASC)**: Primary sort by the actual key provided by the user. This ensures that the user's data is ordered correctly for range scans.
+2. **Sequence Number (DESC)**: Secondary sort. Higher sequence numbers (newer versions) come *before* lower ones. This allows `Seek(user_key)` to land directly on the most recent version.
+3. **Value Type (DESC)**: Tertiary sort to handle cases where a key might have both a value and a deletion tombstone at the same sequence (though rare in practice).
 
 ## Sequence Number Management
 
