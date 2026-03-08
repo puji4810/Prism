@@ -11,12 +11,15 @@
 
 #include "db.h"
 #include "db_impl.h"
+#include "filename.h"
 #include "version_set.h"
 #include "write_batch.h"
 
 #include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <string>
+#include <vector>
 
 using namespace prism;
 
@@ -49,6 +52,34 @@ protected:
 		if (!res.has_value())
 			return nullptr;
 		return std::move(res.value());
+	}
+
+	std::vector<std::string> ListTableFiles() const
+	{
+		std::vector<std::string> files;
+		for (const auto& entry : std::filesystem::directory_iterator(kDbName))
+		{
+			if (!entry.is_regular_file())
+			{
+				continue;
+			}
+			const std::string filename = entry.path().filename().string();
+			uint64_t number = 0;
+			FileType type;
+			if (ParseFileName(filename, &number, &type) && type == FileType::kTableFile)
+			{
+				files.push_back(entry.path().string());
+			}
+		}
+		return files;
+	}
+
+	void CreateDummyFile(const std::string& path)
+	{
+		std::ofstream out(path, std::ios::binary);
+		ASSERT_TRUE(out.is_open());
+		out << "dummy";
+		out.close();
 	}
 };
 
@@ -176,4 +207,88 @@ TEST_F(ObsoleteFilesTest, IteratorAndGetInterleaved)
 
 	int refs_final = impl->TEST_CurrentVersionRefs();
 	EXPECT_EQ(refs_final, base_refs) << "After iterator is released, ref count must be back to baseline";
+}
+
+TEST_F(ObsoleteFilesTest, PendingOutputIsNotDeleted)
+{
+	auto db = OpenDB();
+	ASSERT_NE(db, nullptr);
+
+	auto* impl = static_cast<DBImpl*>(db.get());
+	const uint64_t pending_number = 900001;
+	impl->TEST_AddPendingOutput(pending_number);
+
+	const std::string pending_file = TableFileName(kDbName, pending_number);
+	CreateDummyFile(pending_file);
+	ASSERT_TRUE(std::filesystem::exists(pending_file));
+
+	impl->TEST_RemoveObsoleteFiles();
+	EXPECT_TRUE(std::filesystem::exists(pending_file));
+}
+
+TEST_F(ObsoleteFilesTest, ObsoleteTableEvictsCacheBeforeDelete)
+{
+	Options opts;
+	opts.create_if_missing = true;
+	opts.write_buffer_size = 128;
+	auto open_res = DB::Open(opts, kDbName);
+	ASSERT_TRUE(open_res.has_value());
+	auto db = std::move(open_res.value());
+
+	for (int i = 0; i < 32; ++i)
+	{
+		ASSERT_TRUE(db->Put("flush_key_" + std::to_string(i), std::string(64, 'x')).ok());
+	}
+
+	auto tables_before = ListTableFiles();
+	ASSERT_FALSE(tables_before.empty());
+	db.reset();
+
+	const uint64_t stale_number = 900002;
+	const std::string stale_file = TableFileName(kDbName, stale_number);
+	CreateDummyFile(stale_file);
+	ASSERT_TRUE(std::filesystem::exists(stale_file));
+
+	auto reopen_res = DB::Open(opts, kDbName);
+	ASSERT_TRUE(reopen_res.has_value());
+	auto reopened = std::move(reopen_res.value());
+	auto* impl = static_cast<DBImpl*>(reopened.get());
+
+	impl->TEST_RemoveObsoleteFiles();
+	EXPECT_FALSE(std::filesystem::exists(stale_file));
+}
+
+TEST_F(ObsoleteFilesTest, RecoveryRemovesDeadLogsButKeepsLiveTables)
+{
+	Options opts;
+	opts.create_if_missing = true;
+	opts.write_buffer_size = 128;
+	auto open_res = DB::Open(opts, kDbName);
+	ASSERT_TRUE(open_res.has_value());
+	auto db = std::move(open_res.value());
+
+	for (int i = 0; i < 32; ++i)
+	{
+		ASSERT_TRUE(db->Put("keep_key_" + std::to_string(i), std::string(64, 'y')).ok());
+	}
+
+	auto live_tables = ListTableFiles();
+	ASSERT_FALSE(live_tables.empty());
+	db.reset();
+
+	const std::string stale_log = LogFileName(kDbName, 1);
+	CreateDummyFile(stale_log);
+	ASSERT_TRUE(std::filesystem::exists(stale_log));
+
+	auto reopen_res = DB::Open(opts, kDbName);
+	ASSERT_TRUE(reopen_res.has_value());
+	auto reopened = std::move(reopen_res.value());
+	auto* impl = static_cast<DBImpl*>(reopened.get());
+
+	impl->TEST_RemoveObsoleteFiles();
+	EXPECT_FALSE(std::filesystem::exists(stale_log));
+	for (const auto& table_file : live_tables)
+	{
+		EXPECT_TRUE(std::filesystem::exists(table_file));
+	}
 }

@@ -39,9 +39,9 @@ namespace prism
 		// ─────────────────────────────────────────────────────────────────────────
 		struct ReadView
 		{
-			MemTable* mem = nullptr;   // Ref()-ed on capture, Unref()-ed on release.
-			MemTable* imm = nullptr;   // May be nullptr; Ref()-ed if non-null.
-			Version*  current = nullptr; // Ref()-ed on capture.
+			MemTable* mem = nullptr; // Ref()-ed on capture, Unref()-ed on release.
+			MemTable* imm = nullptr; // May be nullptr; Ref()-ed if non-null.
+			Version* current = nullptr; // Ref()-ed on capture.
 			SequenceNumber snapshot = 0; // Visible sequence number for this read.
 		};
 
@@ -738,6 +738,63 @@ namespace prism
 		return s;
 	}
 
+	void DBImpl::RemoveObsoleteFiles()
+	{
+		std::set<uint64_t> live;
+		versions_->AddLiveFiles(&live);
+		for (uint64_t number : pending_outputs_)
+		{
+			live.insert(number);
+		}
+
+		auto children = env_->GetChildren(dbname_);
+		if (!children.has_value())
+		{
+			return;
+		}
+
+		for (const auto& filename : children.value())
+		{
+			uint64_t number = 0;
+			FileType type;
+			if (!ParseFileName(filename, &number, &type))
+			{
+				continue;
+			}
+
+			bool keep = true;
+			switch (type)
+			{
+			case FileType::kLogFile:
+				keep = (number >= versions_->LogNumber());
+				break;
+			case FileType::kDescriptorFile:
+				keep = (number >= versions_->ManifestFileNumber());
+				break;
+			case FileType::kTableFile:
+				keep = (live.count(number) > 0);
+				break;
+			case FileType::kTempFile:
+				keep = (live.count(number) > 0);
+				break;
+			case FileType::kCurrentFile:
+			case FileType::kDBLockFile:
+			case FileType::kInfoLogFile:
+				keep = true;
+				break;
+			}
+
+			if (!keep)
+			{
+				if (type == FileType::kTableFile)
+				{
+					table_cache_->Evict(number);
+				}
+				env_->RemoveFile(dbname_ + "/" + filename);
+			}
+		}
+	}
+
 	Status DBImpl::FlushMemTable()
 	{
 		if (imm_ != nullptr)
@@ -996,20 +1053,22 @@ namespace prism
 		return Write(write_options, std::move(batch));
 	}
 
-Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
+	Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
 	{
 		// Phase 1: Capture a pinned read view under the lock.
 		MemTable* mem = nullptr;
 		MemTable* imm = nullptr;
-		Version*  current = nullptr;
+		Version* current = nullptr;
 		SequenceNumber snapshot = 0;
 		{
 			std::shared_lock<std::shared_mutex> lock(mutex_);
 			snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
 			mem = mem_;
-			if (mem != nullptr) mem->Ref();
+			if (mem != nullptr)
+				mem->Ref();
 			imm = imm_;
-			if (imm != nullptr) imm->Ref();
+			if (imm != nullptr)
+				imm->Ref();
 			current = versions_->current();
 			current->Ref();
 		}
@@ -1050,15 +1109,16 @@ Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& ke
 						break;
 					}
 				}
-				if (done) break;
+				if (done)
+					break;
 			}
 		}
 
 		// Phase 3: Release all pinned resources.
 		current->Unref();
-		if (imm != nullptr) imm->Unref();
+		if (imm != nullptr)
+			imm->Unref();
 		mem->Unref();
-
 
 		if (!s.ok())
 		{

@@ -36,6 +36,9 @@ namespace prism
 		Version* TEST_CurrentVersion() const;
 		// Returns the current ref count of the current Version.
 		int TEST_CurrentVersionRefs() const;
+		void TEST_RemoveObsoleteFiles() { RemoveObsoleteFiles(); }
+		void TEST_AddPendingOutput(uint64_t number) { pending_outputs_.insert(number); }
+
 	private:
 		friend class DB;
 
@@ -45,6 +48,7 @@ namespace prism
 		Status ApplyBatch(WriteBatch& batch);
 		Status FlushMemTable();
 		Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers);
+		void RemoveObsoleteFiles();
 		Status NewLogFile();
 		Status CloseLogFile();
 

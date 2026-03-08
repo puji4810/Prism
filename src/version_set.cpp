@@ -553,6 +553,18 @@ namespace prism
 		return compact_pointer_[level];
 	}
 
+	void VersionSet::AddLiveFiles(std::set<uint64_t>* live)
+	{
+		for (int level = 0; level < kNumLevels; ++level)
+		{
+			const auto& files = current_->files(level);
+			for (const FileMetaData* file : files)
+			{
+				live->insert(file->number);
+			}
+		}
+	}
+
 	struct VersionSet::Builder::BySmallestKey
 	{
 		const InternalKeyComparator* internal_comparator;
