@@ -1,7 +1,11 @@
 #include <memory>
+#include <mutex>
+#include <string>
+#include <unistd.h>
 #include <vector>
 #include "gtest/gtest.h"
 
+#include "env.h"
 #include "options.h"
 #include "version_set.h"
 #include "version_edit.h"
@@ -276,6 +280,54 @@ namespace prism
 		EXPECT_EQ(0, icmp_.Compare(compact_pointer, InternalKey("k", 100, kTypeValue)));
 
 		base->Unref();
+	}
+TEST_F(VersionSetTest, LogAndApplyReleasesOldCurrentRefAfterSwap)
+	{
+		// Create a temporary directory for the test database
+		std::string tmp_dir = "/tmp/prism_version_set_test_" + std::to_string(::getpid());
+		prism::Env::Default()->CreateDir(tmp_dir);
+
+		Options options;
+		options.create_if_missing = true;
+		VersionSet vset(tmp_dir, &options, nullptr, &icmp_);
+
+		// Get the initial current version (it starts with refs_ == 1 from VersionSet)
+		Version* old_current = vset.current();
+		EXPECT_EQ(1, old_current->TEST_Refs());
+
+		// Hold an extra ref to the old current
+		old_current->Ref();
+		EXPECT_EQ(2, old_current->TEST_Refs());
+
+		// Create a minimal edit to trigger LogAndApply
+		VersionEdit edit;
+		edit.SetLogNumber(0);
+		edit.SetNextFile(2);
+		edit.SetLastSequence(0);
+
+		// Apply the edit with a mutex (required by LogAndApply)
+		std::mutex mu;
+		mu.lock();
+		Status s = vset.LogAndApply(&edit, &mu);
+		mu.unlock();
+		ASSERT_TRUE(s.ok()) << s.ToString();
+
+		// After LogAndApply, the old current should have exactly 1 ref (our extra ref)
+		// VersionSet::current_ now points to a new version, and AppendVersion() released
+		// VersionSet's ref on old_current
+		EXPECT_EQ(1, old_current->TEST_Refs());
+
+		// The new current should also have 1 ref (VersionSet's ownership)
+		EXPECT_EQ(1, vset.current()->TEST_Refs());
+		EXPECT_NE(old_current, vset.current());
+
+		// Release our extra ref - this should delete old_current
+		old_current->Unref();
+
+		// Cleanup: remove temporary directory files
+		prism::Env::Default()->RemoveFile(tmp_dir + "/CURRENT");
+		prism::Env::Default()->RemoveFile(tmp_dir + "/MANIFEST-000001");
+		prism::Env::Default()->RemoveDir(tmp_dir);
 	}
 
 } // namespace prism

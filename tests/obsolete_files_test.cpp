@@ -292,3 +292,91 @@ TEST_F(ObsoleteFilesTest, RecoveryRemovesDeadLogsButKeepsLiveTables)
 		EXPECT_TRUE(std::filesystem::exists(table_file));
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ObsoleteFilesTest.VersionRefsReturnToBaselineAfterVersionTurnover
+//
+// After version turnover (via compaction/flush), all version refs must
+// return to baseline. The old version should be released and refs should
+// drop back to the initial level.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(ObsoleteFilesTest, VersionRefsReturnToBaselineAfterVersionTurnover)
+{
+	auto db = OpenDB();
+	ASSERT_NE(db, nullptr);
+
+	auto* impl = static_cast<DBImpl*>(db.get());
+	int baseline = impl->TEST_CurrentVersionRefs();
+
+	// Write enough data to trigger compaction or version turnover.
+	for (int i = 0; i < 100; ++i)
+	{
+		ASSERT_TRUE(db->Put("turnover_key_" + std::to_string(i),
+		                  std::string(256, 'x')).ok());
+	}
+
+	// Give any background operations time to settle.
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+	// After version turnover, refs must return to baseline.
+	int refs_after = impl->TEST_CurrentVersionRefs();
+	EXPECT_EQ(refs_after, baseline)
+	    << "Version refs must return to baseline after version turnover";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ObsoleteFilesTest.ConcurrentGetsAfterRecoveryDoNotAccumulateVersionRefs
+//
+// After recovery and concurrent Get() calls from multiple threads,
+// version refs must not accumulate. Each Get() should not leak refs.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(ObsoleteFilesTest, ConcurrentGetsAfterRecoveryDoNotAccumulateVersionRefs)
+{
+	// Write some data and close.
+	{
+		auto db = OpenDB();
+		ASSERT_NE(db, nullptr);
+		for (int i = 0; i < 20; ++i)
+		{
+			ASSERT_TRUE(db->Put("recovery_key_" + std::to_string(i),
+			                  std::string(32, 'y')).ok());
+		}
+	}
+
+	// Reopen DB (recovery path).
+	auto db = OpenDB();
+	ASSERT_NE(db, nullptr);
+
+	auto* impl = static_cast<DBImpl*>(db.get());
+	int baseline = impl->TEST_CurrentVersionRefs();
+
+	// Run concurrent Get() operations.
+	std::vector<std::thread> threads;
+	const int num_threads = 4;
+	const int gets_per_thread = 10;
+
+	for (int t = 0; t < num_threads; ++t)
+	{
+		threads.emplace_back([&db, gets_per_thread]() {
+			for (int i = 0; i < gets_per_thread; ++i)
+			{
+				for (int k = 0; k < 20; ++k)
+				{
+					auto res = db->Get("recovery_key_" + std::to_string(k));
+					(void)res; // Suppress unused warning
+				}
+			}
+		});
+	}
+
+	// Wait for all threads to complete.
+	for (auto& thread : threads)
+	{
+		thread.join();
+	}
+
+	// Verify refs returned to baseline after concurrent Gettings completed.
+	int refs_after = impl->TEST_CurrentVersionRefs();
+	EXPECT_EQ(refs_after, baseline)
+	    << "Version refs must not accumulate after concurrent Get() calls on recovered DB";
+}

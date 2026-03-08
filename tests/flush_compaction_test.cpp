@@ -1,4 +1,5 @@
 #include "db.h"
+#include "comparator.h"
 #include "db_impl.h"
 #include "env.h"
 #include "filename.h"
@@ -92,6 +93,16 @@ namespace
 			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		}
 		return condition();
+	}
+
+	FileMetaData* MakeFileMeta(uint64_t number, uint64_t file_size, const std::string& smallest, const std::string& largest)
+	{
+		auto* file = new FileMetaData();
+		file->number = number;
+		file->file_size = file_size;
+		file->smallest = InternalKey(smallest, 100, kTypeValue);
+		file->largest = InternalKey(largest, 100, kTypeValue);
+		return file;
 	}
 }
 
@@ -228,4 +239,69 @@ TEST_F(FlushCompactionTest, LevelZeroPressureTriggersStallPolicy)
 		writer.join();
 		EXPECT_FALSE(writer_status.ok());
 	}
+}
+
+TEST_F(FlushCompactionTest, FlushInstallsLevelZeroTableViaVersionEdit)
+{
+	const std::string dbname = "test_flush_compaction";
+	std::filesystem::create_directories(dbname);
+
+	Options options;
+	InternalKeyComparator icmp(BytewiseComparator());
+	VersionSet vset(dbname, &options, nullptr, &icmp);
+
+	const int l0_before = static_cast<int>(vset.current()->files(0).size());
+	VersionEdit edit;
+	edit.AddFile(0, 7, 4096, InternalKey("a", 100, kTypeValue), InternalKey("z", 100, kTypeValue));
+
+	std::mutex mu;
+	mu.lock();
+	ASSERT_TRUE(vset.LogAndApply(&edit, &mu).ok());
+	mu.unlock();
+
+	EXPECT_GT(static_cast<int>(vset.current()->files(0).size()), l0_before);
+}
+
+TEST_F(FlushCompactionTest, PickLevelForMemTableOutputStopsAtConfiguredMaxLevel)
+{
+	Options options;
+	InternalKeyComparator icmp(BytewiseComparator());
+	VersionSet vset(&options, icmp);
+
+	Version* v = vset.NewVersion();
+	v->Ref();
+	v->AddFile(4, MakeFileMeta(101, 1024, "m", "n"));
+
+	EXPECT_EQ(v->PickLevelForMemTableOutput("a", "b"), config::kMaxMemCompactLevel);
+
+	v->Unref();
+}
+
+TEST_F(FlushCompactionTest, EmptyMemtableDoesNotAddManifestFileEntry)
+{
+	Options options;
+	options.create_if_missing = true;
+
+	auto open = DB::Open(options, "test_flush_compaction");
+	ASSERT_TRUE(open.has_value()) << open.error().ToString();
+	auto db = std::move(open.value());
+	auto* impl = static_cast<DBImpl*>(db.get());
+
+	EXPECT_FALSE(impl->TEST_HasImmutableMemTable());
+	const int l0_before = impl->TEST_NumLevelFiles(0);
+	impl->TEST_SignalBackgroundWorkFinished();
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	EXPECT_EQ(impl->TEST_NumLevelFiles(0), l0_before);
+
+	int table_files = 0;
+	for (const auto& entry : std::filesystem::directory_iterator("test_flush_compaction"))
+	{
+		uint64_t number = 0;
+		FileType type;
+		if (ParseFileName(entry.path().filename().string(), &number, &type) && type == FileType::kTableFile)
+		{
+			++table_files;
+		}
+	}
+	EXPECT_EQ(table_files, 0);
 }

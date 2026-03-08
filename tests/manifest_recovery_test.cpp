@@ -467,6 +467,78 @@ TEST_F(ManifestRecoveryTest, StaleTableFilesOutsideManifestAreIgnored)
 	EXPECT_EQ("stable_value", value.value());
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// LSAN Regression Tests – verify no memory leaks on clean shutdown paths
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Test 1: Fresh bootstrap – create DB and cleanly close
+TEST_F(ManifestRecoveryTest, FreshBootstrapOpenCloseIsLsanClean)
+{
+	auto res = OpenDB();
+	ASSERT_TRUE(res.has_value()) << "DB::Open failed: " << res.error().ToString();
+
+	// Verify basic state
+	EXPECT_TRUE(HasLockFile()) << "LOCK file missing after fresh open";
+	EXPECT_TRUE(HasLogFile()) << "WAL log file missing after fresh open";
+
+	// Close the DB – should clean up all resources without leaks
+	CloseDB();
+	// LSAN will validate no leaks on test exit
+}
+
+// Test 2: Recovery path – create DB, write data, close, reopen, close
+TEST_F(ManifestRecoveryTest, ReopenRecoveryOpenCloseIsLsanClean)
+{
+	// First open: create DB and write data
+	auto res1 = OpenDB();
+	ASSERT_TRUE(res1.has_value()) << "DB::Open failed: " << res1.error().ToString();
+	Status s = db_->Put("recovery_key", "recovery_value");
+	ASSERT_TRUE(s.ok()) << "Put failed: " << s.ToString();
+
+	// Close the DB
+	CloseDB();
+
+	// Second open: recovery path reads manifest and recreates state
+	auto res2 = OpenDB();
+	ASSERT_TRUE(res2.has_value()) << "DB::Open (recovery) failed: " << res2.error().ToString();
+
+	// Verify recovery worked
+	auto get_res = db_->Get("recovery_key");
+	ASSERT_TRUE(get_res.has_value()) << "key missing after recovery";
+	EXPECT_EQ("recovery_value", get_res.value());
+
+	// Close again – should clean up all resources without leaks
+	CloseDB();
+	// LSAN will validate no leaks on test exit
+}
+
+// Test 3: Legacy bootstrap – recover from legacy directory, close cleanly
+TEST_F(ManifestRecoveryTest, LegacyBootstrapRecoverOpenCloseIsLsanClean)
+{
+	// Plant legacy directory (no CURRENT or MANIFEST)
+	ASSERT_TRUE(PlantLegacyDirectory(db_path_));
+	ASSERT_FALSE(HasCurrentFile()) << "legacy directory should not have CURRENT yet";
+
+	// Recover using VersionSet (this triggers legacy bootstrap)
+	Options options;
+	options.env = Env::Default();
+	options.comparator = BytewiseComparator();
+
+	TableCache table_cache(db_path_, options, 16);
+	InternalKeyComparator icmp(options.comparator);
+	VersionSet version_set(db_path_, &options, &table_cache, &icmp);
+
+	bool save_manifest = false;
+	Status s = version_set.Recover(&save_manifest);
+	ASSERT_TRUE(s.ok()) << "Recover failed: " << s.ToString();
+	EXPECT_TRUE(save_manifest) << "should need to save manifest after legacy recovery";
+	EXPECT_TRUE(HasCurrentFile()) << "CURRENT file should exist after legacy recovery";
+	EXPECT_TRUE(HasManifestFile()) << "MANIFEST file should exist after legacy recovery";
+
+	// VersionSet dtor will clean up resources – LSAN verifies no leaks
+}
+
+
 int main(int argc, char** argv)
 {
 	::testing::InitGoogleTest(&argc, argv);
