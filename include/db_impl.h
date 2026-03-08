@@ -18,6 +18,7 @@ namespace prism
 {
 	class FileLock;
 	class TableCache;
+	class CompactionExecutionTest;
 
 	class DBImpl: public DB
 	{
@@ -43,9 +44,21 @@ namespace prism
 		int TEST_NumLevelFiles(int level) const;
 		void TEST_SetBackgroundError(const Status& status);
 		void TEST_SignalBackgroundWorkFinished();
+		uint64_t TEST_NewFileNumber();
+		Status TEST_AddFileToVersion(
+		    int level, uint64_t number, uint64_t file_size, const InternalKey& smallest, const InternalKey& largest);
+		Status TEST_RunPickedCompaction();
+		Status TEST_RunBackgroundCompactionOnce();
+		std::vector<FileMetaData> TEST_LevelFilesCopy(int level) const;
+		TableCache* TEST_TableCache() const { return table_cache_; }
+		Env* TEST_Env() const { return env_; }
+		const Options& TEST_Options() const { return options_; }
+		const std::string& TEST_DBName() const { return dbname_; }
+		bool TEST_PendingOutputsEmpty() const;
 
 	private:
 		friend class DB;
+		friend class CompactionExecutionTest;
 
 		class RecoveryHandler;
 
@@ -53,10 +66,14 @@ namespace prism
 		Status ApplyBatch(WriteBatch& batch);
 		Status MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lock);
 		void MaybeScheduleCompaction();
+		void RecordBackgroundError(const Status& status);
 		void BackgroundCall();
 		static void BGWork(void* db);
 		void BackgroundCompaction();
+		Status InstallCompactionResults(Compaction* compaction, const std::vector<FileMetaData>& outputs, uint64_t total_bytes);
 		void CompactMemTable();
+		Iterator* MakeInputIterator(Compaction* compaction);
+		Status DoCompactionWork(Compaction* compaction);
 		Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base);
 		Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers);
 		void RemoveObsoleteFiles();

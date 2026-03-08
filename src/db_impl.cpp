@@ -1,6 +1,7 @@
 #include "db_impl.h"
 
 #include "comparator.h"
+#include "coding.h"
 #include "db.h"
 #include "dbformat.h"
 #include "env.h"
@@ -13,6 +14,7 @@
 #include "table_cache.h"
 #include "table/merger.h"
 #include "table/table_builder.h"
+#include "table/two_level_iterator.h"
 #include "version_edit.h"
 #include "write_batch.h"
 #include "write_batch_internal.h"
@@ -175,6 +177,125 @@ namespace prism
 			default:
 				return Status::Corruption("unknown value type");
 			}
+		}
+
+		struct CompactionOutputMeta
+		{
+			uint64_t number = 0;
+			uint64_t file_size = 0;
+			InternalKey smallest;
+			InternalKey largest;
+		};
+
+		struct CompactionOutput
+		{
+			uint64_t number = 0;
+			std::string filename;
+			std::unique_ptr<WritableFile> file;
+			std::unique_ptr<TableBuilder> builder;
+			CompactionOutputMeta meta;
+
+			bool IsOpen() const { return builder != nullptr && file != nullptr; }
+		};
+
+		struct FileIteratorState
+		{
+			TableCache* table_cache;
+		};
+
+		class LevelFileNumIterator final: public Iterator
+		{
+		public:
+			LevelFileNumIterator(const InternalKeyComparator* icmp, const std::vector<FileMetaData*>& files)
+			    : icmp_(icmp)
+			    , files_(files)
+			{
+			}
+
+			bool Valid() const override { return index_ < files_.size(); }
+
+			void SeekToFirst() override { index_ = 0; }
+
+			void SeekToLast() override
+			{
+				if (files_.empty())
+				{
+					index_ = 0;
+					return;
+				}
+				index_ = files_.size() - 1;
+			}
+
+			void Seek(const Slice& target) override
+			{
+				size_t left = 0;
+				size_t right = files_.size();
+				while (left < right)
+				{
+					const size_t mid = left + ((right - left) / 2);
+					FileMetaData* file = files_[mid];
+					if (icmp_->Compare(file->largest.Encode(), target) < 0)
+					{
+						left = mid + 1;
+					}
+					else
+					{
+						right = mid;
+					}
+				}
+				index_ = right;
+			}
+
+			void Next() override
+			{
+				assert(Valid());
+				++index_;
+			}
+
+			void Prev() override
+			{
+				assert(Valid());
+				if (index_ == 0)
+				{
+					index_ = files_.size();
+					return;
+				}
+				--index_;
+			}
+
+			Slice key() const override
+			{
+				assert(Valid());
+				return files_[index_]->largest.Encode();
+			}
+
+			Slice value() const override
+			{
+				assert(Valid());
+				EncodeFixed64(value_buf_, files_[index_]->number);
+				EncodeFixed64(value_buf_ + 8, files_[index_]->file_size);
+				return Slice(value_buf_, sizeof(value_buf_));
+			}
+
+			Status status() const override { return Status::OK(); }
+
+		private:
+			const InternalKeyComparator* icmp_;
+			std::vector<FileMetaData*> files_;
+			size_t index_ = 0;
+			mutable char value_buf_[16]{};
+		};
+
+		Iterator* OpenCompactionFileIterator(void* arg, const ReadOptions& options, const Slice& value)
+		{
+			auto* state = reinterpret_cast<FileIteratorState*>(arg);
+			if (value.size() != 16)
+			{
+				return NewErrorIterator(Status::Corruption("bad file number in compaction iterator"));
+			}
+			const uint64_t file_number = DecodeFixed64(value.data());
+			const uint64_t file_size = DecodeFixed64(value.data() + 8);
+			return state->table_cache->NewIterator(options, file_number, file_size);
 		}
 
 		class DBIter: public Iterator
@@ -800,6 +921,273 @@ namespace prism
 		return s;
 	}
 
+	Iterator* DBImpl::MakeInputIterator(Compaction* compaction)
+	{
+		assert(compaction != nullptr);
+
+		ReadOptions options;
+		options.verify_checksums = options_.paranoid_checks;
+		options.fill_cache = false;
+
+		std::vector<Iterator*> list;
+		list.reserve((compaction->level() == 0 ? compaction->num_input_files(0) + 1 : 2));
+
+		auto* file_iterator_state = new FileIteratorState{ table_cache_ };
+		for (int which = 0; which < 2; ++which)
+		{
+			const int count = compaction->num_input_files(which);
+			if (count == 0)
+			{
+				continue;
+			}
+
+			if (compaction->level() + which == 0)
+			{
+				for (int index = 0; index < count; ++index)
+				{
+					FileMetaData* file = compaction->input(which, index);
+					list.push_back(table_cache_->NewIterator(options, file->number, file->file_size));
+				}
+				continue;
+			}
+
+			std::vector<FileMetaData*> files;
+			files.reserve(static_cast<size_t>(count));
+			for (int index = 0; index < count; ++index)
+			{
+				files.push_back(compaction->input(which, index));
+			}
+
+			Iterator* level_file_iter = new LevelFileNumIterator(&internal_comparator_, files);
+			list.push_back(NewTwoLevelIterator(level_file_iter, &OpenCompactionFileIterator, file_iterator_state, options));
+		}
+
+		if (list.empty())
+		{
+			delete file_iterator_state;
+			return NewEmptyIterator();
+		}
+
+		Iterator* merged = NewMergingIterator(&internal_comparator_, list.data(), static_cast<int>(list.size()));
+		merged->RegisterCleanup([](void*, void* arg) { delete reinterpret_cast<FileIteratorState*>(arg); }, nullptr, file_iterator_state);
+		return merged;
+	}
+
+	Status DBImpl::DoCompactionWork(Compaction* compaction)
+	{
+		assert(compaction != nullptr);
+
+		std::unique_ptr<Iterator> input(MakeInputIterator(compaction));
+		Status status = input->status();
+		if (!status.ok())
+		{
+			return status;
+		}
+
+		mutex_.unlock();
+
+		CompactionOutput output;
+		std::vector<FileMetaData> outputs;
+		uint64_t total_output_bytes = 0;
+
+		auto cleanup_failed_output = [&](CompactionOutput* state) {
+			if (state->builder != nullptr)
+			{
+				state->builder->Abandon();
+				state->builder.reset();
+			}
+			if (state->file != nullptr)
+			{
+				state->file->Close();
+				state->file.reset();
+			}
+			if (!state->filename.empty())
+			{
+				env_->RemoveFile(state->filename);
+			}
+			if (state->number != 0)
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				pending_outputs_.erase(state->number);
+			}
+			state->number = 0;
+			state->filename.clear();
+		};
+
+		auto open_output = [&]() -> Status {
+			assert(!output.IsOpen());
+
+			uint64_t file_number = 0;
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				file_number = versions_->NewFileNumber();
+				pending_outputs_.insert(file_number);
+			}
+
+			output.number = file_number;
+			output.filename = TableFileName(dbname_, file_number);
+			auto file_result = env_->NewWritableFile(output.filename);
+			if (!file_result.has_value())
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				pending_outputs_.erase(file_number);
+				output.number = 0;
+				output.filename.clear();
+				return file_result.error();
+			}
+
+			output.file = std::move(file_result.value());
+			output.builder = std::make_unique<TableBuilder>(options_, output.file.get());
+			output.meta = CompactionOutputMeta{};
+			output.meta.number = file_number;
+			return Status::OK();
+		};
+
+		auto finish_output = [&]() -> Status {
+			assert(output.IsOpen());
+			Status s = input->status();
+			if (s.ok())
+			{
+				s = output.builder->Finish();
+			}
+			else
+			{
+				output.builder->Abandon();
+			}
+
+			const uint64_t entries = output.builder->NumEntries();
+			output.meta.file_size = output.builder->FileSize();
+			output.builder.reset();
+
+			if (s.ok())
+			{
+				s = output.file->Sync();
+			}
+			if (s.ok())
+			{
+				s = output.file->Close();
+			}
+			output.file.reset();
+
+			if (!s.ok())
+			{
+				cleanup_failed_output(&output);
+				return s;
+			}
+
+			if (entries > 0)
+			{
+				std::unique_ptr<Iterator> check(table_cache_->NewIterator(ReadOptions(), output.meta.number, output.meta.file_size));
+				check->SeekToFirst();
+				s = check->status();
+				if (!s.ok())
+				{
+					cleanup_failed_output(&output);
+					return s;
+				}
+
+				FileMetaData file_meta;
+				file_meta.number = output.meta.number;
+				file_meta.file_size = output.meta.file_size;
+				file_meta.smallest = output.meta.smallest;
+				file_meta.largest = output.meta.largest;
+				total_output_bytes += file_meta.file_size;
+				outputs.push_back(std::move(file_meta));
+			}
+
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				pending_outputs_.erase(output.number);
+			}
+			output.number = 0;
+			output.filename.clear();
+			return Status::OK();
+		};
+
+		input->SeekToFirst();
+		while (input->Valid() && !shutting_down_.load(std::memory_order_acquire))
+		{
+			if (compaction->ShouldStopBefore(input->key()) && output.IsOpen())
+			{
+				status = finish_output();
+				if (!status.ok())
+				{
+					break;
+				}
+			}
+
+			if (!output.IsOpen())
+			{
+				status = open_output();
+				if (!status.ok())
+				{
+					break;
+				}
+			}
+
+			if (output.builder->NumEntries() == 0)
+			{
+				output.meta.smallest.DecodeFrom(input->key());
+			}
+			output.meta.largest.DecodeFrom(input->key());
+			output.builder->Add(input->key(), input->value());
+
+			if (output.builder->FileSize() >= compaction->max_output_file_size())
+			{
+				status = finish_output();
+				if (!status.ok())
+				{
+					break;
+				}
+			}
+
+			input->Next();
+		}
+
+		if (status.ok() && shutting_down_.load(std::memory_order_acquire))
+		{
+			status = Status::IOError("Deleting DB during compaction");
+		}
+		if (status.ok() && output.IsOpen())
+		{
+			status = finish_output();
+		}
+		if (status.ok())
+		{
+			status = input->status();
+		}
+
+		if (!status.ok())
+		{
+			if (output.number != 0)
+			{
+				cleanup_failed_output(&output);
+			}
+			for (const FileMetaData& out : outputs)
+			{
+				env_->RemoveFile(TableFileName(dbname_, out.number));
+			}
+			mutex_.lock();
+			return status;
+		}
+
+		status = InstallCompactionResults(compaction, outputs, total_output_bytes);
+		if (status.ok())
+		{
+			RemoveObsoleteFiles();
+		}
+
+		if (!status.ok())
+		{
+			for (const FileMetaData& out : outputs)
+			{
+				env_->RemoveFile(TableFileName(dbname_, out.number));
+			}
+		}
+
+		return status;
+	}
+
 	void DBImpl::CompactMemTable()
 	{
 		assert(imm_ != nullptr);
@@ -828,10 +1216,34 @@ namespace prism
 			imm_ = nullptr;
 			RemoveObsoleteFiles();
 		}
-		else if (bg_error_.ok())
+		else
 		{
-			bg_error_ = s;
+			RecordBackgroundError(s);
 		}
+	}
+
+	void DBImpl::RecordBackgroundError(const Status& status)
+	{
+		if (bg_error_.ok())
+		{
+			bg_error_ = status;
+			background_work_finished_signal_.notify_all();
+		}
+	}
+
+	Status DBImpl::InstallCompactionResults(Compaction* compaction, const std::vector<FileMetaData>& outputs, uint64_t total_bytes)
+	{
+		assert(compaction != nullptr);
+		Log(options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes", compaction->num_input_files(0), compaction->level(),
+		    compaction->num_input_files(1), compaction->level() + 1, static_cast<long long>(total_bytes));
+
+		VersionEdit* edit = compaction->edit();
+		compaction->AddInputDeletions(edit);
+		for (const FileMetaData& output : outputs)
+		{
+			edit->AddFile(compaction->level_out(), output.number, output.file_size, output.smallest, output.largest);
+		}
+		return versions_->LogAndApply(edit, &mutex_);
 	}
 
 	void DBImpl::BackgroundCompaction()
@@ -839,6 +1251,37 @@ namespace prism
 		if (imm_ != nullptr)
 		{
 			CompactMemTable();
+			return;
+		}
+
+		std::unique_ptr<Compaction> compaction(versions_->PickCompaction());
+		if (!compaction)
+		{
+			return;
+		}
+
+		Status s;
+		if (compaction->IsTrivialMove())
+		{
+			FileMetaData* file = compaction->input(0, 0);
+			VersionEdit* edit = compaction->edit();
+			edit->RemoveFile(compaction->level(), file->number);
+			edit->AddFile(compaction->level_out(), file->number, file->file_size, file->smallest, file->largest);
+			s = versions_->LogAndApply(edit, &mutex_);
+			if (s.ok())
+			{
+				RemoveObsoleteFiles();
+			}
+		}
+		else
+		{
+			s = DoCompactionWork(compaction.get());
+		}
+
+		compaction->ReleaseInputs();
+		if (!s.ok())
+		{
+			RecordBackgroundError(s);
 		}
 	}
 
@@ -856,7 +1299,7 @@ namespace prism
 		{
 			return;
 		}
-		if (imm_ == nullptr)
+		if (imm_ == nullptr && versions_->current()->compaction_score() < 1)
 		{
 			return;
 		}
@@ -870,6 +1313,7 @@ namespace prism
 	void DBImpl::BackgroundCall()
 	{
 		std::unique_lock<std::mutex> lock(mutex_);
+		assert(bg_compaction_scheduled_);
 		if (shutting_down_.load(std::memory_order_acquire))
 		{
 		}
@@ -882,8 +1326,8 @@ namespace prism
 		}
 
 		bg_compaction_scheduled_ = false;
-		background_work_finished_signal_.notify_all();
 		MaybeScheduleCompaction();
+		background_work_finished_signal_.notify_all();
 	}
 
 	Status DBImpl::MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lock)
@@ -1382,6 +1826,64 @@ namespace prism
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		background_work_finished_signal_.notify_all();
+	}
+
+	uint64_t DBImpl::TEST_NewFileNumber()
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		return versions_->NewFileNumber();
+	}
+
+	Status DBImpl::TEST_AddFileToVersion(
+	    int level, uint64_t number, uint64_t file_size, const InternalKey& smallest, const InternalKey& largest)
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		VersionEdit edit;
+		edit.AddFile(level, number, file_size, smallest, largest);
+		return versions_->LogAndApply(&edit, &mutex_);
+	}
+
+	Status DBImpl::TEST_RunPickedCompaction()
+	{
+		std::unique_lock<std::mutex> lock(mutex_);
+		Compaction* compaction = versions_->PickCompaction();
+		if (compaction == nullptr)
+		{
+			return Status::InvalidArgument("no compaction candidate");
+		}
+
+		Status s = DoCompactionWork(compaction);
+		compaction->ReleaseInputs();
+		delete compaction;
+		return s;
+	}
+
+	Status DBImpl::TEST_RunBackgroundCompactionOnce()
+	{
+		std::unique_lock<std::mutex> lock(mutex_);
+		BackgroundCompaction();
+		return bg_error_;
+	}
+
+	std::vector<FileMetaData> DBImpl::TEST_LevelFilesCopy(int level) const
+	{
+		std::vector<FileMetaData> files_copy;
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (level < 0 || level >= kNumLevels)
+		{
+			return files_copy;
+		}
+		for (const FileMetaData* file : versions_->current()->files(level))
+		{
+			files_copy.push_back(*file);
+		}
+		return files_copy;
+	}
+
+	bool DBImpl::TEST_PendingOutputsEmpty() const
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		return pending_outputs_.empty();
 	}
 
 	Status DestroyDB(const std::string& dbname, const Options& options)

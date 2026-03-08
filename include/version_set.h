@@ -2,6 +2,7 @@
 #define PRISM_VERSION_SET_H
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -26,29 +27,39 @@ namespace prism
 		static constexpr int kMaxMemCompactLevel = 2;
 	}
 
+	class VersionSet;
+	class Compaction;
+
 	class Version
 	{
 	public:
-		Version();
+		explicit Version(VersionSet* vset = nullptr);
 		~Version();
 
 		void Ref();
 		void Unref();
 
 		// Test-only: returns the current reference count.
-		int TEST_Refs() const { return refs_; }
+		int TEST_Refs() const { return refs_.load(std::memory_order_acquire); }
 
 		void AddFile(int level, FileMetaData* file);
 		const std::vector<FileMetaData*>& files(int level) const;
 		std::vector<FileMetaData*>& mutable_files(int level);
+
+		int PickLevelForMemTableOutput(const Slice& smallest_user_key, const Slice& largest_user_key);
 
 		double compaction_score() const { return compaction_score_; }
 		int compaction_level() const { return compaction_level_; }
 
 	private:
 		friend class VersionSet;
+		friend class Compaction;
 
-		int refs_;
+		bool OverlapInLevel(int level, const Slice* smallest_user_key, const Slice* largest_user_key);
+		void GetOverlappingInputs(int level, const InternalKey* begin, const InternalKey* end, std::vector<FileMetaData*>* inputs);
+
+		std::atomic<int> refs_;
+		VersionSet* vset_ = nullptr;
 		Version* prev_ = nullptr;
 		Version* next_ = nullptr;
 		std::vector<FileMetaData*> files_[kNumLevels];
@@ -97,6 +108,7 @@ namespace prism
 
 		Version* NewVersion() const;
 		Version* current() const { return current_; }
+		const InternalKeyComparator* Comparator() const { return icmp_; }
 
 		Status LogAndApply(VersionEdit* edit, std::mutex* mu);
 		Status Recover(bool* save_manifest);
@@ -104,6 +116,10 @@ namespace prism
 
 		void Finalize(Version* v) const;
 		double MaxBytesForLevel(int level) const;
+		Compaction* PickCompaction();
+		void SetupOtherInputs(Compaction* c);
+		static void AddBoundaryInputs(
+		    const InternalKeyComparator& icmp, const std::vector<FileMetaData*>& level_files, std::vector<FileMetaData*>* compaction_files);
 
 		uint64_t ManifestFileNumber() const { return manifest_file_number_; }
 		uint64_t NewFileNumber() { return next_file_number_++; }
@@ -154,6 +170,44 @@ namespace prism
 		uint64_t prev_log_number_;
 
 		std::string compact_pointer_[kNumLevels];
+	};
+
+	class Compaction
+	{
+	public:
+		Compaction(const Options* options, int level);
+		~Compaction();
+
+		int level() const { return level_; }
+		int level_out() const { return level_out_; }
+		uint64_t max_output_file_size() const { return max_output_file_size_; }
+
+		VersionEdit* edit() { return &edit_; }
+
+		int num_input_files(int which) const { return static_cast<int>(inputs_[which].size()); }
+		FileMetaData* input(int which, int i) const { return inputs_[which][i]; }
+
+		bool IsTrivialMove() const;
+		void AddInputDeletions(VersionEdit* edit);
+		bool IsBaseLevelForKey(const Slice& user_key);
+		bool ShouldStopBefore(const Slice& internal_key);
+		void ReleaseInputs();
+
+	private:
+		friend class VersionSet;
+
+		int level_;
+		int level_out_;
+		uint64_t max_output_file_size_;
+		uint64_t max_grandparent_overlap_bytes_;
+		Version* input_version_;
+		VersionEdit edit_;
+		std::vector<FileMetaData*> inputs_[2];
+		std::vector<FileMetaData*> grandparents_;
+		size_t grandparent_index_;
+		bool seen_key_;
+		uint64_t overlapped_bytes_;
+		size_t level_ptrs_[kNumLevels];
 	};
 
 	// ─────────────────────────────────────────────────────────────────────────────
