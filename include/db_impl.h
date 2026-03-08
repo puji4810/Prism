@@ -6,10 +6,12 @@
 #include "log_writer.h"
 #include "memtable.h"
 #include "result.h"
+#include "version_set.h"
 
+#include <condition_variable>
+#include <set>
 #include <string>
 #include <shared_mutex>
-#include <vector>
 
 namespace prism
 {
@@ -33,23 +35,16 @@ namespace prism
 		friend class DB;
 
 		class RecoveryHandler;
-		struct FileMeta
-		{
-			uint64_t number;
-			uint64_t file_size;
-			InternalKey smallest;
-			InternalKey largest;
-		};
 
 		Status Recover();
 		Status ApplyBatch(WriteBatch& batch);
 		Status FlushMemTable();
 		Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers);
-		Status RecoverTableFiles(std::vector<uint64_t>* log_numbers);
 		Status NewLogFile();
 		Status CloseLogFile();
 
 		mutable std::shared_mutex mutex_;
+		std::condition_variable_any background_work_finished_signal_;
 
 		Env* env_;
 		Options options_;
@@ -64,11 +59,16 @@ namespace prism
 
 		MemTable* mem_;
 		MemTable* imm_ = nullptr;
-		SequenceNumber sequence_ = 0;
+		// sequence_ is the next sequence number to assign to a new write.
+		// VersionSet persists last_sequence (last assigned), so:
+		//   sequence_ == versions_->LastSequence() + 1
+		SequenceNumber sequence_ = 1;
 		InternalKeyComparator internal_comparator_;
 
-		uint64_t next_file_number_ = 1;
-		std::vector<FileMeta> files_;
+		std::unique_ptr<VersionSet> versions_;
+		std::set<uint64_t> pending_outputs_;
+		Status bg_error_;
+		bool bg_compaction_scheduled_ = false;
 	};
 } // namespace prism
 

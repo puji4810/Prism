@@ -428,6 +428,45 @@ TEST_F(ManifestRecoveryTest, ReuseLogsDisabledDuringManifestRollout)
 	EXPECT_TRUE(save_manifest);
 }
 
+TEST_F(ManifestRecoveryTest, SequenceMappingSurvivesReopen)
+{
+	ASSERT_TRUE(OpenDB().has_value());
+	ASSERT_TRUE(db_->Put("off_by_one_key", "v1").ok());
+
+	CloseDB();
+	ASSERT_TRUE(OpenDB().has_value());
+	ASSERT_TRUE(db_->Delete("off_by_one_key").ok());
+	ASSERT_TRUE(db_->Put("survivor_key", "v2").ok());
+
+	CloseDB();
+	ASSERT_TRUE(OpenDB().has_value());
+
+	auto deleted = db_->Get("off_by_one_key");
+	EXPECT_TRUE(deleted.error().IsNotFound()) << deleted.error().ToString();
+
+	auto survivor = db_->Get("survivor_key");
+	ASSERT_TRUE(survivor.has_value()) << survivor.error().ToString();
+	EXPECT_EQ("v2", survivor.value());
+}
+
+TEST_F(ManifestRecoveryTest, StaleTableFilesOutsideManifestAreIgnored)
+{
+	Options options;
+	options.create_if_missing = true;
+	options.write_buffer_size = 1;
+
+	ASSERT_TRUE(OpenDB(options).has_value());
+	ASSERT_TRUE(db_->Put("stable_key", "stable_value").ok());
+	CloseDB();
+
+	ASSERT_TRUE(CreatePlaceholderFile(TableFileName(db_path_, 999)).ok());
+
+	ASSERT_TRUE(OpenDB(options).has_value());
+	auto value = db_->Get("stable_key");
+	ASSERT_TRUE(value.has_value()) << value.error().ToString();
+	EXPECT_EQ("stable_value", value.value());
+}
+
 int main(int argc, char** argv)
 {
 	::testing::InitGoogleTest(&argc, argv);

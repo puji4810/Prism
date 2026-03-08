@@ -13,6 +13,7 @@
 #include "table_cache.h"
 #include "table/merger.h"
 #include "table/table_builder.h"
+#include "version_edit.h"
 #include "write_batch.h"
 #include "write_batch_internal.h"
 
@@ -512,12 +513,15 @@ namespace prism
 	    : env_(options.env)
 	    , options_(options)
 	    , dbname_(dbname)
+	    , table_cache_(nullptr)
 	    , mem_(nullptr)
 	    , internal_comparator_(options.comparator)
+	    , versions_(nullptr)
 	{
 		options_.comparator = &internal_comparator_;
 
 		table_cache_ = new TableCache(dbname_, options_, TableCacheEntries(options_));
+		versions_ = std::make_unique<VersionSet>(dbname_, &options_, table_cache_, &internal_comparator_);
 
 		mem_ = new MemTable(internal_comparator_);
 		mem_->Ref();
@@ -561,7 +565,7 @@ namespace prism
 
 	Status DBImpl::NewLogFile()
 	{
-		const uint64_t new_log_number = next_file_number_++;
+		const uint64_t new_log_number = versions_->NewFileNumber();
 		auto result = env_->NewWritableFile(LogFileName(dbname_, new_log_number));
 		if (!result.has_value())
 		{
@@ -598,14 +602,33 @@ namespace prism
 		}
 		db_lock_ = std::move(lock.value());
 
-		std::vector<uint64_t> log_numbers;
-		s = RecoverTableFiles(&log_numbers);
-		if (!s.ok())
+		auto children_res = env_->GetChildren(dbname_);
+		if (!children_res.has_value())
 		{
-			return s;
+			return children_res.error();
 		}
 
-		const bool db_exists = !files_.empty() || !log_numbers.empty();
+		std::vector<uint64_t> log_numbers;
+		bool db_exists = false;
+		for (const auto& name : children_res.value())
+		{
+			uint64_t number = 0;
+			FileType type;
+			if (!ParseFileName(name, &number, &type))
+			{
+				continue;
+			}
+			if (type == FileType::kDBLockFile)
+			{
+				continue;
+			}
+			db_exists = true;
+			if (type == FileType::kLogFile)
+			{
+				log_numbers.push_back(number);
+			}
+		}
+
 		if (!db_exists)
 		{
 			if (!options_.create_if_missing)
@@ -618,125 +641,66 @@ namespace prism
 			return Status::InvalidArgument(dbname_, "exists (error_if_exists is true)");
 		}
 
-		bool found_sequence = false;
-		SequenceNumber max_sequence = 0;
-		for (const auto& file : files_)
+		bool save_manifest = false;
+		s = versions_->Recover(&save_manifest);
+		if (s.IsNotFound())
 		{
-			std::unique_ptr<Iterator> iter(table_cache_->NewIterator(ReadOptions(), file.number, file.file_size));
-			for (iter->SeekToFirst(); iter->Valid(); iter->Next())
+			if (!options_.create_if_missing)
 			{
-				ParsedInternalKey parsed;
-				if (!ParseInternalKey(iter->key(), &parsed))
-				{
-					return Status::Corruption("bad internal key");
-				}
-				found_sequence = true;
-				if (parsed.sequence > max_sequence)
-				{
-					max_sequence = parsed.sequence;
-				}
+				return s;
 			}
-			if (!iter->status().ok())
+			VersionEdit new_db;
+			new_db.SetComparatorName(internal_comparator_.user_comparator()->Name());
+			new_db.SetLogNumber(0);
+			new_db.SetPrevLogNumber(0);
+			std::mutex manifest_mu;
+			manifest_mu.lock();
+			s = versions_->LogAndApply(&new_db, &manifest_mu);
+			manifest_mu.unlock();
+			if (!s.ok())
 			{
-				return iter->status();
+				return s;
 			}
 		}
-		sequence_ = found_sequence ? (max_sequence + 1) : 0;
+		else if (!s.ok())
+		{
+			return s;
+		}
 
-		s = RecoverLogFiles(log_numbers);
+		sequence_ = versions_->LastSequence() + 1;
+
+		std::sort(log_numbers.begin(), log_numbers.end());
+		std::vector<uint64_t> logs_to_recover;
+		for (uint64_t number : log_numbers)
+		{
+			if (number >= versions_->LogNumber() || number == versions_->PrevLogNumber())
+			{
+				logs_to_recover.push_back(number);
+			}
+		}
+
+		s = RecoverLogFiles(logs_to_recover);
 		if (!s.ok())
 		{
 			return s;
 		}
 
+		versions_->SetLastSequence(sequence_ - 1);
+
 		if (log_ == nullptr)
 		{
 			s = NewLogFile();
+			if (s.ok())
+			{
+				VersionEdit edit;
+				edit.SetLogNumber(logfile_number_);
+				std::mutex manifest_mu;
+				manifest_mu.lock();
+				s = versions_->LogAndApply(&edit, &manifest_mu);
+				manifest_mu.unlock();
+			}
 		}
 		return s;
-	}
-
-	Status DBImpl::RecoverTableFiles(std::vector<uint64_t>* log_numbers)
-	{
-		files_.clear();
-		log_numbers->clear();
-
-		Status s;
-		auto filenames = env_->GetChildren(dbname_);
-		if (!filenames.has_value())
-		{
-			return filenames.error();
-		}
-
-		uint64_t max_number = 0;
-		for (const auto& name : filenames.value())
-		{
-			uint64_t number = 0;
-			FileType type;
-			if (!ParseFileName(name, &number, &type))
-			{
-				continue;
-			}
-
-			if (number > max_number)
-			{
-				max_number = number;
-			}
-
-			if (type == FileType::kLogFile)
-			{
-				log_numbers->push_back(number);
-				continue;
-			}
-
-			if (type != FileType::kTableFile)
-			{
-				continue;
-			}
-
-			std::string fname = TableFileName(dbname_, number);
-			auto file_size = env_->GetFileSize(fname);
-			if (!file_size.has_value())
-			{
-				fname = SSTTableFileName(dbname_, number);
-				file_size = env_->GetFileSize(fname);
-				if (!file_size.has_value())
-				{
-					continue;
-				}
-			}
-
-			std::unique_ptr<Iterator> iter(table_cache_->NewIterator(ReadOptions(), number, file_size.value()));
-			iter->SeekToFirst();
-			if (!iter->status().ok())
-			{
-				return iter->status();
-			}
-			if (!iter->Valid())
-			{
-				continue;
-			}
-
-			FileMeta meta;
-			meta.number = number;
-			meta.file_size = file_size.value();
-			meta.smallest.DecodeFrom(iter->key());
-			iter->SeekToLast();
-			if (iter->Valid())
-			{
-				meta.largest.DecodeFrom(iter->key());
-			}
-			files_.push_back(std::move(meta));
-		}
-
-		std::sort(files_.begin(), files_.end(), [](const FileMeta& a, const FileMeta& b) { return a.number < b.number; });
-		std::sort(log_numbers->begin(), log_numbers->end());
-		next_file_number_ = max_number + 1;
-		if (next_file_number_ == 0)
-		{
-			next_file_number_ = 1;
-		}
-		return Status::OK();
 	}
 
 	Status DBImpl::FlushMemTable()
@@ -750,7 +714,7 @@ namespace prism
 			return Status::InvalidArgument("log file not open");
 		}
 
-		const uint64_t new_log_number = next_file_number_++;
+		const uint64_t new_log_number = versions_->NewFileNumber();
 		Status s;
 		auto result = env_->NewWritableFile(LogFileName(dbname_, new_log_number));
 		if (!result.has_value())
@@ -771,13 +735,15 @@ namespace prism
 		mem_ = new MemTable(internal_comparator_);
 		mem_->Ref();
 
-		const uint64_t table_number = next_file_number_++;
+		const uint64_t table_number = versions_->NewFileNumber();
+		pending_outputs_.insert(table_number);
 		std::unique_ptr<Iterator> iter(imm_->NewIterator());
 
 		uint64_t file_size = 0;
 		InternalKey smallest;
 		InternalKey largest;
 		s = BuildTable(dbname_, env_, options_, table_cache_, table_number, iter.get(), &file_size, &smallest, &largest);
+		pending_outputs_.erase(table_number);
 		if (!s.ok())
 		{
 			log_.reset();
@@ -801,14 +767,21 @@ namespace prism
 			return s;
 		}
 
+		VersionEdit edit;
+		edit.SetLogNumber(new_log_number);
 		if (file_size > 0)
 		{
-			FileMeta meta;
-			meta.number = table_number;
-			meta.file_size = file_size;
-			meta.smallest = smallest;
-			meta.largest = largest;
-			files_.push_back(std::move(meta));
+			edit.AddFile(0, table_number, file_size, smallest, largest);
+		}
+		versions_->SetLastSequence(sequence_ - 1);
+		std::mutex manifest_mu;
+		manifest_mu.lock();
+		s = versions_->LogAndApply(&edit, &manifest_mu);
+		manifest_mu.unlock();
+		if (!s.ok())
+		{
+			bg_error_ = s;
+			return s;
 		}
 
 		imm_->Unref();
@@ -846,7 +819,6 @@ namespace prism
 		for (size_t i = 0; i < log_numbers.size(); ++i)
 		{
 			const uint64_t log_number = log_numbers[i];
-			const bool last_log = (i + 1 == log_numbers.size());
 
 			const std::string fname = LogFileName(dbname_, log_number);
 			// SequentialFile* file = nullptr;
@@ -867,7 +839,6 @@ namespace prism
 
 			std::string scratch;
 			Slice record;
-			int compactions = 0;
 			while (reader.ReadRecord(&record, &scratch) && read_status.ok())
 			{
 				if (record.size() < kHeader)
@@ -897,23 +868,24 @@ namespace prism
 
 				if (mem_->ApproximateMemoryUsage() > options_.write_buffer_size)
 				{
-					++compactions;
-
-					const uint64_t table_number = next_file_number_++;
+					const uint64_t table_number = versions_->NewFileNumber();
+					pending_outputs_.insert(table_number);
 					std::unique_ptr<Iterator> iter(mem_->NewIterator());
 
 					uint64_t file_size = 0;
 					InternalKey smallest;
 					InternalKey largest;
 					s = BuildTable(dbname_, env_, options_, table_cache_, table_number, iter.get(), &file_size, &smallest, &largest);
+					pending_outputs_.erase(table_number);
 					if (s.ok() && file_size > 0)
 					{
-						FileMeta meta;
-						meta.number = table_number;
-						meta.file_size = file_size;
-						meta.smallest = smallest;
-						meta.largest = largest;
-						files_.push_back(std::move(meta));
+						VersionEdit edit;
+						edit.AddFile(0, table_number, file_size, smallest, largest);
+						versions_->SetLastSequence(sequence_ - 1);
+						std::mutex manifest_mu;
+						manifest_mu.lock();
+						s = versions_->LogAndApply(&edit, &manifest_mu);
+						manifest_mu.unlock();
 					}
 					mem_->Unref();
 					mem_ = new MemTable(internal_comparator_);
@@ -938,37 +910,27 @@ namespace prism
 				return reader.status();
 			}
 
-			// Try to reuse the last log file to avoid creating a new one on open.
-			if (options_.reuse_logs && last_log && compactions == 0)
-			{
-				uint64_t file_size = 0;
-				auto logfile_result = env_->NewAppendableFile(fname);
-				if (!logfile_result)
-				{
-					// ignore and fall through
-				}
-				else if (auto file_size = env_->GetFileSize(fname); file_size.has_value())
-				{
-					logfile_ = logfile_result.value().release();
-					logfile_number_ = log_number;
-					log_ = std::make_unique<log::Writer>(logfile_, file_size.value());
-					return Status::OK();
-				}
-			}
-
 			// Flush any remaining recovered entries into an sstable and delete this log file.
 			if (mem_->ApproximateMemoryUsage() > 0)
 			{
-				const uint64_t table_number = next_file_number_++;
+				const uint64_t table_number = versions_->NewFileNumber();
+				pending_outputs_.insert(table_number);
 				std::unique_ptr<Iterator> iter(mem_->NewIterator());
 
 				uint64_t file_size = 0;
 				InternalKey smallest;
 				InternalKey largest;
 				s = BuildTable(dbname_, env_, options_, table_cache_, table_number, iter.get(), &file_size, &smallest, &largest);
+				pending_outputs_.erase(table_number);
 				if (s.ok() && file_size > 0)
 				{
-					files_.emplace_back(FileMeta{ table_number, file_size, smallest, largest });
+					VersionEdit edit;
+					edit.AddFile(0, table_number, file_size, smallest, largest);
+					versions_->SetLastSequence(sequence_ - 1);
+					std::mutex manifest_mu;
+					manifest_mu.lock();
+					s = versions_->LogAndApply(&edit, &manifest_mu);
+					manifest_mu.unlock();
 				}
 				mem_->Unref();
 				mem_ = new MemTable(internal_comparator_);
@@ -1028,16 +990,21 @@ namespace prism
 		Slice internal_key = ikey.Encode();
 
 		TableGetState state{ internal_comparator_.user_comparator(), key, &value };
-		for (auto it = files_.rbegin(); it != files_.rend(); ++it)
+		Version* current = versions_->current();
+		for (int level = 0; level < kNumLevels; ++level)
 		{
-			s = table_cache_->Get(read_options, it->number, it->file_size, internal_key, &state, &SaveValue);
-			if (!s.ok())
+			const auto& files = current->files(level);
+			for (const FileMetaData* file : files)
 			{
-				return std::unexpected(s);
-			}
-			if (state.value_found)
-			{
-				return value;
+				s = table_cache_->Get(read_options, file->number, file->file_size, internal_key, &state, &SaveValue);
+				if (!s.ok())
+				{
+					return std::unexpected(s);
+				}
+				if (state.value_found)
+				{
+					return value;
+				}
 			}
 		}
 		return std::unexpected(Status::NotFound(Slice()));
@@ -1046,6 +1013,10 @@ namespace prism
 	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch batch)
 	{
 		std::unique_lock<std::shared_mutex> lock(mutex_);
+		if (!bg_error_.ok())
+		{
+			return bg_error_;
+		}
 
 		// TODO : Group commit
 		std::size_t count = WriteBatchInternal::Count(&batch);
@@ -1060,6 +1031,7 @@ namespace prism
 
 		WriteBatchInternal::SetSequence(&batch, sequence_);
 		sequence_ += count;
+		versions_->SetLastSequence(sequence_ - 1);
 
 		Slice record = WriteBatchInternal::Contents(&batch);
 		Status s = log_->AddRecord(record);
@@ -1103,12 +1075,17 @@ namespace prism
 
 			MemTable* mem = nullptr;
 			MemTable* imm = nullptr;
+			Version* current = nullptr;
 			std::vector<TableFileRef> files;
 			SequenceNumber snapshot = 0;
 		};
 
 		auto release_sv = [](void*, void* arg) {
 			auto* sv = reinterpret_cast<SuperVersionLite*>(arg);
+			if (sv->current != nullptr)
+			{
+				sv->current->Unref();
+			}
 			if (sv->imm != nullptr)
 			{
 				sv->imm->Unref();
@@ -1129,7 +1106,7 @@ namespace prism
 		{
 			std::shared_lock<std::shared_mutex> lock(mutex_);
 			sv = new SuperVersionLite;
-			sv->snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
+			sv->snapshot = sequence_ - 1;
 
 			sv->mem = mem_;
 			if (sv->mem != nullptr)
@@ -1143,10 +1120,16 @@ namespace prism
 				sv->imm->Ref();
 			}
 
-			sv->files.reserve(files_.size());
-			for (const auto& file : files_)
+			sv->current = versions_->current();
+			sv->current->Ref();
+
+			for (int level = 0; level < kNumLevels; ++level)
 			{
-				sv->files.push_back(SuperVersionLite::TableFileRef{ file.number, file.file_size });
+				const auto& level_files = sv->current->files(level);
+				for (const FileMetaData* file : level_files)
+				{
+					sv->files.push_back(SuperVersionLite::TableFileRef{ file->number, file->file_size });
+				}
 			}
 		}
 
