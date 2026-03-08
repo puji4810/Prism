@@ -2,13 +2,91 @@
 #define PRISM_VERSION_SET_H
 
 #include <cstdint>
+#include <string>
+#include <set>
 #include <vector>
 
 #include "dbformat.h"
+#include "options.h"
 #include "version_edit.h"
 
 namespace prism
 {
+	namespace config
+	{
+		static constexpr int kL0_CompactionTrigger = 4;
+		static constexpr int kL0_SlowdownWritesTrigger = 8;
+		static constexpr int kL0_StopWritesTrigger = 12;
+		static constexpr int kMaxMemCompactLevel = 2;
+	}
+
+	class Version
+	{
+	public:
+		Version();
+		~Version();
+
+		void Ref();
+		void Unref();
+
+		void AddFile(int level, FileMetaData* file);
+		const std::vector<FileMetaData*>& files(int level) const;
+		std::vector<FileMetaData*>& mutable_files(int level);
+
+		double compaction_score() const { return compaction_score_; }
+		int compaction_level() const { return compaction_level_; }
+
+	private:
+		friend class VersionSet;
+
+		int refs_;
+		std::vector<FileMetaData*> files_[kNumLevels];
+		double compaction_score_;
+		int compaction_level_;
+	};
+
+	class VersionSet
+	{
+	public:
+		explicit VersionSet(const Options* options, const InternalKeyComparator& icmp);
+
+		class Builder
+		{
+		public:
+			Builder(VersionSet* vset, Version* base);
+			~Builder();
+
+			void Apply(const VersionEdit* edit);
+			void SaveTo(Version* v);
+
+		private:
+			struct BySmallestKey;
+			using FileSet = std::set<FileMetaData*, BySmallestKey>;
+
+			struct LevelState
+			{
+				std::set<uint64_t> deleted_files;
+				FileSet* added_files;
+			};
+
+			void MaybeAddFile(Version* v, int level, FileMetaData* f);
+
+			VersionSet* vset_;
+			Version* base_;
+			LevelState levels_[kNumLevels];
+		};
+
+		Version* NewVersion() const;
+		void Finalize(Version* v) const;
+		double MaxBytesForLevel(int level) const;
+
+		const std::string& compact_pointer(int level) const;
+
+	private:
+		const Options* options_;
+		InternalKeyComparator icmp_;
+		std::string compact_pointer_[kNumLevels];
+	};
 
 	// ─────────────────────────────────────────────────────────────────────────────
 	// File-range helpers

@@ -1,7 +1,8 @@
-#include <vector>
 #include <memory>
+#include <vector>
 #include "gtest/gtest.h"
 
+#include "options.h"
 #include "version_set.h"
 #include "version_edit.h"
 #include "dbformat.h"
@@ -35,6 +36,17 @@ namespace prism
 			f->smallest = InternalKey(smallest_user_key, smallest_seq, kTypeValue);
 			f->largest = InternalKey(largest_user_key, largest_seq, kTypeValue);
 			files_.push_back(f);
+			return f;
+		}
+
+		FileMetaData* NewVersionFile(
+		    uint64_t number, uint64_t file_size, const std::string& smallest_user_key, const std::string& largest_user_key)
+		{
+			FileMetaData* f = new FileMetaData;
+			f->number = number;
+			f->file_size = file_size;
+			f->smallest = InternalKey(smallest_user_key, 100, kTypeValue);
+			f->largest = InternalKey(largest_user_key, 100, kTypeValue);
 			return f;
 		}
 
@@ -187,6 +199,83 @@ namespace prism
 		// This should trigger an assert in CheckLevelInvariant due to >= comparison
 		// We use EXPECT_DEATH to verify the assertion happens
 		EXPECT_DEATH({ CheckLevelInvariant(icmp_, files_); }, "");
+	}
+
+	TEST_F(VersionSetTest, FinalizeUsesFileCountForLevelZero)
+	{
+		Options options;
+		VersionSet vset(&options, icmp_);
+		std::unique_ptr<Version> v(vset.NewVersion());
+
+		v->AddFile(0, NewVersionFile(1, 64 * 1024, "a", "b"));
+		v->AddFile(0, NewVersionFile(2, 64 * 1024, "c", "d"));
+		v->AddFile(0, NewVersionFile(3, 64 * 1024, "e", "f"));
+		v->AddFile(0, NewVersionFile(4, 64 * 1024, "g", "h"));
+		v->AddFile(0, NewVersionFile(5, 64 * 1024, "i", "j"));
+
+		vset.Finalize(v.get());
+
+		EXPECT_EQ(0, v->compaction_level());
+		EXPECT_DOUBLE_EQ(1.25, v->compaction_score());
+	}
+
+	TEST_F(VersionSetTest, FinalizeUsesByteBudgetForLevelOnePlus)
+	{
+		Options options;
+		VersionSet vset(&options, icmp_);
+		std::unique_ptr<Version> v(vset.NewVersion());
+
+		v->AddFile(1, NewVersionFile(100, 15ull * 1024 * 1024, "a", "z"));
+
+		vset.Finalize(v.get());
+
+		EXPECT_EQ(1, v->compaction_level());
+		EXPECT_DOUBLE_EQ(1.5, v->compaction_score());
+	}
+
+	TEST_F(VersionSetTest, BuilderAppliesAddDeleteAndCompactPointer)
+	{
+		Options options;
+		VersionSet vset(&options, icmp_);
+		Version* base = vset.NewVersion();
+		base->Ref();
+
+		base->AddFile(0, NewVersionFile(10, 64 * 1024, "a", "b"));
+		base->AddFile(0, NewVersionFile(20, 64 * 1024, "c", "d"));
+
+		base->AddFile(1, NewVersionFile(100, 64 * 1024, "a", "b"));
+		base->AddFile(1, NewVersionFile(200, 64 * 1024, "m", "z"));
+
+		VersionEdit edit;
+		edit.RemoveFile(0, 20);
+		edit.RemoveFile(1, 100);
+		edit.AddFile(0, 30, 64 * 1024, InternalKey("e", 100, kTypeValue), InternalKey("f", 100, kTypeValue));
+		edit.AddFile(1, 150, 4ull * 1024 * 1024, InternalKey("c", 100, kTypeValue), InternalKey("l", 100, kTypeValue));
+		edit.SetCompactPointer(1, InternalKey("k", 100, kTypeValue));
+
+		std::unique_ptr<Version> out(vset.NewVersion());
+		{
+			VersionSet::Builder builder(&vset, base);
+			builder.Apply(&edit);
+			builder.SaveTo(out.get());
+		}
+
+		ASSERT_EQ(2u, out->files(0).size());
+		EXPECT_EQ(30u, out->files(0)[0]->number);
+		EXPECT_EQ(10u, out->files(0)[1]->number);
+
+		ASSERT_EQ(2u, out->files(1).size());
+		EXPECT_EQ(150u, out->files(1)[0]->number);
+		EXPECT_EQ(200u, out->files(1)[1]->number);
+
+		EXPECT_EQ(256, out->files(1)[0]->allowed_seeks);
+		EXPECT_EQ(100, out->files(0)[0]->allowed_seeks);
+
+		InternalKey compact_pointer;
+		ASSERT_TRUE(compact_pointer.DecodeFrom(vset.compact_pointer(1)));
+		EXPECT_EQ(0, icmp_.Compare(compact_pointer, InternalKey("k", 100, kTypeValue)));
+
+		base->Unref();
 	}
 
 } // namespace prism
