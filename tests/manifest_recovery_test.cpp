@@ -16,7 +16,7 @@
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <algorithm>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -150,6 +150,35 @@ static bool PlantLegacyDirectory(const std::string& db_path)
 	return legacy_table.value()->Close().ok();
 }
 
+// Helper to plant a legacy directory where log number > table number
+// This tests the edge case that could trigger the LogAndApply assertion
+static bool PlantLegacyDirectoryWithHighLogNumber(const std::string& db_path)
+{
+	Env* env = Env::Default();
+	env->CreateDir(db_path);
+
+	// Create a table file with number 10
+	auto legacy_table = env->NewWritableFile(TableFileName(db_path, 10));
+	if (!legacy_table.has_value())
+		return false;
+	Status table_status = legacy_table.value()->Append(Slice("legacy_table_placeholder"));
+	if (!table_status.ok())
+		return false;
+	if (!legacy_table.value()->Close().ok())
+		return false;
+
+	// Create a log file with number 100 (higher than table number 10)
+	std::string log_name = LogFileName(db_path, 100);
+	auto res = env->NewWritableFile(log_name);
+	if (!res.has_value())
+		return false;
+	auto& wf = res.value();
+	Status s = wf->Append(Slice("placeholder_log"));
+	if (!s.ok())
+		return false;
+	return wf->Close().ok();
+}
+
 static Status CreatePlaceholderFile(const std::string& fname)
 {
 	auto writable = Env::Default()->NewWritableFile(fname);
@@ -167,7 +196,7 @@ static Status CreatePlaceholderFile(const std::string& fname)
 
 static Status ApplyEdit(VersionSet* version_set, VersionEdit* edit)
 {
-	std::mutex mu;
+	std::shared_mutex mu;
 	mu.lock();
 	Status s = version_set->LogAndApply(edit, &mu);
 	mu.unlock();
@@ -287,7 +316,7 @@ TEST_F(ManifestRecoveryTest, WriteSnapshotContainsAllLiveFiles)
 	install_edit.AddFile(0, 100, 4 * 1024, InternalKey("a", 100, kTypeValue), InternalKey("b", 100, kTypeValue));
 	install_edit.AddFile(1, 200, 8 * 1024, InternalKey("c", 100, kTypeValue), InternalKey("d", 100, kTypeValue));
 
-	std::mutex mu;
+	std::shared_mutex mu;
 	mu.lock();
 	Status s = version_set.LogAndApply(&install_edit, &mu);
 	mu.unlock();
@@ -358,6 +387,43 @@ TEST_F(ManifestRecoveryTest, LegacyDirectoryBootstrap)
 	const std::vector<uint64_t> reopened_l0 = CollectFileNumbers(reopen.current(), 0);
 	EXPECT_EQ(l0_files, reopened_l0);
 	EXPECT_TRUE(reopen.NextFileNumber() > 999u);
+}
+
+// Test: Legacy bootstrap where WAL file number (100) exceeds table file number (10).
+// Verifies that VersionSet::Recover() correctly tracks the highest log number
+// and advances NextFileNumber() past both the table and log high-water marks.
+// This tests the invariant: edit->GetLogNumber() < next_file_number_
+TEST_F(ManifestRecoveryTest, LegacyBootstrapTracksHighestLogNumber)
+{
+	ASSERT_TRUE(PlantLegacyDirectoryWithHighLogNumber(db_path_));
+	ASSERT_FALSE(HasCurrentFile());
+
+	Options options;
+	options.env = Env::Default();
+	options.comparator = BytewiseComparator();
+
+	TableCache table_cache(db_path_, options, 16);
+	InternalKeyComparator icmp(options.comparator);
+	VersionSet version_set(db_path_, &options, &table_cache, &icmp);
+
+	bool save_manifest = false;
+	Status s = version_set.Recover(&save_manifest);
+	ASSERT_TRUE(s.ok()) << "Recover failed: " << s.ToString();
+	EXPECT_TRUE(save_manifest);
+	EXPECT_TRUE(HasCurrentFile());
+	EXPECT_TRUE(HasManifestFile());
+
+	// Verify the table file was recovered
+	const std::vector<uint64_t> l0_files = CollectFileNumbers(version_set.current(), 0);
+	ASSERT_EQ(1u, l0_files.size());
+	EXPECT_EQ(10u, l0_files[0]);
+
+	// CRITICAL: NextFileNumber() must be > 100 (the log number), not just > 10 (the table number)
+	// This ensures the invariant edit->GetLogNumber() < next_file_number_ holds
+	EXPECT_GT(version_set.NextFileNumber(), 100u) << "NextFileNumber must exceed highest log file number";
+
+	// Verify the log number is correctly tracked
+	EXPECT_EQ(100u, version_set.LogNumber());
 }
 
 TEST_F(ManifestRecoveryTest, RecoverUsesManifestAsSourceOfTruth)
@@ -537,7 +603,6 @@ TEST_F(ManifestRecoveryTest, LegacyBootstrapRecoverOpenCloseIsLsanClean)
 
 	// VersionSet dtor will clean up resources – LSAN verifies no leaks
 }
-
 
 int main(int argc, char** argv)
 {
