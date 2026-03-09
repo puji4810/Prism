@@ -11,6 +11,7 @@
 #include <functional>
 #include <gtest/gtest.h>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 
@@ -254,7 +255,7 @@ TEST_F(FlushCompactionTest, FlushInstallsLevelZeroTableViaVersionEdit)
 	VersionEdit edit;
 	edit.AddFile(0, 7, 4096, InternalKey("a", 100, kTypeValue), InternalKey("z", 100, kTypeValue));
 
-	std::mutex mu;
+	std::shared_mutex mu;
 	mu.lock();
 	ASSERT_TRUE(vset.LogAndApply(&edit, &mu).ok());
 	mu.unlock();

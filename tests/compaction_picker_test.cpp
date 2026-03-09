@@ -1,7 +1,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -58,7 +58,7 @@ namespace prism
 				edit.AddFile(level, file->number, file->file_size, file->smallest, file->largest);
 			}
 
-			std::mutex mu;
+			std::shared_mutex mu;
 			mu.lock();
 			ASSERT_TRUE(vset->LogAndApply(&edit, &mu).ok());
 			mu.unlock();

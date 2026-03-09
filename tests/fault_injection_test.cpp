@@ -17,7 +17,7 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <filesystem>
 
@@ -358,7 +358,7 @@ TEST_F(FaultInjectionTest, CrashAfterManifestSyncBeforeCurrent)
 	VersionEdit edit;
 	edit.AddFile(0, 101, 4096, InternalKey("a", 100, kTypeValue), InternalKey("z", 100, kTypeValue));
 
-	std::mutex mu;
+	std::shared_mutex mu;
 	mu.lock();
 	env_->SetFailRename(true);
 	Status s = version_set.LogAndApply(&edit, &mu);

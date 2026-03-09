@@ -1,5 +1,5 @@
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -281,7 +281,7 @@ namespace prism
 
 		base->Unref();
 	}
-TEST_F(VersionSetTest, LogAndApplyReleasesOldCurrentRefAfterSwap)
+	TEST_F(VersionSetTest, LogAndApplyReleasesOldCurrentRefAfterSwap)
 	{
 		// Create a temporary directory for the test database
 		std::string tmp_dir = "/tmp/prism_version_set_test_" + std::to_string(::getpid());
@@ -306,7 +306,7 @@ TEST_F(VersionSetTest, LogAndApplyReleasesOldCurrentRefAfterSwap)
 		edit.SetLastSequence(0);
 
 		// Apply the edit with a mutex (required by LogAndApply)
-		std::mutex mu;
+		std::shared_mutex mu;
 		mu.lock();
 		Status s = vset.LogAndApply(&edit, &mu);
 		mu.unlock();
@@ -327,6 +327,57 @@ TEST_F(VersionSetTest, LogAndApplyReleasesOldCurrentRefAfterSwap)
 		// Cleanup: remove temporary directory files
 		prism::Env::Default()->RemoveFile(tmp_dir + "/CURRENT");
 		prism::Env::Default()->RemoveFile(tmp_dir + "/MANIFEST-000001");
+		prism::Env::Default()->RemoveDir(tmp_dir);
+	}
+
+	// Test: Verify that LogAndApply invariant (log_number < next_file_number) is maintained
+	// when applying edits that set log numbers
+	TEST_F(VersionSetTest, BootstrapLogNumberStaysBelowNextFileNumber)
+	{
+		// Create a temporary directory for the test database
+		std::string tmp_dir = "/tmp/prism_version_set_lognum_test_" + std::to_string(::getpid());
+		prism::Env::Default()->CreateDir(tmp_dir);
+
+		Options options;
+		options.create_if_missing = true;
+		VersionSet vset(tmp_dir, &options, nullptr, &icmp_);
+
+		// Simulate the bootstrap scenario: advance next_file_number, then apply an edit
+		// that sets a log number close to but below next_file_number
+
+		// First, get the initial state
+		uint64_t initial_next = vset.NextFileNumber();
+
+		// Create an edit that sets log_number to be just below next_file_number
+		// This should succeed because log_number < next_file_number
+		VersionEdit edit1;
+		edit1.SetLogNumber(initial_next - 1); // Must be < next_file_number
+		edit1.SetNextFile(initial_next);
+		edit1.SetLastSequence(0);
+
+		std::shared_mutex mu;
+		mu.lock();
+		Status s = vset.LogAndApply(&edit1, &mu);
+		mu.unlock();
+		ASSERT_TRUE(s.ok()) << "LogAndApply with valid log_number should succeed: " << s.ToString();
+
+		// Verify the log number was recorded
+		EXPECT_EQ(initial_next - 1, vset.LogNumber());
+
+		// Cleanup
+		prism::Env::Default()->RemoveFile(tmp_dir + "/CURRENT");
+		// Remove the manifest file (number may vary)
+		auto children = prism::Env::Default()->GetChildren(tmp_dir);
+		if (children.has_value())
+		{
+			for (const auto& name : children.value())
+			{
+				if (name.find("MANIFEST") != std::string::npos)
+				{
+					prism::Env::Default()->RemoveFile(tmp_dir + "/" + name);
+				}
+			}
+		}
 		prism::Env::Default()->RemoveDir(tmp_dir);
 	}
 
