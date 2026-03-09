@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <shared_mutex>
 
 #include "env.h"
 #include "filename.h"
@@ -266,7 +267,7 @@ namespace prism
 		}
 	}
 
-	Status VersionSet::LogAndApply(VersionEdit* edit, std::mutex* mu)
+	Status VersionSet::LogAndApply(VersionEdit* edit, std::shared_mutex* mu)
 	{
 		assert(edit != nullptr);
 		assert(mu != nullptr);
@@ -446,9 +447,10 @@ namespace prism
 			}
 
 			MarkFileNumberUsed(max_file_number);
+			MarkFileNumberUsed(max_log_number);
 			bootstrap_edit.SetLogNumber(max_log_number);
 
-			std::mutex mu;
+			std::shared_mutex mu;
 			mu.lock();
 			s = LogAndApply(&bootstrap_edit, &mu);
 			mu.unlock();

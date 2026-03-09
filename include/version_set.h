@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <atomic>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -110,7 +110,7 @@ namespace prism
 		Version* current() const { return current_; }
 		const InternalKeyComparator* Comparator() const { return icmp_; }
 
-		Status LogAndApply(VersionEdit* edit, std::mutex* mu);
+		Status LogAndApply(VersionEdit* edit, std::shared_mutex* mu);
 		Status Recover(bool* save_manifest);
 		Status WriteSnapshot(log::Writer* log);
 
