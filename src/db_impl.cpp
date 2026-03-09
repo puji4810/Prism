@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 
 namespace prism
 {
@@ -662,7 +663,7 @@ namespace prism
 	DBImpl::~DBImpl()
 	{
 		{
-			std::unique_lock<std::mutex> lock(mutex_);
+			std::unique_lock<std::shared_mutex> lock(mutex_);
 			shutting_down_.store(true, std::memory_order_release);
 			while (bg_compaction_scheduled_)
 			{
@@ -794,7 +795,7 @@ namespace prism
 			new_db.SetComparatorName(internal_comparator_.user_comparator()->Name());
 			new_db.SetLogNumber(0);
 			new_db.SetPrevLogNumber(0);
-			std::unique_lock<std::mutex> lock(mutex_);
+			std::unique_lock<std::shared_mutex> lock(mutex_);
 			s = versions_->LogAndApply(&new_db, &mutex_);
 			if (!s.ok())
 			{
@@ -833,7 +834,7 @@ namespace prism
 			{
 				VersionEdit edit;
 				edit.SetLogNumber(logfile_number_);
-				std::unique_lock<std::mutex> lock(mutex_);
+				std::unique_lock<std::shared_mutex> lock(mutex_);
 				s = versions_->LogAndApply(&edit, &mutex_);
 			}
 		}
@@ -1007,7 +1008,7 @@ namespace prism
 			}
 			if (state->number != 0)
 			{
-				std::lock_guard<std::mutex> lock(mutex_);
+				std::lock_guard<std::shared_mutex> lock(mutex_);
 				pending_outputs_.erase(state->number);
 			}
 			state->number = 0;
@@ -1019,7 +1020,7 @@ namespace prism
 
 			uint64_t file_number = 0;
 			{
-				std::lock_guard<std::mutex> lock(mutex_);
+				std::lock_guard<std::shared_mutex> lock(mutex_);
 				file_number = versions_->NewFileNumber();
 				pending_outputs_.insert(file_number);
 			}
@@ -1029,7 +1030,7 @@ namespace prism
 			auto file_result = env_->NewWritableFile(output.filename);
 			if (!file_result.has_value())
 			{
-				std::lock_guard<std::mutex> lock(mutex_);
+				std::lock_guard<std::shared_mutex> lock(mutex_);
 				pending_outputs_.erase(file_number);
 				output.number = 0;
 				output.filename.clear();
@@ -1096,7 +1097,7 @@ namespace prism
 			}
 
 			{
-				std::lock_guard<std::mutex> lock(mutex_);
+				std::lock_guard<std::shared_mutex> lock(mutex_);
 				pending_outputs_.erase(output.number);
 			}
 			output.number = 0;
@@ -1167,11 +1168,12 @@ namespace prism
 			{
 				env_->RemoveFile(TableFileName(dbname_, out.number));
 			}
-			mutex_.lock();
-			return status;
-		}
+		mutex_.lock();
+		return status;
+	}
 
-		status = InstallCompactionResults(compaction, outputs, total_output_bytes);
+	mutex_.lock();
+	status = InstallCompactionResults(compaction, outputs, total_output_bytes);
 		if (status.ok())
 		{
 			RemoveObsoleteFiles();
@@ -1312,7 +1314,7 @@ namespace prism
 
 	void DBImpl::BackgroundCall()
 	{
-		std::unique_lock<std::mutex> lock(mutex_);
+		std::unique_lock<std::shared_mutex> lock(mutex_);
 		assert(bg_compaction_scheduled_);
 		if (shutting_down_.load(std::memory_order_acquire))
 		{
@@ -1330,7 +1332,7 @@ namespace prism
 		background_work_finished_signal_.notify_all();
 	}
 
-	Status DBImpl::MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lock)
+	Status DBImpl::MakeRoomForWrite(bool force, std::unique_lock<std::shared_mutex>& lock)
 	{
 		Status s;
 		bool allow_delay = !force;
@@ -1489,7 +1491,7 @@ namespace prism
 						VersionEdit edit;
 						edit.AddFile(0, table_number, file_size, smallest, largest);
 						versions_->SetLastSequence(sequence_ - 1);
-						std::unique_lock<std::mutex> lock(mutex_);
+						std::unique_lock<std::shared_mutex> lock(mutex_);
 						s = versions_->LogAndApply(&edit, &mutex_);
 					}
 					mem_->Unref();
@@ -1532,7 +1534,7 @@ namespace prism
 					VersionEdit edit;
 					edit.AddFile(0, table_number, file_size, smallest, largest);
 					versions_->SetLastSequence(sequence_ - 1);
-					std::unique_lock<std::mutex> lock(mutex_);
+					std::unique_lock<std::shared_mutex> lock(mutex_);
 					s = versions_->LogAndApply(&edit, &mutex_);
 				}
 				mem_->Unref();
@@ -1572,7 +1574,7 @@ namespace prism
 		Version* current = nullptr;
 		SequenceNumber snapshot = 0;
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::shared_lock<std::shared_mutex> lock(mutex_);
 			snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
 			mem = mem_;
 			if (mem != nullptr)
@@ -1644,7 +1646,7 @@ namespace prism
 
 	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch batch)
 	{
-		std::unique_lock<std::mutex> lock(mutex_);
+		std::unique_lock<std::shared_mutex> lock(mutex_);
 
 		std::size_t count = WriteBatchInternal::Count(&batch);
 		if (!count)
@@ -1732,7 +1734,7 @@ namespace prism
 
 		SuperVersionLite* sv = nullptr;
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::shared_lock<std::shared_mutex> lock(mutex_);
 			sv = new SuperVersionLite;
 			sv->snapshot = sequence_ - 1;
 
@@ -1782,33 +1784,33 @@ namespace prism
 
 	const Snapshot* DBImpl::GetSnapshot()
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		return nullptr;
 	}
 
-	void DBImpl::ReleaseSnapshot(const Snapshot* /*snapshot*/) { std::lock_guard<std::mutex> lock(mutex_); }
+	void DBImpl::ReleaseSnapshot(const Snapshot* /*snapshot*/) { std::lock_guard<std::shared_mutex> lock(mutex_); }
 
 	Version* DBImpl::TEST_CurrentVersion() const
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		return versions_->current();
 	}
 
 	int DBImpl::TEST_CurrentVersionRefs() const
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		return versions_->current()->TEST_Refs();
 	}
 
 	bool DBImpl::TEST_HasImmutableMemTable() const
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		return imm_ != nullptr;
 	}
 
 	int DBImpl::TEST_NumLevelFiles(int level) const
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		if (level < 0 || level >= kNumLevels)
 		{
 			return 0;
@@ -1818,26 +1820,26 @@ namespace prism
 
 	void DBImpl::TEST_SetBackgroundError(const Status& status)
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		bg_error_ = status;
 	}
 
 	void DBImpl::TEST_SignalBackgroundWorkFinished()
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		background_work_finished_signal_.notify_all();
 	}
 
 	uint64_t DBImpl::TEST_NewFileNumber()
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		return versions_->NewFileNumber();
 	}
 
 	Status DBImpl::TEST_AddFileToVersion(
 	    int level, uint64_t number, uint64_t file_size, const InternalKey& smallest, const InternalKey& largest)
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		VersionEdit edit;
 		edit.AddFile(level, number, file_size, smallest, largest);
 		return versions_->LogAndApply(&edit, &mutex_);
@@ -1845,7 +1847,7 @@ namespace prism
 
 	Status DBImpl::TEST_RunPickedCompaction()
 	{
-		std::unique_lock<std::mutex> lock(mutex_);
+		std::unique_lock<std::shared_mutex> lock(mutex_);
 		Compaction* compaction = versions_->PickCompaction();
 		if (compaction == nullptr)
 		{
@@ -1860,7 +1862,7 @@ namespace prism
 
 	Status DBImpl::TEST_RunBackgroundCompactionOnce()
 	{
-		std::unique_lock<std::mutex> lock(mutex_);
+		std::unique_lock<std::shared_mutex> lock(mutex_);
 		BackgroundCompaction();
 		return bg_error_;
 	}
@@ -1868,7 +1870,7 @@ namespace prism
 	std::vector<FileMetaData> DBImpl::TEST_LevelFilesCopy(int level) const
 	{
 		std::vector<FileMetaData> files_copy;
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		if (level < 0 || level >= kNumLevels)
 		{
 			return files_copy;
@@ -1882,7 +1884,7 @@ namespace prism
 
 	bool DBImpl::TEST_PendingOutputsEmpty() const
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<std::shared_mutex> lock(mutex_);
 		return pending_outputs_.empty();
 	}
 

@@ -10,7 +10,7 @@
 
 #include <condition_variable>
 #include <set>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <atomic>
 
@@ -64,7 +64,7 @@ namespace prism
 
 		Status Recover();
 		Status ApplyBatch(WriteBatch& batch);
-		Status MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lock);
+		Status MakeRoomForWrite(bool force, std::unique_lock<std::shared_mutex>& lock);
 		void MaybeScheduleCompaction();
 		void RecordBackgroundError(const Status& status);
 		void BackgroundCall();
@@ -80,8 +80,8 @@ namespace prism
 		Status NewLogFile();
 		Status CloseLogFile();
 
-		mutable std::mutex mutex_;
-		std::condition_variable background_work_finished_signal_;
+		mutable std::shared_mutex mutex_;
+		std::condition_variable_any background_work_finished_signal_;
 
 		Env* env_;
 		Options options_;
