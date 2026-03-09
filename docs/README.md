@@ -78,7 +78,10 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
 
 ### 🚧 In Progress
 
-- [ ]  **Filter block / Bloom filter** - write-side FilterBlockBuilder integration
+- [X]  **Filter block / Bloom filter** - write-side FilterBlockBuilder integration
+- [X]  **Version & VersionSet** - MANIFEST-based metadata + recovery
+- [X]  **Compaction** - Background merging (multi-level)
+
 - [ ]  **Version & VersionSet** - MANIFEST-based metadata + recovery
 - [ ]  **Compaction** - Background merging (multi-level)
 
@@ -268,7 +271,13 @@ When adding new components:
 - [X]  SSTable core (Table/TableBuilder/TableCache)
 - [X]  DBImpl (L0-only) end-to-end read/write/recover
 
-### Phase 2: Versioning & Compaction (Next)
+### Phase 2: Versioning & Compaction (Completed)
+
+- [X]  VersionEdit/VersionSet + MANIFEST
+- [X]  Minor compaction (MemTable → L0) background
+- [X]  Major compaction (Ln → Ln+1)
+- [X]  Bloom filter (write-side) integration
+
 
 - [ ]  VersionEdit/VersionSet + MANIFEST
 - [ ]  Minor compaction (MemTable → L0) background
