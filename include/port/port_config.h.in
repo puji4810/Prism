@@ -1,0 +1,22 @@
+#ifndef STORAGE_LEVELDB_PORT_PORT_CONFIG_H_
+#define STORAGE_LEVELDB_PORT_PORT_CONFIG_H_
+
+// Define to 1 if you have a definition for fdatasync() in <unistd.h>.
+${define HAVE_FDATASYNC}
+
+// Define to 1 if you have a definition for F_FULLFSYNC in <fcntl.h>.
+${define HAVE_FULLFSYNC}
+
+// Define to 1 if you have a definition for O_CLOEXEC in <fcntl.h>.
+${define HAVE_O_CLOEXEC}
+
+// Define to 1 if you have Google CRC32C.
+${define HAVE_CRC32C}
+
+// Define to 1 if you have Google Snappy.
+${define HAVE_SNAPPY}
+
+// Define to 1 if you have Zstd.
+${define HAVE_ZSTD}
+
+#endif  // STORAGE_LEVELDB_PORT_PORT_CONFIG_H_

@@ -1168,12 +1168,12 @@ namespace prism
 			{
 				env_->RemoveFile(TableFileName(dbname_, out.number));
 			}
-		mutex_.lock();
-		return status;
-	}
+			mutex_.lock();
+			return status;
+		}
 
-	mutex_.lock();
-	status = InstallCompactionResults(compaction, outputs, total_output_bytes);
+		mutex_.lock();
+		status = InstallCompactionResults(compaction, outputs, total_output_bytes);
 		if (status.ok())
 		{
 			RemoveObsoleteFiles();
@@ -1601,71 +1601,68 @@ namespace prism
 			done = true;
 		}
 		else
-	{
-		InternalKey ikey(key, snapshot, kValueTypeForSeek);
-		Slice internal_key = ikey.Encode();
-		TableGetState state{ internal_comparator_.user_comparator(), key, &value };
-		
-		// Helper lambda: check if key is in file's [smallest, largest] range
-		auto KeyInFileRange = [&](const FileMetaData* file) -> bool {
-			const Comparator* ucmp = internal_comparator_.user_comparator();
-			return (ucmp->Compare(key, file->smallest.user_key()) >= 0 &&
-			        ucmp->Compare(key, file->largest.user_key()) <= 0);
-		};
-		
-		// Helper lambda: search a single level for the key
-		auto SearchLevel = [&](int level, const std::vector<FileMetaData*>& files) -> bool {
-			if (level == 0)
-			{
-				// Level 0: files may overlap, scan all but check range first
-				for (const FileMetaData* file : files)
+		{
+			InternalKey ikey(key, snapshot, kValueTypeForSeek);
+			Slice internal_key = ikey.Encode();
+			TableGetState state{ internal_comparator_.user_comparator(), key, &value };
+
+			// Helper lambda: check if key is in file's [smallest, largest] range
+			auto KeyInFileRange = [&](const FileMetaData* file) -> bool {
+				const Comparator* ucmp = internal_comparator_.user_comparator();
+				return (ucmp->Compare(key, file->smallest.user_key()) >= 0 && ucmp->Compare(key, file->largest.user_key()) <= 0);
+			};
+
+			// Helper lambda: search a single level for the key
+			auto SearchLevel = [&](int level, const std::vector<FileMetaData*>& files) -> bool {
+				if (level == 0)
 				{
-					if (!KeyInFileRange(file))
-						continue;
-					s = table_cache_->Get(read_options, file->number, file->file_size, 
-					                      internal_key, &state, &SaveValue);
-					if (!s.ok())
-						return true; // Error, stop searching
-					if (state.value_found)
-						return true; // Found value
-				}
-			}
-			else
-			{
-				// Level 1+: files are sorted and non-overlapping, use binary search
-				if (files.empty())
-					return false;
-				
-				// Find the candidate file using binary search
-				int index = FindFile(internal_comparator_, files, internal_key);
-				if (index < static_cast<int>(files.size()))
-				{
-					const FileMetaData* file = files[index];
-					// Verify key is actually in this file's range
-					if (KeyInFileRange(file))
+					// Level 0: files may overlap, scan all but check range first
+					for (const FileMetaData* file : files)
 					{
-						s = table_cache_->Get(read_options, file->number, file->file_size, 
-						                      internal_key, &state, &SaveValue);
+						if (!KeyInFileRange(file))
+							continue;
+						s = table_cache_->Get(read_options, file->number, file->file_size, internal_key, &state, &SaveValue);
 						if (!s.ok())
-							return true; // Error
+							return true; // Error, stop searching
 						if (state.value_found)
 							return true; // Found value
 					}
 				}
-			}
-			return false;
-		};
-		
-		for (int level = 0; level < kNumLevels; ++level)
-		{
-			const auto& files = current->files(level);
-			if (SearchLevel(level, files))
+				else
+				{
+					// Level 1+: files are sorted and non-overlapping, use binary search
+					if (files.empty())
+						return false;
+
+					// Find the candidate file using binary search
+					int index = FindFile(internal_comparator_, files, internal_key);
+					if (index < static_cast<int>(files.size()))
+					{
+						const FileMetaData* file = files[index];
+						// Verify key is actually in this file's range
+						if (KeyInFileRange(file))
+						{
+							s = table_cache_->Get(read_options, file->number, file->file_size, internal_key, &state, &SaveValue);
+							if (!s.ok())
+								return true; // Error
+							if (state.value_found)
+								return true; // Found value
+						}
+					}
+				}
+				return false;
+			};
+
+			for (int level = 0; level < kNumLevels; ++level)
 			{
-				done = true;
-				break;
+				const auto& files = current->files(level);
+				if (SearchLevel(level, files))
+				{
+					done = true;
+					break;
+				}
 			}
 		}
-	}
 
 		// Phase 3: Release all pinned resources.
 		current->Unref();

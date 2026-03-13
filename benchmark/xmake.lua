@@ -1,5 +1,5 @@
 local common_files = {"$(projectdir)/src/*.cpp", "$(projectdir)/util/*.cpp", "$(projectdir)/include/table/*.cpp"}
-local common_includedirs = {"$(projectdir)/include", "$(projectdir)/src", "$(projectdir)/util"}
+local common_includedirs = {"$(builddir)/generated", "$(projectdir)/include", "$(projectdir)/src", "$(projectdir)/util"}
 
 add_packages("crc32c")
 
