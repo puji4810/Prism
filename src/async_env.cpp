@@ -16,12 +16,12 @@ namespace prism
 
 	AsyncOp<Result<std::size_t>> AsyncRandomAccessFile::ReadAtAsync(uint64_t offset, std::span<std::byte> dst) const
 	{
-		return AsyncOp<Result<std::size_t>>(*scheduler_, [file = file_, offset, dst]() mutable { return file->ReadAt(offset, dst); });
+		return AsyncOp<Result<std::size_t>>(*scheduler_, [file = file_, offset, dst]() { return file->ReadAt(offset, dst); });
 	}
 
 	AsyncOp<Result<std::string>> AsyncRandomAccessFile::ReadAtStringAsync(uint64_t offset, std::size_t n) const
 	{
-		return AsyncOp<Result<std::string>>(*scheduler_, [file = file_, offset, n]() mutable -> Result<std::string> {
+		return AsyncOp<Result<std::string>>(*scheduler_, [file = file_, offset, n]() -> Result<std::string> {
 			std::string buf;
 			buf.resize(n);
 			auto r = file->ReadAt(offset, std::as_writable_bytes(std::span(buf)));
@@ -54,7 +54,7 @@ namespace prism
 				return AsyncOp<Status>(*scheduler_, [] { return Status::IOError("file closed"); });
 			my_ticket = state->next_ticket++;
 		}
-		return AsyncOp<Status>(*scheduler_, [file, state, my_ticket, data = std::move(data)]() mutable {
+		return AsyncOp<Status>(*scheduler_, [file, state, my_ticket, data = std::move(data)]() {
 			{
 				std::unique_lock lock(state->mu);
 				state->cv.wait(lock, [&] { return my_ticket == state->now_serving; });
@@ -80,7 +80,7 @@ namespace prism
 				return AsyncOp<Status>(*scheduler_, [] { return Status::IOError("file closed"); });
 			my_ticket = state->next_ticket++;
 		}
-		return AsyncOp<Status>(*scheduler_, [file, state, my_ticket]() mutable {
+		return AsyncOp<Status>(*scheduler_, [file, state, my_ticket]() {
 			{
 				std::unique_lock lock(state->mu);
 				state->cv.wait(lock, [&] { return my_ticket == state->now_serving; });
@@ -106,7 +106,7 @@ namespace prism
 				return AsyncOp<Status>(*scheduler_, [] { return Status::IOError("file closed"); });
 			my_ticket = state->next_ticket++;
 		}
-		return AsyncOp<Status>(*scheduler_, [file, state, my_ticket]() mutable {
+		return AsyncOp<Status>(*scheduler_, [file, state, my_ticket]() {
 			{
 				std::unique_lock lock(state->mu);
 				state->cv.wait(lock, [&] { return my_ticket == state->now_serving; });
@@ -132,7 +132,7 @@ namespace prism
 				return AsyncOp<Status>(*scheduler_, [] { return Status::IOError("file closed"); });
 			my_ticket = state->next_ticket++;
 		}
-		return AsyncOp<Status>(*scheduler_, [file, state, my_ticket]() mutable {
+		return AsyncOp<Status>(*scheduler_, [file, state, my_ticket]() {
 			{
 				std::unique_lock lock(state->mu);
 				state->cv.wait(lock, [&] { return my_ticket == state->now_serving; });
@@ -159,7 +159,7 @@ namespace prism
 		auto env = env_;
 		auto scheduler = scheduler_;
 		return AsyncOp<Result<std::unique_ptr<AsyncRandomAccessFile>>>(
-		    *scheduler_, [env, scheduler, fname = std::move(fname)]() mutable -> Result<std::unique_ptr<AsyncRandomAccessFile>> {
+		    *scheduler_, [env, scheduler, fname = std::move(fname)]() -> Result<std::unique_ptr<AsyncRandomAccessFile>> {
 			    auto f = env->NewRandomAccessFile(fname);
 			    if (!f.has_value())
 			    {
@@ -174,7 +174,7 @@ namespace prism
 		auto env = env_;
 		auto scheduler = scheduler_;
 		return AsyncOp<Result<std::unique_ptr<AsyncWritableFile>>>(
-		    *scheduler_, [env, scheduler, fname = std::move(fname)]() mutable -> Result<std::unique_ptr<AsyncWritableFile>> {
+		    *scheduler_, [env, scheduler, fname = std::move(fname)]() -> Result<std::unique_ptr<AsyncWritableFile>> {
 			    auto f = env->NewWritableFile(fname);
 			    if (!f.has_value())
 			    {
@@ -189,7 +189,7 @@ namespace prism
 		auto env = env_;
 		auto scheduler = scheduler_;
 		return AsyncOp<Result<std::unique_ptr<AsyncWritableFile>>>(
-		    *scheduler_, [env, scheduler, fname = std::move(fname)]() mutable -> Result<std::unique_ptr<AsyncWritableFile>> {
+		    *scheduler_, [env, scheduler, fname = std::move(fname)]() -> Result<std::unique_ptr<AsyncWritableFile>> {
 			    auto f = env->NewAppendableFile(fname);
 			    if (!f.has_value())
 			    {
@@ -202,18 +202,18 @@ namespace prism
 	AsyncOp<Status> AsyncEnv::RemoveFileAsync(std::string fname)
 	{
 		auto env = env_;
-		return AsyncOp<Status>(*scheduler_, [env, fname = std::move(fname)]() mutable { return env->RemoveFile(fname); });
+		return AsyncOp<Status>(*scheduler_, [env, fname = std::move(fname)]() { return env->RemoveFile(fname); });
 	}
 
 	AsyncOp<Status> AsyncEnv::CreateDirAsync(std::string dirname)
 	{
 		auto env = env_;
-		return AsyncOp<Status>(*scheduler_, [env, dirname = std::move(dirname)]() mutable { return env->CreateDir(dirname); });
+		return AsyncOp<Status>(*scheduler_, [env, dirname = std::move(dirname)]() { return env->CreateDir(dirname); });
 	}
 
 	AsyncOp<Result<std::size_t>> AsyncEnv::GetFileSizeAsync(std::string fname)
 	{
 		auto env = env_;
-		return AsyncOp<Result<std::size_t>>(*scheduler_, [env, fname = std::move(fname)]() mutable { return env->GetFileSize(fname); });
+		return AsyncOp<Result<std::size_t>>(*scheduler_, [env, fname = std::move(fname)]() { return env->GetFileSize(fname); });
 	}
 }

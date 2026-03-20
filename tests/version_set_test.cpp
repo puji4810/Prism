@@ -202,7 +202,11 @@ namespace prism
 		CreateFile(2, "300", 100, "400", 100); // Shares same key "300" with file 1's largest
 		// This should trigger an assert in CheckLevelInvariant due to >= comparison
 		// We use EXPECT_DEATH to verify the assertion happens
+		#if DEBUG
 		EXPECT_DEATH({ CheckLevelInvariant(icmp_, files_); }, "");
+		#else
+		std::fprintf(stderr, "This test should run in debug mode\n");
+		#endif
 	}
 
 	TEST_F(VersionSetTest, FinalizeUsesFileCountForLevelZero)

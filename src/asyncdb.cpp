@@ -18,7 +18,7 @@ namespace prism
 	AsyncOp<Result<std::unique_ptr<AsyncDB>>> AsyncDB::OpenAsync(ThreadPoolScheduler& scheduler, const Options& options, std::string dbname)
 	{
 		return AsyncOp<Result<std::unique_ptr<AsyncDB>>>(
-		    scheduler, [&scheduler, options, dbname = std::move(dbname)]() mutable -> Result<std::unique_ptr<AsyncDB>> {
+		    scheduler, [&scheduler, options, dbname = std::move(dbname)]() -> Result<std::unique_ptr<AsyncDB>> {
 			    auto db = DB::Open(options, dbname);
 			    if (!db.has_value())
 			    {

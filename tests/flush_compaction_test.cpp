@@ -63,7 +63,7 @@ namespace
 		}
 
 	private:
-		mutable std::mutex mu_;
+		std::mutex mu_;
 		std::condition_variable cv_;
 		bool hold_scheduled_work_ = true;
 		std::atomic<int> scheduled_calls_{ 0 };

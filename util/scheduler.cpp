@@ -33,6 +33,7 @@ namespace prism
 			return Context(this, t_current_worker_index);
 		return Context{};
 	}
+	
 	ThreadPoolScheduler::ThreadPoolScheduler(std::size_t num_threads)
 	    : work_threads_(DefaultThreadCount(num_threads))
 	{

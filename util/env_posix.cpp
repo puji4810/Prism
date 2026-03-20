@@ -470,7 +470,7 @@ namespace prism
 	int LockOrUnlock(int fd, bool lock)
 	{
 		errno = 0;
-		::flock file_lock_info;
+		struct ::flock file_lock_info;
 		std::memset(&file_lock_info, 0, sizeof(file_lock_info)); // clear
 		file_lock_info.l_type = (lock ? F_WRLCK : F_UNLCK); // write lock for true, And unlock for false
 		file_lock_info.l_whence = SEEK_SET;
