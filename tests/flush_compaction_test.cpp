@@ -3,6 +3,7 @@
 #include "db_impl.h"
 #include "env.h"
 #include "filename.h"
+#include "table/table_builder.h"
 
 #include <atomic>
 #include <chrono>
@@ -73,12 +74,22 @@ namespace
 	void CreateLegacyL0Files(const std::string& dbname, int count, uint64_t first_number)
 	{
 		std::filesystem::create_directories(dbname);
+		Options table_options;
+		InternalKeyComparator icmp(BytewiseComparator());
+		table_options.comparator = &icmp;
+		table_options.env = Env::Default();
+		table_options.compression = CompressionType::kNoCompression;
 		for (int i = 0; i < count; ++i)
 		{
 			const std::string filename = TableFileName(dbname, first_number + static_cast<uint64_t>(i));
-			std::ofstream out(filename, std::ios::binary);
-			ASSERT_TRUE(out.is_open());
-			out << "legacy_l0";
+			auto writable = Env::Default()->NewWritableFile(filename);
+			ASSERT_TRUE(writable.has_value()) << writable.error().ToString();
+
+			TableBuilder builder(table_options, writable.value().get());
+			const std::string user_key = "legacy_l0_" + std::to_string(i);
+			builder.Add(InternalKey(user_key, 1, kTypeValue).Encode(), Slice("value"));
+			ASSERT_TRUE(builder.Finish().ok());
+			ASSERT_TRUE(writable.value()->Close().ok());
 		}
 	}
 

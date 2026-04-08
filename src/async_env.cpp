@@ -154,6 +154,12 @@ namespace prism
 			{
 				std::unique_lock lock(state->mu);
 				state->cv.wait(lock, [&] { return my_ticket == state->now_serving; });
+				if (state->closed)
+				{
+					state->now_serving++;
+					state->cv.notify_all();
+					return Status::IOError("file closed");
+				}
 			}
 			auto s = file->Close();
 			{

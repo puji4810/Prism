@@ -8,6 +8,7 @@
 #include "env.h"
 #include "filename.h"
 #include "log_reader.h"
+#include "table/table.h"
 #include "table_cache.h"
 
 namespace prism
@@ -77,6 +78,70 @@ namespace prism
 		return true;
 	}
 
+	static Status RecoverLegacyTableBounds(
+	    Env* env, const std::string& dbname, const Options* options, const InternalKeyComparator* icmp, uint64_t file_number,
+	    uint64_t file_size, InternalKey* smallest, InternalKey* largest)
+	{
+		assert(env != nullptr);
+		assert(options != nullptr);
+		assert(icmp != nullptr);
+		assert(smallest != nullptr);
+		assert(largest != nullptr);
+
+		auto file = env->NewRandomAccessFile(TableFileName(dbname, file_number));
+		if (!file.has_value())
+		{
+			file = env->NewRandomAccessFile(SSTTableFileName(dbname, file_number));
+			if (!file.has_value())
+			{
+				return file.error();
+			}
+		}
+
+		Options table_options = *options;
+		table_options.env = env;
+		table_options.comparator = icmp;
+
+		Table* raw_table = nullptr;
+		Status s = Table::Open(table_options, file.value().get(), file_size, &raw_table);
+		if (!s.ok())
+		{
+			return s;
+		}
+
+		std::unique_ptr<Table> table(raw_table);
+		std::unique_ptr<Iterator> iter(table->NewIterator(ReadOptions()));
+		iter->SeekToFirst();
+		if (!iter->Valid())
+		{
+			if (!iter->status().ok())
+			{
+				return iter->status();
+			}
+			return Status::Corruption("legacy table is empty");
+		}
+		if (!smallest->DecodeFrom(iter->key()))
+		{
+			return Status::Corruption("legacy table has invalid smallest key");
+		}
+
+		iter->SeekToLast();
+		if (!iter->Valid())
+		{
+			if (!iter->status().ok())
+			{
+				return iter->status();
+			}
+			return Status::Corruption("legacy table is empty");
+		}
+		if (!largest->DecodeFrom(iter->key()))
+		{
+			return Status::Corruption("legacy table has invalid largest key");
+		}
+
+		return Status::OK();
+	}
+
 	static FileMetaData* FindSmallestBoundaryFile(
 	    const InternalKeyComparator& icmp, const std::vector<FileMetaData*>& level_files, const InternalKey& largest_key)
 	{
@@ -98,6 +163,8 @@ namespace prism
 	Version::Version(VersionSet* vset)
 	    : refs_(0)
 	    , vset_(vset)
+	    , prev_(this)
+	    , next_(this)
 	    , compaction_score_(-1)
 	    , compaction_level_(-1)
 	{
@@ -106,6 +173,10 @@ namespace prism
 	Version::~Version()
 	{
 		assert(refs_.load(std::memory_order_acquire) == 0);
+		prev_->next_ = next_;
+		next_->prev_ = prev_;
+		prev_ = nullptr;
+		next_ = nullptr;
 		for (int level = 0; level < kNumLevels; ++level)
 		{
 			for (FileMetaData* file : files_[level])
@@ -259,6 +330,13 @@ namespace prism
 	{
 		assert(v != nullptr);
 		Version* old = current_;
+		if (old != nullptr)
+		{
+			v->next_ = old->next_;
+			v->prev_ = old;
+			old->next_->prev_ = v;
+			old->next_ = v;
+		}
 		current_ = v;
 		current_->Ref();
 		if (old != nullptr)
@@ -421,8 +499,15 @@ namespace prism
 						return file_size.error();
 					}
 
-					const InternalKey boundary_key("", kMaxSequenceNumber, kValueTypeForSeek);
-					bootstrap_edit.AddFile(0, number, static_cast<uint64_t>(file_size.value()), boundary_key, boundary_key);
+					InternalKey smallest;
+					InternalKey largest;
+					Status bounds = RecoverLegacyTableBounds(
+					    env_, dbname_, options_, icmp_, number, static_cast<uint64_t>(file_size.value()), &smallest, &largest);
+					if (!bounds.ok())
+					{
+						return bounds;
+					}
+					bootstrap_edit.AddFile(0, number, static_cast<uint64_t>(file_size.value()), smallest, largest);
 					continue;
 				}
 
@@ -448,7 +533,8 @@ namespace prism
 
 			MarkFileNumberUsed(max_file_number);
 			MarkFileNumberUsed(max_log_number);
-			bootstrap_edit.SetLogNumber(max_log_number);
+			// Leave log_number at zero so DB recovery replays every legacy WAL.
+			bootstrap_edit.SetLogNumber(0);
 
 			std::shared_mutex mu;
 			mu.lock();
@@ -820,14 +906,24 @@ namespace prism
 
 	void VersionSet::AddLiveFiles(std::set<uint64_t>* live)
 	{
-		for (int level = 0; level < kNumLevels; ++level)
+		if (current_ == nullptr)
 		{
-			const auto& files = current_->files(level);
-			for (const FileMetaData* file : files)
+			return;
+		}
+
+		const Version* v = current_;
+		do
+		{
+			for (int level = 0; level < kNumLevels; ++level)
 			{
-				live->insert(file->number);
+				const auto& files = v->files(level);
+				for (const FileMetaData* file : files)
+				{
+					live->insert(file->number);
+				}
 			}
 		}
+		while ((v = v->next_) != current_);
 	}
 
 	struct VersionSet::Builder::BySmallestKey

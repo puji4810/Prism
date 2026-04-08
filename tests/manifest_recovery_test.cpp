@@ -9,9 +9,11 @@
 #include "log_writer.h"
 #include "options.h"
 #include "status.h"
+#include "table/table_builder.h"
 #include "table_cache.h"
 #include "version_edit.h"
 #include "version_set.h"
+#include "write_batch_internal.h"
 
 #include <gtest/gtest.h>
 #include <filesystem>
@@ -129,25 +131,36 @@ static bool PlantLegacyDirectory(const std::string& db_path)
 	Env* env = Env::Default();
 	env->CreateDir(db_path);
 
-	std::string log_name = LogFileName(db_path, 1);
-	auto res = env->NewWritableFile(log_name);
-	if (!res.has_value())
-		return false;
-	auto& wf = res.value();
-	Status s = wf->Append(Slice("placeholder"));
-	if (!s.ok())
-		return false;
-	s = wf->Close();
-	if (!s.ok())
-		return false;
+	Options table_options;
+	table_options.env = env;
+	InternalKeyComparator icmp(BytewiseComparator());
+	table_options.comparator = &icmp;
+	table_options.compression = CompressionType::kNoCompression;
 
 	auto legacy_table = env->NewWritableFile(TableFileName(db_path, 10));
 	if (!legacy_table.has_value())
 		return false;
-	Status table_status = legacy_table.value()->Append(Slice("legacy_table_placeholder"));
+	TableBuilder builder(table_options, legacy_table.value().get());
+	builder.Add(InternalKey("alpha", 1, kTypeValue).Encode(), Slice("table_alpha"));
+	builder.Add(InternalKey("omega", 1, kTypeValue).Encode(), Slice("table_omega"));
+	Status table_status = builder.Finish();
 	if (!table_status.ok())
 		return false;
-	return legacy_table.value()->Close().ok();
+	if (!legacy_table.value()->Close().ok())
+		return false;
+
+	std::string log_name = LogFileName(db_path, 1);
+	auto res = env->NewWritableFile(log_name);
+	if (!res.has_value())
+		return false;
+	log::Writer writer(res.value().get());
+	WriteBatch batch;
+	batch.Put("legacy_log_key", "legacy_log_value");
+	WriteBatchInternal::SetSequence(&batch, 1);
+	Status s = writer.AddRecord(WriteBatchInternal::Contents(&batch));
+	if (!s.ok())
+		return false;
+	return res.value()->Close().ok();
 }
 
 // Helper to plant a legacy directory where log number > table number
@@ -157,11 +170,19 @@ static bool PlantLegacyDirectoryWithHighLogNumber(const std::string& db_path)
 	Env* env = Env::Default();
 	env->CreateDir(db_path);
 
-	// Create a table file with number 10
+	Options table_options;
+	table_options.env = env;
+	InternalKeyComparator icmp(BytewiseComparator());
+	table_options.comparator = &icmp;
+	table_options.compression = CompressionType::kNoCompression;
+
 	auto legacy_table = env->NewWritableFile(TableFileName(db_path, 10));
 	if (!legacy_table.has_value())
 		return false;
-	Status table_status = legacy_table.value()->Append(Slice("legacy_table_placeholder"));
+	TableBuilder builder(table_options, legacy_table.value().get());
+	builder.Add(InternalKey("legacy_high", 1, kTypeValue).Encode(), Slice("legacy_high_value"));
+	builder.Add(InternalKey("legacy_low", 1, kTypeValue).Encode(), Slice("legacy_low_value"));
+	Status table_status = builder.Finish();
 	if (!table_status.ok())
 		return false;
 	if (!legacy_table.value()->Close().ok())
@@ -172,11 +193,14 @@ static bool PlantLegacyDirectoryWithHighLogNumber(const std::string& db_path)
 	auto res = env->NewWritableFile(log_name);
 	if (!res.has_value())
 		return false;
-	auto& wf = res.value();
-	Status s = wf->Append(Slice("placeholder_log"));
+	log::Writer writer(res.value().get());
+	WriteBatch batch;
+	batch.Put("legacy_high_log_key", "legacy_high_log_value");
+	WriteBatchInternal::SetSequence(&batch, 1);
+	Status s = writer.AddRecord(WriteBatchInternal::Contents(&batch));
 	if (!s.ok())
 		return false;
-	return wf->Close().ok();
+	return res.value()->Close().ok();
 }
 
 static Status CreatePlaceholderFile(const std::string& fname)
@@ -422,8 +446,57 @@ TEST_F(ManifestRecoveryTest, LegacyBootstrapTracksHighestLogNumber)
 	// This ensures the invariant edit->GetLogNumber() < next_file_number_ holds
 	EXPECT_GT(version_set.NextFileNumber(), 100u) << "NextFileNumber must exceed highest log file number";
 
-	// Verify the log number is correctly tracked
-	EXPECT_EQ(100u, version_set.LogNumber());
+	// Leave log_number at zero so DB recovery can replay every legacy WAL.
+	EXPECT_EQ(0u, version_set.LogNumber());
+}
+
+TEST_F(ManifestRecoveryTest, LegacyBootstrapReadsKeysFromRecoveredSst)
+{
+	ASSERT_TRUE(PlantLegacyDirectory(db_path_));
+
+	auto res = OpenDB();
+	ASSERT_TRUE(res.has_value()) << "DB::Open failed: " << res.error().ToString();
+
+	auto alpha = db_->Get("alpha");
+	ASSERT_TRUE(alpha.has_value()) << "alpha missing after legacy SST bootstrap";
+	EXPECT_EQ("table_alpha", alpha.value());
+
+	auto omega = db_->Get("omega");
+	ASSERT_TRUE(omega.has_value()) << "omega missing after legacy SST bootstrap";
+	EXPECT_EQ("table_omega", omega.value());
+}
+
+TEST_F(ManifestRecoveryTest, LegacyBootstrapReplaysAllLegacyLogs)
+{
+	Env* env = Env::Default();
+	ASSERT_TRUE(env->CreateDir(db_path_).ok());
+
+	auto write_legacy_log = [&](uint64_t file_number, uint64_t sequence, const std::string& key, const std::string& value) {
+		auto writable = env->NewWritableFile(LogFileName(db_path_, file_number));
+		ASSERT_TRUE(writable.has_value()) << writable.error().ToString();
+
+		log::Writer writer(writable.value().get());
+		WriteBatch batch;
+		batch.Put(key, value);
+		WriteBatchInternal::SetSequence(&batch, sequence);
+		ASSERT_TRUE(writer.AddRecord(WriteBatchInternal::Contents(&batch)).ok());
+		ASSERT_TRUE(writable.value()->Close().ok());
+	};
+
+	write_legacy_log(3, 1, "legacy_log_a", "value_a");
+	write_legacy_log(7, 2, "legacy_log_b", "value_b");
+	ASSERT_FALSE(HasCurrentFile());
+
+	auto res = OpenDB();
+	ASSERT_TRUE(res.has_value()) << "DB::Open failed: " << res.error().ToString();
+
+	auto a = db_->Get("legacy_log_a");
+	ASSERT_TRUE(a.has_value()) << "legacy_log_a should be recovered from lower-numbered WAL";
+	EXPECT_EQ("value_a", a.value());
+
+	auto b = db_->Get("legacy_log_b");
+	ASSERT_TRUE(b.has_value()) << "legacy_log_b should be recovered from higher-numbered WAL";
+	EXPECT_EQ("value_b", b.value());
 }
 
 TEST_F(ManifestRecoveryTest, RecoverUsesManifestAsSourceOfTruth)

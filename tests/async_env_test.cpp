@@ -349,3 +349,25 @@ TEST_F(AsyncEnvTest, CloseInterleaving)
 	bool ok_or_error = append_status.ok() || append_status.IsIOError();
 	EXPECT_TRUE(ok_or_error) << "Unexpected append status: " << append_status.ToString();
 }
+
+TEST_F(AsyncEnvTest, QueuedSecondCloseReturnsIoError)
+{
+	ThreadPoolScheduler scheduler(4);
+	const std::string path = TestFile("queued_second_close.txt");
+
+	auto wf_raw = env_->NewWritableFile(path);
+	ASSERT_TRUE(wf_raw.has_value()) << wf_raw.error().ToString();
+	auto async_wf = std::make_shared<AsyncWritableFile>(scheduler, std::move(wf_raw.value()));
+
+	auto first_close = async_wf->CloseAsync();
+	auto second_close = async_wf->CloseAsync();
+
+	auto first_task = [](AsyncOp<Status> op) -> Task<Status> { co_return co_await std::move(op); }(std::move(first_close));
+	auto second_task = [](AsyncOp<Status> op) -> Task<Status> { co_return co_await std::move(op); }(std::move(second_close));
+
+	Status first = first_task.SyncWait();
+	Status second = second_task.SyncWait();
+
+	EXPECT_TRUE(first.ok()) << first.ToString();
+	EXPECT_TRUE(second.IsIOError()) << "Second queued CloseAsync should fail deterministically: " << second.ToString();
+}

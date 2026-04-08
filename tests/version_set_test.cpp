@@ -385,4 +385,56 @@ namespace prism
 		prism::Env::Default()->RemoveDir(tmp_dir);
 	}
 
+	TEST_F(VersionSetTest, AddLiveFilesIncludesPinnedOlderVersions)
+	{
+		std::string tmp_dir = "/tmp/prism_version_set_live_files_test_" + std::to_string(::getpid());
+		prism::Env::Default()->CreateDir(tmp_dir);
+
+		Options options;
+		options.create_if_missing = true;
+		VersionSet vset(tmp_dir, &options, nullptr, &icmp_);
+
+		VersionEdit first;
+		first.SetLogNumber(0);
+		first.AddFile(0, 10, 64 * 1024, InternalKey("a", 100, kTypeValue), InternalKey("b", 100, kTypeValue));
+		std::shared_mutex mu;
+		mu.lock();
+		Status s = vset.LogAndApply(&first, &mu);
+		mu.unlock();
+		ASSERT_TRUE(s.ok()) << s.ToString();
+
+		Version* pinned = vset.current();
+		pinned->Ref();
+
+		VersionEdit second;
+		second.SetLogNumber(0);
+		second.RemoveFile(0, 10);
+		second.AddFile(0, 20, 64 * 1024, InternalKey("c", 100, kTypeValue), InternalKey("d", 100, kTypeValue));
+		mu.lock();
+		s = vset.LogAndApply(&second, &mu);
+		mu.unlock();
+		ASSERT_TRUE(s.ok()) << s.ToString();
+
+		std::set<uint64_t> live;
+		vset.AddLiveFiles(&live);
+		EXPECT_TRUE(live.count(10) > 0) << "Pinned old version file must remain live";
+		EXPECT_TRUE(live.count(20) > 0) << "Current version file must remain live";
+
+		pinned->Unref();
+
+		prism::Env::Default()->RemoveFile(tmp_dir + "/CURRENT");
+		auto children = prism::Env::Default()->GetChildren(tmp_dir);
+		if (children.has_value())
+		{
+			for (const auto& name : children.value())
+			{
+				if (name.find("MANIFEST") != std::string::npos)
+				{
+					prism::Env::Default()->RemoveFile(tmp_dir + "/" + name);
+				}
+			}
+		}
+		prism::Env::Default()->RemoveDir(tmp_dir);
+	}
+
 } // namespace prism
