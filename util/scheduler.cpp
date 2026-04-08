@@ -177,7 +177,7 @@ namespace prism
 		Submit(std::move(job));
 	}
 
-	bool ThreadPoolScheduler::TryDispatch(Job job)
+	bool ThreadPoolScheduler::TryDispatch(Job& job)
 	{
 		std::lock_guard lock(pending_mutex_);
 		if (pending_list_.empty())
@@ -210,7 +210,7 @@ namespace prism
 
 			// Try to dispatch top-priority task to idle worker.
 			// Only pop from queue after successful dispatch to ensure tasks aren't lost.
-			if (TryDispatch(std::move(priority_queue_.top().job)))
+			if (TryDispatch(const_cast<Job&>(priority_queue_.top().job)))
 			{
 				priority_queue_.pop();
 			}
@@ -247,7 +247,7 @@ namespace prism
 				lock.unlock();
 
 				// Try direct dispatch to idle worker; fallback to priority queue if all busy
-				if (!TryDispatch(std::move(task.job)))
+				if (!TryDispatch(task.job))
 				{
 					Submit(std::move(task.job), kLazyFallbackPriority);
 				}

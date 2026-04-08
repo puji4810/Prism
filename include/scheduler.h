@@ -200,7 +200,8 @@ namespace prism
 		};
 
 		// TryDispatch: Find idle worker and assign job. Returns false if no idle workers.
-		bool TryDispatch(Job job);
+		// Only consumes `job` on success so callers can safely retry/fallback.
+		bool TryDispatch(Job& job);
 
 		// PriorityLoop: Dispatcher thread that processes priority_queue_
 		void PriorityLoop();

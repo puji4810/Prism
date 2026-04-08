@@ -239,34 +239,36 @@ namespace
 	TEST(KVBenchAsyncMatrixTest, CompactionOverlapUsesSplitClientRoles)
 	{
 		std::string db_dir = MakeTestDir();
-		prism::Options options;
-		options.create_if_missing = true;
-		options.write_buffer_size = 4 * 1024;
+		{
+			prism::Options options;
+			options.create_if_missing = true;
+			options.write_buffer_size = 4 * 1024;
 
-		auto db_result = prism::DB::Open(options, db_dir);
-		ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-		auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
+			auto db_result = prism::DB::Open(options, db_dir);
+			ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
+			auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
 
-		prism::ThreadPoolScheduler scheduler(2);
-		prism::AsyncDB async_db(scheduler, db);
+			prism::ThreadPoolScheduler scheduler(2);
+			prism::AsyncDB async_db(scheduler, db);
 
-		prism::bench::Config cfg;
-		cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
-		cfg.clients = 4;
-		cfg.workers = 2;
-		cfg.ops_per_client = 50;
-		cfg.value_size = 100;
-		cfg.inflight_per_client = 1;
-		cfg.no_latency = true;
-		cfg.prefill = 1;
+			prism::bench::Config cfg;
+			cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
+			cfg.clients = 4;
+			cfg.workers = 2;
+			cfg.ops_per_client = 50;
+			cfg.value_size = 100;
+			cfg.inflight_per_client = 1;
+			cfg.no_latency = true;
+			cfg.prefill = 1;
 
-		auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
-		prism::bench::Prefill(*db, keys, cfg.ops_per_client, cfg.value_size);
+			auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
+			prism::bench::Prefill(*db, keys, cfg.ops_per_client, cfg.value_size);
 
-		auto stats = prism::bench::RunAsyncCompactionOverlap(async_db, scheduler, cfg, keys);
+			auto stats = prism::bench::RunAsyncCompactionOverlap(async_db, scheduler, cfg, keys);
 
-		EXPECT_GT(stats.seconds, 0);
-		EXPECT_EQ(stats.max_client_inflight, 1);
+			EXPECT_GT(stats.seconds, 0);
+			EXPECT_EQ(stats.max_client_inflight, 1);
+		}
 
 		std::filesystem::remove_all(db_dir);
 	}
@@ -274,34 +276,36 @@ namespace
 	TEST(KVBenchAsyncMatrixTest, CompactionOverlapReportsBackgroundEvidence)
 	{
 		std::string db_dir = MakeTestDir();
-		prism::Options options;
-		options.create_if_missing = true;
-		options.write_buffer_size = 4 * 1024;
+		{
+			prism::Options options;
+			options.create_if_missing = true;
+			options.write_buffer_size = 4 * 1024;
 
-		auto db_result = prism::DB::Open(options, db_dir);
-		ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-		auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
+			auto db_result = prism::DB::Open(options, db_dir);
+			ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
+			auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
 
-		prism::ThreadPoolScheduler scheduler(2);
-		prism::AsyncDB async_db(scheduler, db);
+			prism::ThreadPoolScheduler scheduler(2);
+			prism::AsyncDB async_db(scheduler, db);
 
-		prism::bench::Config cfg;
-		cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
-		cfg.clients = 4;
-		cfg.workers = 2;
-		cfg.ops_per_client = 50;
-		cfg.value_size = 100;
-		cfg.inflight_per_client = 1;
-		cfg.no_latency = true;
-		cfg.prefill = 1;
+			prism::bench::Config cfg;
+			cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
+			cfg.clients = 4;
+			cfg.workers = 2;
+			cfg.ops_per_client = 50;
+			cfg.value_size = 100;
+			cfg.inflight_per_client = 1;
+			cfg.no_latency = true;
+			cfg.prefill = 1;
 
-		auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
-		prism::bench::Prefill(*db, keys, cfg.ops_per_client, cfg.value_size);
+			auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
+			prism::bench::Prefill(*db, keys, cfg.ops_per_client, cfg.value_size);
 
-		auto stats = prism::bench::RunAsyncCompactionOverlap(async_db, scheduler, cfg, keys);
+			auto stats = prism::bench::RunAsyncCompactionOverlap(async_db, scheduler, cfg, keys);
 
-		EXPECT_GE(stats.bg_scheduled, 0);
-		EXPECT_GE(stats.bg_sleeps, 0);
+			EXPECT_GE(stats.bg_scheduled, 0);
+			EXPECT_GE(stats.bg_sleeps, 0);
+		}
 
 		std::filesystem::remove_all(db_dir);
 	}
