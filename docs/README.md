@@ -82,9 +82,6 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
 - [X]  **Version & VersionSet** - MANIFEST-based metadata + recovery
 - [X]  **Compaction** - Background merging (multi-level)
 
-- [ ]  **Version & VersionSet** - MANIFEST-based metadata + recovery
-- [ ]  **Compaction** - Background merging (multi-level)
-
 ### 📋 Planned
 
 - [ ]  **Sharded cache** - Concurrent cache implementation

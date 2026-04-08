@@ -31,7 +31,7 @@ namespace prism
 	{
 	}
 
-	MemTable::~MemTable() { assert(refs_ == 0); }
+	MemTable::~MemTable() { assert(refs_.load(std::memory_order_acquire) == 0); }
 
 	class MemTableIterator: public Iterator
 	{

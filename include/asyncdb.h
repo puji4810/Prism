@@ -32,9 +32,6 @@ namespace prism
 	// - DB instance is protected by its internal shared_mutex.
 	// - Multiple concurrent async operations are safe.
 	// - Scheduler manages thread pool lifetime. Must outlive all awaiting AsyncOps.
-	// - DB instance is protected by its internal shared_mutex
-	// - Multiple concurrent async operations are safe
-	// - Scheduler manages thread pool lifetime
 	class AsyncDB
 	{
 	public:

@@ -1674,9 +1674,13 @@ namespace prism
 		{
 			return std::unexpected(s);
 		}
-		if (!value.empty())
+		if (done)
 		{
-			return value;
+			if (s.ok())
+			{
+				return value;
+			}
+			return std::unexpected(s);
 		}
 		return std::unexpected(Status::NotFound(Slice()));
 	}

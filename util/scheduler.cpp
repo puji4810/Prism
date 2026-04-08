@@ -152,6 +152,10 @@ namespace prism
 
 	void ThreadPoolScheduler::SubmitIn(Context ctx, Job job)
 	{
+		// Debug-only guard: external-thread submission after shutdown is unsupported.
+		// Worker re-entrant submissions during shutdown are supported and drained.
+		assert(!IsExitRequested() || (t_current_scheduler == this));
+
 		// Only honor affinity if the context belongs to this scheduler instance.
 		if (ctx.scheduler_ == this)
 		{

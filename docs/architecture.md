@@ -106,7 +106,6 @@ sequenceDiagram
 ## Recovery Path
 
 The recovery process restores the database state by replaying the Write-Ahead Log (WAL) into a new MemTable. This process is triggered automatically during `DB::Open()`.
-,
 ```mermaid
 flowchart TD
     Start([DB::Open]) --> OpenWAL[Open WAL File]
@@ -128,16 +127,13 @@ flowchart TD
 ### MemTable
 
 **Purpose:** The MemTable serves as the primary in-memory buffer for all incoming writes. It provides sorted storage, which facilitates fast range scans and eventual flushing to sorted SSTables.
-,
 **Implementation:**
 - **SkipList**: A probabilistic data structure that provides O(log N) search and insertion while being simpler to implement than balanced trees.
 - **Arena Allocator**: A custom memory pool that minimizes allocation overhead and improves cache locality by allocating large blocks and using bump-pointers.
 - **InternalKey**: Keys are encoded with their sequence number and type (Value/Deletion) to support MVCC. Refer to **[Database Format](dbformat.md)** for encoding details.
-,
 **Performance Insights:**
 - Writes are O(log N) due to the SkipList structure. Since all memory is allocated from the Arena, there is zero `malloc` overhead on the critical write path.
 - Once a MemTable reaches a certain size (e.g., 4MB), it is converted to an **Immutable MemTable** and a new active MemTable is created. This allows background flushing to disk without blocking incoming writes.
-,
 **State transitions:**
 ```mermaid
 stateDiagram-v2
@@ -229,7 +225,6 @@ Record := checksum | length | type | data
 ## Memory Management Hierarchy
 
 Prism uses a hierarchical memory ownership model centered around the `Arena` allocator. This design ensures fast allocation and simplifies object lifetime management by tying the memory's lifecycle to the `MemTable`.
-,
 ```mermaid
 flowchart TD
     DBImpl --> Mem[MemTable - active]
@@ -240,7 +235,6 @@ flowchart TD
     ArenaB --> BlocksB[4KB Memory Blocks] -- contains --> NodesB[SkipList Nodes]
     DBImpl --> LogW[LogWriter] --> File[WAL File Handle]
 ```
-,
 **Why this matters:**
 - **MemTable**: Reference counted (`Ref()`/`Unref()`). This is crucial because a MemTable might be accessed by both the foreground write thread and a background flush thread.
 - **Arena**: Owned exclusively by its `MemTable`. When the MemTable's reference count reaches zero, the Arena is destroyed, instantly freeing all associated memory blocks without individual `free()` calls.
@@ -287,9 +281,7 @@ flowchart TD
 ---
 
 ## Comparator Hierarchy
-,
 Comparators define the sort order of keys within Prism. Since Prism stores multiple versions of the same user key, the comparison logic must handle both user-defined ordering and internal metadata (sequence numbers).
-,
 ```mermaid
 flowchart BT
     UC[User Comparator] -- "1. Compare User Keys (ASC)" --> IK[InternalKeyComparator]
@@ -298,7 +290,6 @@ flowchart BT
     IK --> KC[MemTable KeyComparator]
     KC -- "Decode length-prefixed keys" --> KC
 ```
-,
 **Why this matters:**
 1. **User Key (ASC)**: Primary sort by the actual key provided by the user. This ensures that the user's data is ordered correctly for range scans.
 2. **Sequence Number (DESC)**: Secondary sort. Higher sequence numbers (newer versions) come *before* lower ones. This allows `Seek(user_key)` to land directly on the most recent version.
