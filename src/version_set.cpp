@@ -677,7 +677,7 @@ namespace prism
 		AppendVersion(recovered);
 
 		manifest_file_number_ = manifest_number;
-		next_file_number_ = next_file + 1;
+		next_file_number_ = next_file;
 		last_sequence_ = last_sequence;
 		log_number_ = log_number;
 		prev_log_number_ = prev_log_number;

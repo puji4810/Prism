@@ -249,7 +249,11 @@ namespace prism
 				// Try direct dispatch to idle worker; fallback to priority queue if all busy
 				if (!TryDispatch(task.job))
 				{
-					Submit(std::move(task.job), kLazyFallbackPriority);
+					{
+						std::lock_guard priority_lock(priority_mutex_);
+						priority_queue_.push(PriorityTask{ std::move(task.job), kLazyFallbackPriority });
+					}
+					priority_waiter_.release();
 				}
 			}
 			else
