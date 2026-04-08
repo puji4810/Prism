@@ -1,816 +1,32 @@
+#include "kv_bench_lib.h"
+
 #include "asyncdb.h"
+#include "bench_env_wrapper.h"
 #include "db.h"
 #include "scheduler.h"
 
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
 #include <cstdio>
-#include <exception>
 #include <filesystem>
-#include <optional>
-#include <random>
+#include <memory>
 #include <semaphore>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <thread>
-#include <utility>
-#include <vector>
 
 #include <unistd.h>
 
 namespace prism::bench
 {
-	using Clock = std::chrono::steady_clock;
-
-	static uint64_t NowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
-
-	static std::string MakeTempDir(std::string_view tag)
+	static void RunSyncBenchmark(const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
-		const auto base = std::filesystem::temp_directory_path();
-		const auto pid = static_cast<unsigned long>(::getpid());
-		const auto t = static_cast<unsigned long long>(NowNs());
-		std::string name;
-		name.reserve(128);
-		name.append("prism_");
-		name.append(tag);
-		name.push_back('_');
-		name.append(std::to_string(pid));
-		name.push_back('_');
-		name.append(std::to_string(t));
-		auto dir = base / name;
-		(void)std::filesystem::create_directories(dir);
-		return dir.string();
-	}
-
-	static std::string MakeValue(std::size_t n)
-	{
-		std::string v;
-		v.resize(n);
-		std::fill(v.begin(), v.end(), 'v');
-		return v;
-	}
-
-	static std::string MakeKey(int worker, std::size_t i)
-	{
-		char buf[64];
-		const int n = std::snprintf(buf, sizeof(buf), "k_%d_%zu", worker, i);
-		return std::string(buf, static_cast<std::size_t>(n));
-	}
-
-	static std::vector<std::vector<std::string>> MakeKeys(int clients, std::size_t ops_per_client)
-	{
-		std::vector<std::vector<std::string>> keys;
-		keys.resize(static_cast<std::size_t>(clients));
-		for (int t = 0; t < clients; ++t)
+		if (cfg.mode == BenchMode::kSstReadPipeline)
 		{
-			auto& v = keys[static_cast<std::size_t>(t)];
-			v.reserve(ops_per_client);
-			for (std::size_t i = 0; i < ops_per_client; ++i)
-			{
-				v.push_back(MakeKey(t, i));
-			}
+			std::fprintf(stderr, "error: sst_read_pipeline benchmark is async-only. Use --async instead of --sync.\n");
+			exit(1);
 		}
-		return keys;
-	}
-
-	struct StartGate
-	{
-		struct Awaiter
+		if (cfg.mode == BenchMode::kCompactionOverlap)
 		{
-			StartGate* gate;
-
-			bool await_ready() const noexcept { return gate->open.load(std::memory_order_acquire); }
-
-			bool await_suspend(std::coroutine_handle<> handle)
-			{
-				if (gate->open.load(std::memory_order_acquire))
-				{
-					return false;
-				}
-				std::lock_guard lock(gate->mutex);
-				if (gate->open.load(std::memory_order_relaxed))
-				{
-					return false;
-				}
-				gate->waiters.push_back(handle);
-				return true;
-			}
-
-			void await_resume() const noexcept {}
-		};
-
-		Awaiter operator co_await() noexcept { return Awaiter{ this }; }
-
-		void Open(ThreadPoolScheduler& scheduler)
-		{
-			std::vector<std::coroutine_handle<>> to_resume;
-			{
-				std::lock_guard lock(mutex);
-				open.store(true, std::memory_order_release);
-				to_resume.swap(waiters);
-			}
-			for (auto h : to_resume)
-			{
-				scheduler.Submit([h] { h.resume(); });
-			}
+			std::fprintf(stderr, "error: compaction_overlap benchmark is async-only. Use --async instead of --sync.\n");
+			exit(1);
 		}
 
-		std::mutex mutex;
-		std::vector<std::coroutine_handle<>> waiters;
-		std::atomic<bool> open{ false };
-	};
-
-	struct DoneState
-	{
-		explicit DoneState(int count)
-		    : remaining(count)
-		{
-		}
-
-		void NotifyDone()
-		{
-			if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
-			{
-				done.release();
-			}
-		}
-
-		std::binary_semaphore done{ 0 };
-		std::atomic<int> remaining;
-		std::exception_ptr exception;
-	};
-
-	struct Detached
-	{
-		struct promise_type
-		{
-			Detached get_return_object() noexcept { return {}; }
-			std::suspend_never initial_suspend() noexcept { return {}; }
-			std::suspend_never final_suspend() noexcept { return {}; }
-			void return_void() noexcept {}
-			void unhandled_exception() noexcept { std::terminate(); }
-		};
-	};
-
-	enum class BenchMode
-	{
-		kMixed,
-		kDiskRead
-	};
-
-	struct Config
-	{
-		int clients = 4;
-		int workers = 4;
-		std::size_t ops_per_client = 10000;
-		std::size_t value_size = 100;
-		int read_ratio = 0;
-		int rounds = 3;
-		BenchMode mode = BenchMode::kMixed;
-		std::size_t write_buffer_size = 4 * 1024 * 1024;
-		bool do_sync = true;
-		bool do_async = true;
-		int inflight_per_client = 1;
-		int warmup_rounds = 0;
-		bool no_latency = false;
-		int prefill = -1; // -1=auto, 0=off, 1=force
-		std::string db_dir = "";
-		bool keep_db = false;
-	};
-
-	struct Stats
-	{
-		double seconds = 0;
-		std::vector<uint64_t> latency_ns;
-		std::size_t max_inflight_observed = 0;
-	};
-
-	static uint64_t PercentileNs(std::vector<uint64_t> v, double p)
-	{
-		if (v.empty())
-		{
-			return 0;
-		}
-		std::sort(v.begin(), v.end());
-		const std::size_t idx = static_cast<std::size_t>(p * static_cast<double>(v.size() - 1));
-		return v[idx];
-	}
-
-	static void Prefill(DB& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size)
-	{
-		const std::string value = MakeValue(value_size);
-		for (std::size_t t = 0; t < keys.size(); ++t)
-		{
-			for (std::size_t i = 0; i < ops_per_client; ++i)
-			{
-				Status s = db.Put(WriteOptions(), Slice(keys[t][i]), Slice(value));
-				if (!s.ok())
-				{
-					throw std::runtime_error(s.ToString());
-				}
-			}
-		}
-	}
-
-	static Stats RunSyncMixed(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
-	{
-		Stats out;
-		if (!cfg.no_latency)
-		{
-			out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
-		}
-
-		std::atomic<bool> start{ false };
-		std::atomic<int> ready_count{ 0 };
-		std::atomic<bool> all_ready{ false };
-		std::atomic<uint64_t> start_ns{ 0 };
-		std::atomic<uint64_t> sink{ 0 };
-
-		std::mutex lat_mutex;
-
-		std::vector<std::thread> threads;
-		threads.reserve(cfg.clients);
-
-		const std::string value = MakeValue(cfg.value_size);
-
-		for (int t = 0; t < cfg.clients; ++t)
-		{
-			threads.emplace_back([&, t] {
-				std::mt19937_64 rng(static_cast<uint64_t>(t + 1));
-				std::vector<uint64_t> local_lat;
-				if (!cfg.no_latency)
-				{
-					local_lat.reserve(cfg.ops_per_client);
-				}
-				uint64_t local_sink = 0;
-
-				const int prev_ready = ready_count.fetch_add(1, std::memory_order_acq_rel);
-				if (prev_ready + 1 == cfg.clients)
-				{
-					all_ready.store(true, std::memory_order_release);
-				}
-
-				while (!start.load(std::memory_order_acquire))
-				{
-					std::this_thread::yield();
-				}
-
-				for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
-				{
-					const bool do_read = (cfg.read_ratio > 0) && (static_cast<int>(rng() % 100) < cfg.read_ratio);
-					const uint64_t begin = NowNs();
-					if (do_read)
-					{
-						auto r = db.Get(ReadOptions(), Slice(keys[static_cast<std::size_t>(t)][i]));
-						if (r.has_value())
-						{
-							local_sink += r.value().size();
-						}
-					}
-					else
-					{
-						Status s = db.Put(WriteOptions(), Slice(keys[static_cast<std::size_t>(t)][i]), Slice(value));
-						if (s.ok())
-						{
-							local_sink += 1;
-						}
-					}
-					const uint64_t end = NowNs();
-					if (!cfg.no_latency)
-					{
-						local_lat.push_back(end - begin);
-					}
-				}
-
-				(void)sink.fetch_add(local_sink, std::memory_order_relaxed);
-				if (!cfg.no_latency)
-				{
-					std::lock_guard lock(lat_mutex);
-					auto it = out.latency_ns.insert(out.latency_ns.end(), local_lat.begin(), local_lat.end());
-					if (it == out.latency_ns.end())
-					{
-						std::terminate();
-					}
-				}
-			});
-		}
-
-		while (!all_ready.load(std::memory_order_acquire))
-		{
-			std::this_thread::yield();
-		}
-
-		start_ns.store(NowNs(), std::memory_order_release);
-		start.store(true, std::memory_order_release);
-
-		for (auto& th : threads)
-		{
-			th.join();
-		}
-
-		(void)sink.load(std::memory_order_relaxed);
-		const uint64_t end_ns = NowNs();
-
-		const uint64_t begin_ns = start_ns.load(std::memory_order_acquire);
-		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		return out;
-	}
-
-	static Stats RunSyncDiskRead(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
-	{
-		Stats out;
-		if (!cfg.no_latency)
-		{
-			out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
-		}
-
-		std::atomic<bool> start{ false };
-		std::atomic<int> ready_count{ 0 };
-		std::atomic<bool> all_ready{ false };
-		std::atomic<uint64_t> start_ns{ 0 };
-		std::atomic<uint64_t> sink{ 0 };
-
-		std::mutex lat_mutex;
-		std::vector<std::thread> threads;
-		threads.reserve(cfg.clients);
-
-		for (int t = 0; t < cfg.clients; ++t)
-		{
-			threads.emplace_back([&, t] {
-				std::vector<uint64_t> local_lat;
-				if (!cfg.no_latency)
-				{
-					local_lat.reserve(cfg.ops_per_client);
-				}
-				uint64_t local_sink = 0;
-				const int prev_ready = ready_count.fetch_add(1, std::memory_order_acq_rel);
-				if (prev_ready + 1 == cfg.clients)
-				{
-					all_ready.store(true, std::memory_order_release);
-				}
-
-				while (!start.load(std::memory_order_acquire))
-				{
-					std::this_thread::yield();
-				}
-
-				for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
-				{
-					const uint64_t begin = NowNs();
-					auto r = db.Get(ReadOptions(), Slice(keys[static_cast<std::size_t>(t)][i]));
-					if (r.has_value())
-					{
-						local_sink += r.value().size();
-					}
-					const uint64_t end = NowNs();
-					if (!cfg.no_latency)
-					{
-						local_lat.push_back(end - begin);
-					}
-				}
-
-				(void)sink.fetch_add(local_sink, std::memory_order_relaxed);
-				if (!cfg.no_latency)
-				{
-					std::lock_guard lock(lat_mutex);
-					auto it = out.latency_ns.insert(out.latency_ns.end(), local_lat.begin(), local_lat.end());
-					if (it == out.latency_ns.end())
-					{
-						std::terminate();
-					}
-				}
-			});
-		}
-
-		while (!all_ready.load(std::memory_order_acquire))
-		{
-			std::this_thread::yield();
-		}
-
-		start_ns.store(NowNs(), std::memory_order_release);
-		start.store(true, std::memory_order_release);
-
-		for (auto& th : threads)
-		{
-			th.join();
-		}
-
-		(void)sink.load(std::memory_order_relaxed);
-		const uint64_t end_ns = NowNs();
-		const uint64_t begin_ns = start_ns.load(std::memory_order_acquire);
-		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		return out;
-	}
-
-	static Detached RunAsyncMixedWorker(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int id, std::string value, std::vector<uint64_t>& lat,
-	    std::atomic<std::size_t>& inflight_counter, std::atomic<std::size_t>& max_inflight_observed)
-	{
-		try
-		{
-			std::mt19937_64 rng(static_cast<uint64_t>(id + 1));
-			co_await gate;
-			if (!cfg.no_latency)
-			{
-				lat.reserve(cfg.ops_per_client);
-			}
-			for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
-			{
-				const bool do_read = (cfg.read_ratio > 0) && (static_cast<int>(rng() % 100) < cfg.read_ratio);
-				const uint64_t begin = NowNs();
-				// Track inflight
-				const std::size_t cur = inflight_counter.fetch_add(1, std::memory_order_relaxed) + 1;
-				// CAS loop to update max_inflight_observed
-				std::size_t observed = max_inflight_observed.load(std::memory_order_relaxed);
-				while (cur > observed)
-				{
-					if (max_inflight_observed.compare_exchange_weak(observed, cur, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
-				if (do_read)
-				{
-					(void)co_await db.GetAsync(ReadOptions(), keys[static_cast<std::size_t>(id)][i]);
-				}
-				else
-				{
-					(void)co_await db.PutAsync(WriteOptions(), keys[static_cast<std::size_t>(id)][i], value);
-				}
-				inflight_counter.fetch_sub(1, std::memory_order_relaxed);
-				const uint64_t end = NowNs();
-				if (!cfg.no_latency)
-				{
-					lat.push_back(end - begin);
-				}
-			}
-		}
-		catch (...)
-		{
-			done.exception = std::current_exception();
-		}
-		done.NotifyDone();
-		co_return;
-	}
-
-	static Detached RunAsyncDiskReadWorker(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int id, std::vector<uint64_t>& lat, std::atomic<std::size_t>& inflight_counter,
-	    std::atomic<std::size_t>& max_inflight_observed)
-	{
-		try
-		{
-			co_await gate;
-			if (!cfg.no_latency)
-			{
-				lat.reserve(cfg.ops_per_client);
-			}
-			for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
-			{
-				const uint64_t begin = NowNs();
-				// Track inflight
-				const std::size_t cur = inflight_counter.fetch_add(1, std::memory_order_relaxed) + 1;
-				// CAS loop to update max_inflight_observed
-				std::size_t observed = max_inflight_observed.load(std::memory_order_relaxed);
-				while (cur > observed)
-				{
-					if (max_inflight_observed.compare_exchange_weak(observed, cur, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
-				(void)co_await db.GetAsync(ReadOptions(), keys[static_cast<std::size_t>(id)][i]);
-				inflight_counter.fetch_sub(1, std::memory_order_relaxed);
-				const uint64_t end = NowNs();
-				if (!cfg.no_latency)
-				{
-					lat.push_back(end - begin);
-				}
-			}
-		}
-		catch (...)
-		{
-			done.exception = std::current_exception();
-		}
-		done.NotifyDone();
-		co_return;
-	}
-
-	static Stats RunAsyncMixed(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
-	{
-		Stats out;
-		StartGate gate;
-		DoneState done(cfg.clients);
-		std::vector<std::vector<uint64_t>> lat;
-		lat.resize(static_cast<std::size_t>(cfg.clients));
-		const std::string value = MakeValue(cfg.value_size);
-		std::atomic<std::size_t> inflight_counter{ 0 };
-		std::atomic<std::size_t> max_inflight{ 0 };
-
-		for (int t = 0; t < cfg.clients; ++t)
-		{
-			RunAsyncMixedWorker(db, gate, done, cfg, keys, t, value, lat[static_cast<std::size_t>(t)], inflight_counter, max_inflight);
-		}
-
-		const uint64_t begin_ns = NowNs();
-		gate.Open(scheduler);
-		done.done.acquire();
-		const uint64_t end_ns = NowNs();
-
-		if (done.exception)
-		{
-			std::rethrow_exception(done.exception);
-		}
-
-		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		out.max_inflight_observed = max_inflight.load(std::memory_order_relaxed);
-		if (!cfg.no_latency)
-		{
-			out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
-			for (auto& v : lat)
-			{
-				out.latency_ns.insert(out.latency_ns.end(), v.begin(), v.end());
-			}
-		}
-		return out;
-	}
-
-	static Stats RunAsyncDiskRead(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
-	{
-		Stats out;
-		StartGate gate;
-		DoneState done(cfg.clients);
-		std::vector<std::vector<uint64_t>> lat;
-		lat.resize(static_cast<std::size_t>(cfg.clients));
-		std::atomic<std::size_t> inflight_counter{ 0 };
-		std::atomic<std::size_t> max_inflight{ 0 };
-
-		for (int t = 0; t < cfg.clients; ++t)
-		{
-			RunAsyncDiskReadWorker(db, gate, done, cfg, keys, t, lat[static_cast<std::size_t>(t)], inflight_counter, max_inflight);
-		}
-
-		const uint64_t begin_ns = NowNs();
-		gate.Open(scheduler);
-		done.done.acquire();
-		const uint64_t end_ns = NowNs();
-
-		if (done.exception)
-		{
-			std::rethrow_exception(done.exception);
-		}
-
-		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		out.max_inflight_observed = max_inflight.load(std::memory_order_relaxed);
-		if (!cfg.no_latency)
-		{
-			out.latency_ns.reserve(static_cast<std::size_t>(cfg.clients) * cfg.ops_per_client);
-			for (auto& v : lat)
-			{
-				out.latency_ns.insert(out.latency_ns.end(), v.begin(), v.end());
-			}
-		}
-		return out;
-	}
-
-	static void PrintLine(std::string_view name, const Config& cfg, int round, const Stats& stats, std::size_t max_inflight = 0)
-	{
-		const double total_ops = static_cast<double>(cfg.clients) * static_cast<double>(cfg.ops_per_client);
-		const double ops_per_sec = total_ops / stats.seconds;
-		if (cfg.no_latency)
-		{
-			if (max_inflight > 0)
-			{
-				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f max_inflight=%zu\n",
-				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
-				    stats.seconds, ops_per_sec, max_inflight);
-			}
-			else
-			{
-				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f\n",
-				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
-				    stats.seconds, ops_per_sec);
-			}
-		}
-		else
-		{
-			const uint64_t p50_ns = PercentileNs(stats.latency_ns, 0.50);
-			const uint64_t p95_ns = PercentileNs(stats.latency_ns, 0.95);
-			if (max_inflight > 0)
-			{
-				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f max_inflight=%zu "
-				            "p50_us=%.2f p95_us=%.2f\n",
-				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
-				    stats.seconds, ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0);
-			}
-			else
-			{
-				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f p50_us=%.2f p95_us=%.2f\n",
-				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
-				    stats.seconds, ops_per_sec, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0);
-			}
-		}
-	}
-
-	static std::string RunName(const Config& cfg)
-	{
-		if (cfg.do_sync && cfg.do_async)
-			return "both";
-		if (cfg.do_sync)
-			return "sync";
-		return "async";
-	}
-
-	static std::string BenchName(BenchMode m) { return m == BenchMode::kMixed ? "mixed" : "disk_read"; }
-
-	static Config ParseArgs(int argc, char** argv)
-	{
-		Config cfg;
-		for (int i = 1; i < argc; ++i)
-		{
-			std::string_view arg(argv[i]);
-
-			if (arg == "--help")
-			{
-				std::printf("Usage: kv_bench [OPTIONS]\n");
-				std::printf("Options:\n");
-				std::printf("  --run=<sync|async|both>      Set run mode (default: both)\n");
-				std::printf("  --bench=<mixed|disk_read>    Set benchmark mode (default: mixed)\n");
-				std::printf("  --clients=<n>                Number of concurrent clients (default: 4)\n");
-				std::printf("  --workers=<n>                Number of worker threads (default: 4)\n");
-				std::printf("  --ops=<n>                    Operations per client (default: 10000)\n");
-				std::printf("  --value_size=<n>             Value size in bytes (default: 100)\n");
-				std::printf("  --read_ratio=<n>             Read ratio 0-100 (default: 0)\n");
-				std::printf("  --rounds=<n>                 Number of rounds (default: 3)\n");
-				std::printf("  --write_buffer_size=<n>      Write buffer size (default: 4MB)\n");
-				std::printf("  --sync                       Run only sync benchmark\n");
-				std::printf("  --async                      Run only async benchmark\n");
-				std::printf("  --inflight_per_client=<n>    Inflight ops per client (default: 1)\n");
-				std::printf("  --warmup_rounds=<n>          Warmup rounds before measurement (default: 0)\n");
-				std::printf("  --no_latency                 Skip p50/p95 latency collection (default: off)\n");
-				std::printf("  --prefill=<-1|0|1>           Prefill: -1=auto, 0=off, 1=force (default: -1)\n");
-				std::printf("  --db_dir=<path>              Use existing dir for async DB (default: temp)\n");
-				std::printf("  --keep_db=<0|1>              Keep DB dir after run (default: 0)\n");
-				std::printf("  --help                       Show this message\n");
-				exit(0);
-			}
-
-			auto parse_int = [&](std::string_view key, int& out) {
-				if (!arg.starts_with(key))
-				{
-					return;
-				}
-				out = std::stoi(std::string(arg.substr(key.size())));
-			};
-
-			auto parse_size = [&](std::string_view key, std::size_t& out) {
-				if (!arg.starts_with(key))
-				{
-					return;
-				}
-				out = static_cast<std::size_t>(std::stoull(std::string(arg.substr(key.size()))));
-			};
-
-			parse_int("--clients=", cfg.clients);
-			parse_int("--workers=", cfg.workers);
-			parse_int("--rounds=", cfg.rounds);
-			parse_size("--ops=", cfg.ops_per_client);
-			parse_size("--value_size=", cfg.value_size);
-			parse_size("--write_buffer_size=", cfg.write_buffer_size);
-			parse_int("--read_ratio=", cfg.read_ratio);
-			parse_int("--inflight_per_client=", cfg.inflight_per_client);
-			parse_int("--warmup_rounds=", cfg.warmup_rounds);
-			parse_int("--prefill=", cfg.prefill);
-
-			if (arg == "--no_latency")
-			{
-				cfg.no_latency = true;
-			}
-
-			if (arg.starts_with("--keep_db="))
-			{
-				int tmp = 0;
-				parse_int("--keep_db=", tmp);
-				cfg.keep_db = (tmp != 0);
-			}
-
-			if (arg.starts_with("--db_dir="))
-			{
-				cfg.db_dir = std::string(arg.substr(9));
-			}
-
-			if (arg == "--sync")
-			{
-				cfg.do_sync = true;
-				cfg.do_async = false;
-			}
-			if (arg == "--async")
-			{
-				cfg.do_sync = false;
-				cfg.do_async = true;
-			}
-
-			if (arg.starts_with("--run="))
-			{
-				std::string_view run_val = arg.substr(6);
-				if (run_val == "sync")
-				{
-					cfg.do_sync = true;
-					cfg.do_async = false;
-				}
-				else if (run_val == "async")
-				{
-					cfg.do_sync = false;
-					cfg.do_async = true;
-				}
-				else if (run_val == "both")
-				{
-					cfg.do_sync = true;
-					cfg.do_async = true;
-				}
-				else
-				{
-					std::fprintf(stderr, "invalid --run value: %s; allowed: sync|async|both\n", std::string(run_val).c_str());
-					exit(1);
-				}
-			}
-
-			bool bench_flag_handled = false;
-			if (arg == "--bench=mixed")
-			{
-				cfg.mode = BenchMode::kMixed;
-				bench_flag_handled = true;
-			}
-			if (arg == "--bench=disk_read")
-			{
-				cfg.mode = BenchMode::kDiskRead;
-				bench_flag_handled = true;
-			}
-
-			if (arg.starts_with("--bench=") && !bench_flag_handled)
-			{
-				std::string_view bench_val = arg.substr(8);
-				std::fprintf(
-				    stderr, "unknown --bench value: %s; allowed: mixed|disk_read; did you mean --async?\n", std::string(bench_val).c_str());
-				exit(1);
-			}
-		}
-
-		if (cfg.clients <= 0)
-		{
-			cfg.clients = 1;
-		}
-		if (cfg.workers <= 0)
-		{
-			cfg.workers = 1;
-		}
-		if (cfg.rounds <= 0)
-		{
-			cfg.rounds = 1;
-		}
-		if (cfg.read_ratio < 0)
-		{
-			cfg.read_ratio = 0;
-		}
-		if (cfg.read_ratio > 100)
-		{
-			cfg.read_ratio = 100;
-		}
-		if (cfg.inflight_per_client < 1)
-		{
-			cfg.inflight_per_client = 1;
-		}
-		if (cfg.warmup_rounds < 0)
-		{
-			cfg.warmup_rounds = 0;
-		}
-		if (cfg.prefill < -1 || cfg.prefill > 1)
-		{
-			cfg.prefill = -1;
-		}
-
-		return cfg;
-	}
-}
-
-int main(int argc, char** argv)
-{
-	using namespace prism;
-	using namespace prism::bench;
-
-	Config cfg = ParseArgs(argc, argv);
-	const auto keys = MakeKeys(cfg.clients, cfg.ops_per_client);
-
-	std::printf("config: run=%s bench=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n", RunName(cfg).c_str(),
-	    BenchName(cfg.mode).c_str(), cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio);
-	if (cfg.do_sync)
-	{
 		const std::string dir = MakeTempDir("bench_sync");
 		Options options;
 		options.create_if_missing = true;
@@ -825,7 +41,7 @@ int main(int argc, char** argv)
 		if (!db_res.has_value())
 		{
 			std::fprintf(stderr, "sync open failed: %s\n", db_res.error().ToString().c_str());
-			return 1;
+			return;
 		}
 		auto db = std::move(db_res.value());
 
@@ -843,13 +59,15 @@ int main(int argc, char** argv)
 			if (!reopened.has_value())
 			{
 				std::fprintf(stderr, "sync reopen failed: %s\n", reopened.error().ToString().c_str());
-				return 1;
+				return;
 			}
 			db = std::move(reopened.value());
 		}
 
 		std::vector<uint64_t> all_lat;
 		double total_seconds = 0;
+		std::size_t total_max_client_inflight = 0;
+		int total_write_sync = 0;
 
 		for (int r = 1; r <= cfg.rounds; ++r)
 		{
@@ -859,6 +77,11 @@ int main(int argc, char** argv)
 				stats = RunSyncDiskRead(*db, cfg, keys);
 				PrintLine("sync_disk", cfg, r, stats);
 			}
+			else if (cfg.mode == BenchMode::kDurabilityWrite)
+			{
+				stats = RunSyncDurabilityWrite(*db, cfg, keys);
+				PrintLine("sync_durability_write", cfg, r, stats);
+			}
 			else
 			{
 				stats = RunSyncMixed(*db, cfg, keys);
@@ -866,6 +89,11 @@ int main(int argc, char** argv)
 			}
 
 			total_seconds += stats.seconds;
+			if (stats.max_client_inflight > total_max_client_inflight)
+			{
+				total_max_client_inflight = stats.max_client_inflight;
+			}
+			total_write_sync = stats.write_sync;
 			if (!cfg.no_latency)
 			{
 				auto it = all_lat.insert(all_lat.end(), stats.latency_ns.begin(), stats.latency_ns.end());
@@ -879,12 +107,44 @@ int main(int argc, char** argv)
 		Stats total;
 		total.seconds = total_seconds / static_cast<double>(cfg.rounds);
 		total.latency_ns = std::move(all_lat);
-		PrintLine(cfg.mode == BenchMode::kDiskRead ? "sync_disk_total" : "sync_total", cfg, 0, total);
+		total.max_client_inflight = total_max_client_inflight;
+		total.write_sync = total_write_sync;
+		if (cfg.mode == BenchMode::kDiskRead)
+		{
+			PrintLine("sync_disk_total", cfg, 0, total);
+		}
+		else if (cfg.mode == BenchMode::kDurabilityWrite)
+		{
+			PrintLine("sync_durability_write_total", cfg, 0, total);
+		}
+		else
+		{
+			PrintLine("sync_total", cfg, 0, total);
+		}
 
 		(void)std::filesystem::remove_all(dir);
 	}
 
-	if (cfg.do_async)
+	static Detached RunAsyncOpen(AsyncDB*& out_db, ThreadPoolScheduler& scheduler, const Options& options, const std::string& dir,
+	    std::binary_semaphore& sem, std::exception_ptr& exc)
+	{
+		try
+		{
+			auto result = co_await AsyncDB::OpenAsync(scheduler, options, dir);
+			if (result.has_value())
+			{
+				out_db = result.value().release();
+			}
+		}
+		catch (...)
+		{
+			exc = std::current_exception();
+		}
+		sem.release();
+		co_return;
+	}
+
+	static void RunAsyncBenchmark(const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		const std::string dir = cfg.db_dir.empty() ? MakeTempDir("bench_async") : cfg.db_dir;
 		ThreadPoolScheduler scheduler(static_cast<std::size_t>(cfg.workers));
@@ -897,59 +157,68 @@ int main(int argc, char** argv)
 			options.write_buffer_size = std::min<std::size_t>(options.write_buffer_size, 4 * 1024);
 		}
 
-		const bool should_prefill = (cfg.prefill == 1) || (cfg.prefill == -1 && (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0));
+		BenchEnvWrapper env_wrapper(Env::Default());
+		Env* env_to_use = Env::Default();
+		if (cfg.mode == BenchMode::kCompactionOverlap)
+		{
+			env_to_use = &env_wrapper;
+			options.env = &env_wrapper;
+		}
+
+		const bool should_prefill = (cfg.mode == BenchMode::kSstReadPipeline) || (cfg.prefill == 1)
+		    || (cfg.mode == BenchMode::kCompactionOverlap)
+		    || (cfg.prefill == -1 && (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0));
 
 		if (should_prefill)
 		{
-			auto pre = DB::Open(options, dir);
+			Options prefill_options = options;
+			prefill_options.env = env_to_use;
+			auto pre = DB::Open(prefill_options, dir);
 			if (!pre.has_value())
 			{
 				std::fprintf(stderr, "async prefill open failed: %s\n", pre.error().ToString().c_str());
-				return 1;
+				return;
 			}
 			auto pre_db = std::move(pre.value());
 			Prefill(*pre_db, keys, cfg.ops_per_client, cfg.value_size);
 		}
 
 		auto open_sem = std::binary_semaphore(0);
-		std::optional<Result<std::unique_ptr<AsyncDB>>> opened;
+		AsyncDB* adb_ptr = nullptr;
 		std::exception_ptr open_exc;
-		auto open_fn = [&]() -> Detached {
-			try
-			{
-				opened = co_await AsyncDB::OpenAsync(scheduler, options, dir);
-			}
-			catch (...)
-			{
-				open_exc = std::current_exception();
-			}
-			open_sem.release();
-			co_return;
-		};
-		open_fn();
+		RunAsyncOpen(adb_ptr, scheduler, options, dir, open_sem, open_exc);
 
 		open_sem.acquire();
 		if (open_exc)
 		{
 			std::rethrow_exception(open_exc);
 		}
-		if (!opened.has_value() || !opened->has_value())
+		if (!adb_ptr)
 		{
-			const Status s = opened.has_value() ? opened->error() : Status::InvalidArgument("async open failed");
-			std::fprintf(stderr, "async open failed: %s\n", s.ToString().c_str());
-			return 1;
+			std::fprintf(stderr, "async open failed\n");
+			return;
 		}
-
-		auto adb = std::move(opened->value());
+		std::unique_ptr<AsyncDB> adb(adb_ptr);
 
 		std::printf("scheduler_threads=%zu inflight_per_client=%d\n", scheduler.WorkerCount(), cfg.inflight_per_client);
 
-		// Warmup rounds (discard stats)
 		for (int w = 0; w < cfg.warmup_rounds; ++w)
 		{
 			if (cfg.mode == BenchMode::kDiskRead)
 			{
 				(void)RunAsyncDiskRead(*adb, scheduler, cfg, keys);
+			}
+			else if (cfg.mode == BenchMode::kSstReadPipeline)
+			{
+				(void)RunAsyncSstReadPipeline(*adb, scheduler, cfg, keys);
+			}
+			else if (cfg.mode == BenchMode::kDurabilityWrite)
+			{
+				(void)RunAsyncDurabilityWrite(*adb, scheduler, cfg, keys);
+			}
+			else if (cfg.mode == BenchMode::kCompactionOverlap)
+			{
+				(void)RunAsyncCompactionOverlap(*adb, scheduler, cfg, keys);
 			}
 			else
 			{
@@ -959,14 +228,41 @@ int main(int argc, char** argv)
 
 		std::vector<uint64_t> all_lat;
 		double total_seconds = 0;
+		std::size_t total_max_inflight_observed = 0;
+		std::size_t total_max_client_inflight = 0;
+		int total_write_sync = 0;
+		int total_bg_scheduled = 0;
+		int total_bg_sleeps = 0;
 
 		for (int r = 1; r <= cfg.rounds; ++r)
 		{
+			if (cfg.mode == BenchMode::kCompactionOverlap)
+			{
+				env_wrapper.Reset();
+			}
+
 			Stats stats;
 			if (cfg.mode == BenchMode::kDiskRead)
 			{
 				stats = RunAsyncDiskRead(*adb, scheduler, cfg, keys);
 				PrintLine("async_disk", cfg, r, stats, stats.max_inflight_observed);
+			}
+			else if (cfg.mode == BenchMode::kSstReadPipeline)
+			{
+				stats = RunAsyncSstReadPipeline(*adb, scheduler, cfg, keys);
+				PrintLine("async_sst_read_pipeline", cfg, r, stats, stats.max_inflight_observed);
+			}
+			else if (cfg.mode == BenchMode::kDurabilityWrite)
+			{
+				stats = RunAsyncDurabilityWrite(*adb, scheduler, cfg, keys);
+				PrintLine("async_durability_write", cfg, r, stats, stats.max_inflight_observed);
+			}
+			else if (cfg.mode == BenchMode::kCompactionOverlap)
+			{
+				stats = RunAsyncCompactionOverlap(*adb, scheduler, cfg, keys);
+				stats.bg_scheduled = env_wrapper.ScheduledCalls();
+				stats.bg_sleeps = env_wrapper.SleepCalls();
+				PrintLine("async_compaction_overlap", cfg, r, stats, stats.max_inflight_observed);
 			}
 			else
 			{
@@ -975,6 +271,17 @@ int main(int argc, char** argv)
 			}
 
 			total_seconds += stats.seconds;
+			if (stats.max_inflight_observed > total_max_inflight_observed)
+			{
+				total_max_inflight_observed = stats.max_inflight_observed;
+			}
+			if (stats.max_client_inflight > total_max_client_inflight)
+			{
+				total_max_client_inflight = stats.max_client_inflight;
+			}
+			total_write_sync = stats.write_sync;
+			total_bg_scheduled += stats.bg_scheduled;
+			total_bg_sleeps += stats.bg_sleeps;
 			if (!cfg.no_latency)
 			{
 				auto it = all_lat.insert(all_lat.end(), stats.latency_ns.begin(), stats.latency_ns.end());
@@ -988,12 +295,59 @@ int main(int argc, char** argv)
 		Stats total;
 		total.seconds = total_seconds / static_cast<double>(cfg.rounds);
 		total.latency_ns = std::move(all_lat);
-		PrintLine(cfg.mode == BenchMode::kDiskRead ? "async_disk_total" : "async_total", cfg, 0, total);
+		total.max_inflight_observed = total_max_inflight_observed;
+		total.max_client_inflight = total_max_client_inflight;
+		total.write_sync = total_write_sync;
+		total.bg_scheduled = total_bg_scheduled;
+		total.bg_sleeps = total_bg_sleeps;
+		if (cfg.mode == BenchMode::kDiskRead)
+		{
+			PrintLine("async_disk_total", cfg, 0, total, total.max_inflight_observed);
+		}
+		else if (cfg.mode == BenchMode::kSstReadPipeline)
+		{
+			PrintLine("async_sst_read_pipeline_total", cfg, 0, total, total.max_inflight_observed);
+		}
+		else if (cfg.mode == BenchMode::kDurabilityWrite)
+		{
+			PrintLine("async_durability_write_total", cfg, 0, total, total.max_inflight_observed);
+		}
+		else if (cfg.mode == BenchMode::kCompactionOverlap)
+		{
+			PrintLine("async_compaction_overlap_total", cfg, 0, total, total.max_inflight_observed);
+		}
+		else
+		{
+			PrintLine("async_total", cfg, 0, total, total.max_inflight_observed);
+		}
 
 		if (!cfg.keep_db)
 		{
 			(void)std::filesystem::remove_all(dir);
 		}
+	}
+
+} // namespace prism::bench
+
+int main(int argc, char** argv)
+{
+	using namespace prism;
+	using namespace prism::bench;
+
+	Config cfg = ParseArgs(argc, argv);
+	const auto keys = MakeKeys(cfg.clients, cfg.ops_per_client);
+
+	std::printf("config: run=%s bench=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n", RunName(cfg).c_str(),
+	    BenchName(cfg.mode).c_str(), cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio);
+
+	if (cfg.do_sync)
+	{
+		RunSyncBenchmark(cfg, keys);
+	}
+
+	if (cfg.do_async)
+	{
+		RunAsyncBenchmark(cfg, keys);
 	}
 
 	return 0;
