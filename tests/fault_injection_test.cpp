@@ -370,9 +370,3 @@ TEST_F(FaultInjectionTest, CrashAfterManifestSyncBeforeCurrent)
 	EXPECT_FALSE(Env::Default()->FileExists(CurrentFileName(tmp_path_)));
 	EXPECT_EQ(0u, version_set.current()->files(0).size());
 }
-
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
-}

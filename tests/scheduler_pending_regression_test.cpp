@@ -231,9 +231,3 @@ TEST(SchedulerPendingRegressionTest, AffinityJobsDoNotSpuriouslyReregister)
 	}
 	ASSERT_TRUE(WaitFor(health, 10, 5s)) << "scheduler unhealthy after affinity chain";
 }
-
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
-}

@@ -49,9 +49,7 @@ TEST(SchedulerExceptionsTest, AffinityJobThrowTerminates)
 		    // throwing job back to itself via affinity.
 		    scheduler.Submit([&scheduler, &affinity_submitted]() {
 			    auto ctx = scheduler.CaptureContext();
-			    scheduler.SubmitIn(ctx, []() {
-				    throw std::logic_error("affinity contract violation");
-			    });
+			    scheduler.SubmitIn(ctx, []() { throw std::logic_error("affinity contract violation"); });
 			    affinity_submitted.release();
 		    });
 
@@ -165,9 +163,7 @@ TEST(SchedulerExceptionsTest, DrainRemainingThrowTerminates)
 			    auto ctx = scheduler.CaptureContext();
 			    // SubmitIn with a valid context calls WorkThread::Push() directly,
 			    // placing the throwing job in worker 0's local deque.
-			    scheduler.SubmitIn(ctx, []() {
-				    throw std::runtime_error("drain remaining contract violation");
-			    });
+			    scheduler.SubmitIn(ctx, []() { throw std::runtime_error("drain remaining contract violation"); });
 		    });
 		    // Destructor runs here:
 		    //   Exit() → join threads → drain loop:
@@ -182,8 +178,3 @@ TEST(SchedulerExceptionsTest, DrainRemainingThrowTerminates)
 // ---------------------------------------------------------------------------
 // GoogleTest main
 // ---------------------------------------------------------------------------
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
-}

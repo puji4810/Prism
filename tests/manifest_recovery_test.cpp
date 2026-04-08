@@ -56,7 +56,7 @@ protected:
 		fs::remove_all(db_path_, ec);
 	}
 
-	Result<std::unique_ptr<DB>> OpenDB(Options opts = {})
+	Result<std::unique_ptr<DB>> OpenDB(Options opts = { })
 	{
 		db_.reset();
 		opts.create_if_missing = true;
@@ -602,10 +602,4 @@ TEST_F(ManifestRecoveryTest, LegacyBootstrapRecoverOpenCloseIsLsanClean)
 	EXPECT_TRUE(HasManifestFile()) << "MANIFEST file should exist after legacy recovery";
 
 	// VersionSet dtor will clean up resources – LSAN verifies no leaks
-}
-
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
 }

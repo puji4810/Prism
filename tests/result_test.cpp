@@ -66,9 +66,3 @@ TEST(ResultTest, VoidOkAndError)
 	EXPECT_FALSE(err.has_value());
 	EXPECT_TRUE(err.error().IsInvalidArgument());
 }
-
-int main(int argc, char** argv)
-{
-	testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
-}

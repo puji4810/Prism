@@ -124,9 +124,3 @@ TEST_F(FilterBlockTest, MultiChunk)
 	ASSERT_TRUE(!reader.KeyMayMatch(9000, Slice("foo")));
 	ASSERT_TRUE(!reader.KeyMayMatch(9000, Slice("bar")));
 }
-
-int main()
-{
-	testing::InitGoogleTest();
-	return RUN_ALL_TESTS();
-}

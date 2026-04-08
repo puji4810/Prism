@@ -111,9 +111,3 @@ TEST(StatusTest, SelfAssignment)
 	EXPECT_TRUE(s.IsNotFound());
 	EXPECT_EQ("NotFound: test", s.ToString());
 }
-
-int main(int argc, char** argv)
-{
-	testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
-}

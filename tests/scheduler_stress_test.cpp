@@ -16,9 +16,7 @@ TEST(SchedulerStressTest, HighConcurrency)
 
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([counter]() {
-			counter->fetch_add(1, std::memory_order_relaxed);
-		}, i % 10);
+		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, i % 10);
 	}
 
 	// Poll with bounded timeout instead of sleep_for
@@ -47,9 +45,7 @@ TEST(SchedulerStressTest, AffinityTasks)
 			auto my_ctx = scheduler.CaptureContext();
 
 			// Submit affinity task - should try to execute on same thread
-			scheduler.SubmitIn(my_ctx, [counter]() {
-				counter->fetch_add(1, std::memory_order_relaxed);
-			});
+			scheduler.SubmitIn(my_ctx, [counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
 		});
 	}
 
@@ -76,15 +72,11 @@ TEST(SchedulerStressTest, MixedWorkload)
 
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([immediate]() {
-			immediate->fetch_add(1, std::memory_order_relaxed);
-		}, i % 5);
+		scheduler.Submit([immediate]() { immediate->fetch_add(1, std::memory_order_relaxed); }, i % 5);
 
 		scheduler.Submit([&scheduler, affinity]() {
 			auto ctx = scheduler.CaptureContext();
-			scheduler.SubmitIn(ctx, [affinity]() {
-				affinity->fetch_add(1, std::memory_order_relaxed);
-			});
+			scheduler.SubmitIn(ctx, [affinity]() { affinity->fetch_add(1, std::memory_order_relaxed); });
 		});
 	}
 
@@ -102,10 +94,4 @@ TEST(SchedulerStressTest, MixedWorkload)
 
 	EXPECT_EQ(immediate->load(), kNumTasks);
 	EXPECT_EQ(affinity->load(), kNumTasks);
-}
-
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
 }

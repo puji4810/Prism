@@ -44,7 +44,7 @@ namespace
 		EXPECT_TRUE(base_dir.has_value());
 		if (!base_dir.has_value())
 		{
-			return {};
+			return { };
 		}
 		return std::filesystem::path(base_dir.value()) / ("env_posix_test-" + std::to_string(env->NowMicros()));
 	}
@@ -210,10 +210,4 @@ TEST(PosixEnvTest, NowMicrosAndSleep)
 	env->SleepForMicroseconds(2000);
 	const uint64_t after = env->NowMicros();
 	EXPECT_GT(after, before);
-}
-
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
 }

@@ -158,9 +158,3 @@ TEST(FormatTest, InternalKeyDebugString)
 	InternalKey invalid_key; // empty rep_
 	EXPECT_EQ("(bad)", invalid_key.DebugString());
 }
-
-int main()
-{
-	testing::InitGoogleTest();
-	return RUN_ALL_TESTS();
-}

@@ -225,44 +225,42 @@ TEST_F(DBTest, ThreadSafeConcurrentPutGet)
 
 	for (int t = 0; t < kWriterThreads; ++t)
 	{
-		threads.emplace_back([&, t]
-		    {
-			    while (!start.load(std::memory_order_acquire))
-			    {
-			    }
-			    for (int i = 0; i < kKeysPerWriter; ++i)
-			    {
-				    ASSERT_TRUE(db->Put(key_for(t, i), value_for(t, i)).ok());
-			    }
-		    });
+		threads.emplace_back([&, t] {
+			while (!start.load(std::memory_order_acquire))
+			{
+			}
+			for (int i = 0; i < kKeysPerWriter; ++i)
+			{
+				ASSERT_TRUE(db->Put(key_for(t, i), value_for(t, i)).ok());
+			}
+		});
 	}
 
 	for (int t = 0; t < kReaderThreads; ++t)
 	{
-		threads.emplace_back([&]
-		    {
-			    while (!start.load(std::memory_order_acquire))
-			    {
-			    }
-			    while (!writers_done.load(std::memory_order_acquire))
-			    {
-				    for (int w = 0; w < kWriterThreads; ++w)
-				    {
-					    for (int i = 0; i < kKeysPerWriter; i += 17)
-					    {
-						    auto r = db->Get(key_for(w, i));
-						    if (r.has_value())
-						    {
-							    ASSERT_EQ(r.value(), value_for(w, i));
-						    }
-						    else
-						    {
-							    ASSERT_TRUE(r.error().IsNotFound()) << r.error().ToString();
-						    }
-					    }
-				    }
-			    }
-		    });
+		threads.emplace_back([&] {
+			while (!start.load(std::memory_order_acquire))
+			{
+			}
+			while (!writers_done.load(std::memory_order_acquire))
+			{
+				for (int w = 0; w < kWriterThreads; ++w)
+				{
+					for (int i = 0; i < kKeysPerWriter; i += 17)
+					{
+						auto r = db->Get(key_for(w, i));
+						if (r.has_value())
+						{
+							ASSERT_EQ(r.value(), value_for(w, i));
+						}
+						else
+						{
+							ASSERT_TRUE(r.error().IsNotFound()) << r.error().ToString();
+						}
+					}
+				}
+			}
+		});
 	}
 
 	start.store(true, std::memory_order_release);
@@ -286,10 +284,4 @@ TEST_F(DBTest, ThreadSafeConcurrentPutGet)
 			ASSERT_EQ(r.value(), value_for(w, i));
 		}
 	}
-}
-
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
 }

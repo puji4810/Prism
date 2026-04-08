@@ -105,11 +105,11 @@ TEST_F(AsyncEnvTest, ReadAtAsync)
 		std::vector<std::byte> buf(n);
 		auto file_res = co_await p_env->NewRandomAccessFileAsync(path);
 		if (!file_res.has_value())
-			co_return std::string{};
+			co_return std::string{ };
 		auto file = std::move(file_res.value());
 		auto n_res = co_await file->ReadAtAsync(0, std::span<std::byte>(buf));
 		if (!n_res.has_value() || n_res.value() == 0)
-			co_return std::string{};
+			co_return std::string{ };
 		co_return std::string(reinterpret_cast<const char*>(buf.data()), n_res.value());
 	}();
 	std::string result = task.SyncWait();
@@ -138,11 +138,11 @@ TEST_F(AsyncEnvTest, ReadAtStringAsyncExact)
 	auto task = [p_env = &async_env, path]() -> Task<std::string> {
 		auto file_res = co_await p_env->NewRandomAccessFileAsync(path);
 		if (!file_res.has_value())
-			co_return std::string{};
+			co_return std::string{ };
 		auto file = std::move(file_res.value());
 		auto read_res = co_await file->ReadAtStringAsync(0, 2);
 		if (!read_res.has_value())
-			co_return std::string{};
+			co_return std::string{ };
 		co_return read_res.value();
 	}();
 	std::string result = task.SyncWait();
@@ -172,7 +172,8 @@ TEST_F(AsyncEnvTest, AppendAfterClose)
 	auto task = [&]() -> Task<void> {
 		auto wf_res = co_await async_env.NewWritableFileAsync(path);
 		EXPECT_TRUE(wf_res.has_value()) << wf_res.error().ToString();
-		if (!wf_res.has_value()) co_return;
+		if (!wf_res.has_value())
+			co_return;
 		auto wf = std::move(wf_res.value());
 
 		auto s = co_await wf->AppendAsync("hello");
@@ -206,9 +207,10 @@ TEST_F(AsyncEnvTest, ConcurrentAppendFIFO)
 	// Each worker thread has a 'go' flag and a 'ready' flag.
 	// Main: release thread i -> wait for thread i to signal 'ready' -> release thread i+1.
 	// This ensures AppendAsync tickets are obtained in strict 0..N-1 order.
-	std::vector<std::atomic<bool>> go(kCount);		  // Signal to proceed
+	std::vector<std::atomic<bool>> go(kCount); // Signal to proceed
 	std::vector<std::atomic<bool>> ready(kCount); // Ack that AppendAsync was called
-	for (int i = 0; i < kCount; ++i) {
+	for (int i = 0; i < kCount; ++i)
+	{
 		go[i].store(false, std::memory_order_release);
 		ready[i].store(false, std::memory_order_release);
 	}
@@ -216,33 +218,37 @@ TEST_F(AsyncEnvTest, ConcurrentAppendFIFO)
 	// Launch all worker threads.
 	std::vector<std::future<Status>> futures;
 	futures.reserve(kCount);
-	for (int i = 0; i < kCount; ++i) {
+	for (int i = 0; i < kCount; ++i)
+	{
 		int slot = i;
 		futures.push_back(std::async(std::launch::async, [&async_wf, slot, &go, &ready]() -> Status {
 			// Wait until main thread signals us to go.
-			while (!go[slot].load(std::memory_order_acquire)) {
+			while (!go[slot].load(std::memory_order_acquire))
+			{
 				std::this_thread::yield();
 			}
-			
+
 			// Call AppendAsync to obtain a ticket (deterministic order guaranteed by main thread).
 			auto task = [](std::shared_ptr<AsyncWritableFile> wf, int s) -> Task<Status> {
 				co_return co_await wf->AppendAsync(std::to_string(s) + "\n");
 			}(async_wf, slot);
-			
+
 			// Signal main thread that we've entered AppendAsync (ticket obtained).
 			ready[slot].store(true, std::memory_order_release);
-			
+
 			return task.SyncWait();
 		}));
 	}
 
 	// Main thread enforces ordered submission: release thread i, wait for i to be ready, then release i+1.
-	for (int i = 0; i < kCount; ++i) {
+	for (int i = 0; i < kCount; ++i)
+	{
 		// Release thread i.
 		go[i].store(true, std::memory_order_release);
-		
+
 		// Spin-wait until thread i signals it has entered AppendAsync (obtained its ticket).
-		while (!ready[i].load(std::memory_order_acquire)) {
+		while (!ready[i].load(std::memory_order_acquire))
+		{
 			std::this_thread::yield();
 		}
 	}
@@ -255,9 +261,7 @@ TEST_F(AsyncEnvTest, ConcurrentAppendFIFO)
 	}
 
 	// Close file.
-	auto close_task = [](std::shared_ptr<AsyncWritableFile> wf) -> Task<Status> {
-		co_return co_await wf->CloseAsync();
-	}(async_wf);
+	auto close_task = [](std::shared_ptr<AsyncWritableFile> wf) -> Task<Status> { co_return co_await wf->CloseAsync(); }(async_wf);
 	auto cs = close_task.SyncWait();
 	EXPECT_TRUE(cs.ok()) << cs.ToString();
 
@@ -325,16 +329,13 @@ TEST_F(AsyncEnvTest, CloseInterleaving)
 	// Issue CloseAsync and AppendAsync concurrently from two threads.
 	// Both get tickets under the mutex — whichever ran first determines the outcome.
 	auto close_future = std::async(std::launch::async, [&async_wf]() -> Status {
-		auto task = [](std::shared_ptr<AsyncWritableFile> wf) -> Task<Status> {
-			co_return co_await wf->CloseAsync();
-		}(async_wf);
+		auto task = [](std::shared_ptr<AsyncWritableFile> wf) -> Task<Status> { co_return co_await wf->CloseAsync(); }(async_wf);
 		return task.SyncWait();
 	});
 
 	auto append_future = std::async(std::launch::async, [&async_wf]() -> Status {
-		auto task = [](std::shared_ptr<AsyncWritableFile> wf) -> Task<Status> {
-			co_return co_await wf->AppendAsync("interleaved");
-		}(async_wf);
+		auto task
+		    = [](std::shared_ptr<AsyncWritableFile> wf) -> Task<Status> { co_return co_await wf->AppendAsync("interleaved"); }(async_wf);
 		return task.SyncWait();
 	});
 
@@ -347,10 +348,4 @@ TEST_F(AsyncEnvTest, CloseInterleaving)
 	// Append either succeeded (ticket before close) or returned IOError (ticket after close).
 	bool ok_or_error = append_status.ok() || append_status.IsIOError();
 	EXPECT_TRUE(ok_or_error) << "Unexpected append status: " << append_status.ToString();
-}
-
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
 }

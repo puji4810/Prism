@@ -212,9 +212,3 @@ TEST(CodingTest, Strings)
 	EXPECT_EQ(std::string(200, 'x'), v.ToString());
 	EXPECT_EQ("", input.ToString());
 }
-
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
-}

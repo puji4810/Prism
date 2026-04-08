@@ -210,12 +210,3 @@ TEST(SchedulerShutdownTest, LateSubmissionsDuringShutdown)
 	EXPECT_EQ(outer_counter->load(), kOuter) << "Outer tasks were dropped";
 	EXPECT_EQ(inner_counter->load(), kOuter) << "Inner (late-submitted) tasks were dropped on shutdown";
 }
-
-// ---------------------------------------------------------------------------
-// GoogleTest main
-// ---------------------------------------------------------------------------
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
-}

@@ -321,9 +321,3 @@ TEST(TableTest, BlockCacheFillAndBypass)
 	delete table;
 	std::filesystem::remove(fname);
 }
-
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
-}

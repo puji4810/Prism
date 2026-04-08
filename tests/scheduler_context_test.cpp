@@ -193,10 +193,3 @@ TEST(SchedulerContextTest, ContextsDoNotCrossValidate)
 	EXPECT_TRUE(PollUntil([&] { return ran.load(std::memory_order_acquire); }))
 	    << "Cross-scheduler SubmitIn must still execute the job via fallback";
 }
-
-// ---------------------------------------------------------------------------
-int main(int argc, char** argv)
-{
-	::testing::InitGoogleTest(&argc, argv);
-	return RUN_ALL_TESTS();
-}
