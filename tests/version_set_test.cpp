@@ -200,13 +200,13 @@ namespace prism
 		// This tests the boundary condition - files[i-1].largest must be < files[i].smallest
 		CreateFile(1, "100", 100, "300", 100);
 		CreateFile(2, "300", 100, "400", 100); // Shares same key "300" with file 1's largest
-		// This should trigger an assert in CheckLevelInvariant due to >= comparison
-		// We use EXPECT_DEATH to verify the assertion happens
-		#if DEBUG
+// This should trigger an assert in CheckLevelInvariant due to >= comparison
+// We use EXPECT_DEATH to verify the assertion happens
+#if DEBUG
 		EXPECT_DEATH({ CheckLevelInvariant(icmp_, files_); }, "");
-		#else
+#else
 		std::fprintf(stderr, "This test should run in debug mode\n");
-		#endif
+#endif
 	}
 
 	TEST_F(VersionSetTest, FinalizeUsesFileCountForLevelZero)

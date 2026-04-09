@@ -31,9 +31,8 @@ namespace prism
 	AsyncOp<Status> AsyncDB::PutAsync(const WriteOptions& options, std::string key, std::string value)
 	{
 		auto db = db_;
-		return AsyncOp<Status>(*scheduler_, [db, opts = options, key = std::move(key), value = std::move(value)]() {
-			return db->Put(opts, Slice(key), Slice(value));
-		});
+		return AsyncOp<Status>(*scheduler_,
+		    [db, opts = options, key = std::move(key), value = std::move(value)]() { return db->Put(opts, Slice(key), Slice(value)); });
 	}
 
 	AsyncOp<Result<std::string>> AsyncDB::GetAsync(const ReadOptions& options, std::string key)

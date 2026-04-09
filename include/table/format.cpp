@@ -69,7 +69,7 @@ namespace prism
 
 	Status ReadBlock(RandomAccessFile* file, const ReadOptions& options, const BlockHandle& handle, BlockContents* result)
 	{
-		result->data = Slice{};
+		result->data = Slice{ };
 		result->cachable = false;
 		result->heap_allocated = false;
 

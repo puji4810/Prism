@@ -389,7 +389,7 @@ namespace prism
 			}
 		}
 
-		~ShardedLRUCache() override {}
+		~ShardedLRUCache() override { }
 
 		Handle* Insert(const Slice& key, void* value, size_t charge, LRUHandle::Deleter deleter) override
 		{

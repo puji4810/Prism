@@ -31,9 +31,9 @@ namespace prism
 	{
 		if (t_current_scheduler == this)
 			return Context(this, t_current_worker_index);
-		return Context{};
+		return Context{ };
 	}
-	
+
 	ThreadPoolScheduler::ThreadPoolScheduler(std::size_t num_threads)
 	    : work_threads_(DefaultThreadCount(num_threads))
 	{
@@ -83,8 +83,14 @@ namespace prism
 			{
 				auto task = lazy_queue_.top();
 				lazy_queue_.pop();
-				try { task.job(); }
-				catch (...) { std::terminate(); }
+				try
+				{
+					task.job();
+				}
+				catch (...)
+				{
+					std::terminate();
+				}
 				work_remains = true;
 			}
 
@@ -93,8 +99,14 @@ namespace prism
 			{
 				auto job = std::move(const_cast<Job&>(priority_queue_.top().job));
 				priority_queue_.pop();
-				try { job(); }
-				catch (...) { std::terminate(); }
+				try
+				{
+					job();
+				}
+				catch (...)
+				{
+					std::terminate();
+				}
 				work_remains = true;
 			}
 
@@ -168,11 +180,9 @@ namespace prism
 		// Debug-only mismatch trace: helps diagnose misrouted affinity submissions.
 #ifndef NDEBUG
 		std::fprintf(stderr,
-			"[prism::scheduler] SubmitIn context mismatch: this=%p ctx.scheduler_=%p ctx.worker_index_=%zu."
-			" Falling back to Submit().\n",
-			static_cast<const void*>(this),
-			static_cast<const void*>(ctx.scheduler_),
-			ctx.worker_index_);
+		    "[prism::scheduler] SubmitIn context mismatch: this=%p ctx.scheduler_=%p ctx.worker_index_=%zu."
+		    " Falling back to Submit().\n",
+		    static_cast<const void*>(this), static_cast<const void*>(ctx.scheduler_), ctx.worker_index_);
 #endif
 		Submit(std::move(job));
 	}
@@ -291,8 +301,14 @@ namespace prism
 		{
 			auto job = std::move(queue_.front().job);
 			queue_.pop_front();
-			try { job(); }
-			catch (...) { std::terminate(); }
+			try
+			{
+				job();
+			}
+			catch (...)
+			{
+				std::terminate();
+			}
 			did_work = true;
 		}
 		return did_work;
@@ -347,8 +363,14 @@ namespace prism
 				queue_empty_after = queue_.empty();
 			}
 
-			try { queued.job(); }
-			catch (...) { std::terminate(); }
+			try
+			{
+				queued.job();
+			}
+			catch (...)
+			{
+				std::terminate();
+			}
 
 			// Re-register as pending only when the completed job was dispatcher-owned
 			// AND the queue is now empty — ensures affinity jobs cannot flip re-registration.

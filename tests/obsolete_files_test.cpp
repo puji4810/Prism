@@ -312,8 +312,7 @@ TEST_F(ObsoleteFilesTest, VersionRefsReturnToBaselineAfterVersionTurnover)
 	// Write enough data to trigger compaction or version turnover.
 	for (int i = 0; i < 100; ++i)
 	{
-		ASSERT_TRUE(db->Put("turnover_key_" + std::to_string(i),
-		                  std::string(256, 'x')).ok());
+		ASSERT_TRUE(db->Put("turnover_key_" + std::to_string(i), std::string(256, 'x')).ok());
 	}
 
 	// Give any background operations time to settle.
@@ -321,8 +320,7 @@ TEST_F(ObsoleteFilesTest, VersionRefsReturnToBaselineAfterVersionTurnover)
 
 	// After version turnover, refs must return to baseline.
 	int refs_after = impl->TEST_CurrentVersionRefs();
-	EXPECT_EQ(refs_after, baseline)
-	    << "Version refs must return to baseline after version turnover";
+	EXPECT_EQ(refs_after, baseline) << "Version refs must return to baseline after version turnover";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,8 +337,7 @@ TEST_F(ObsoleteFilesTest, ConcurrentGetsAfterRecoveryDoNotAccumulateVersionRefs)
 		ASSERT_NE(db, nullptr);
 		for (int i = 0; i < 20; ++i)
 		{
-			ASSERT_TRUE(db->Put("recovery_key_" + std::to_string(i),
-			                  std::string(32, 'y')).ok());
+			ASSERT_TRUE(db->Put("recovery_key_" + std::to_string(i), std::string(32, 'y')).ok());
 		}
 	}
 
@@ -378,6 +375,5 @@ TEST_F(ObsoleteFilesTest, ConcurrentGetsAfterRecoveryDoNotAccumulateVersionRefs)
 
 	// Verify refs returned to baseline after concurrent Gettings completed.
 	int refs_after = impl->TEST_CurrentVersionRefs();
-	EXPECT_EQ(refs_after, baseline)
-	    << "Version refs must not accumulate after concurrent Get() calls on recovered DB";
+	EXPECT_EQ(refs_after, baseline) << "Version refs must not accumulate after concurrent Get() calls on recovered DB";
 }

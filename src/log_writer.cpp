@@ -107,8 +107,7 @@ namespace prism::log
 		assert(length <= 0xffff);
 		assert(block_offset_ + kHeaderSize + static_cast<int>(length) <= kBlockSize);
 
-		uint32_t crc = crc32c::Extend(type_crc_[static_cast<int>(type)],
-		    reinterpret_cast<const uint8_t*>(ptr), length);
+		uint32_t crc = crc32c::Extend(type_crc_[static_cast<int>(type)], reinterpret_cast<const uint8_t*>(ptr), length);
 		crc = Mask(crc);
 
 		Header header;
@@ -131,4 +130,3 @@ namespace prism::log
 		return s;
 	}
 }
-

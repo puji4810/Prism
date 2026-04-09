@@ -79,9 +79,8 @@ namespace prism
 		return true;
 	}
 
-	static Status RecoverLegacyTableBounds(
-	    Env* env, const std::string& dbname, const Options* options, const InternalKeyComparator* icmp, uint64_t file_number,
-	    uint64_t file_size, InternalKey* smallest, InternalKey* largest)
+	static Status RecoverLegacyTableBounds(Env* env, const std::string& dbname, const Options* options, const InternalKeyComparator* icmp,
+	    uint64_t file_number, uint64_t file_size, InternalKey* smallest, InternalKey* largest)
 	{
 		assert(env != nullptr);
 		assert(options != nullptr);
@@ -947,8 +946,7 @@ namespace prism
 					live->insert(file->number);
 				}
 			}
-		}
-		while ((v = v->next_) != current_);
+		} while ((v = v->next_) != current_);
 	}
 
 	struct VersionSet::Builder::BySmallestKey

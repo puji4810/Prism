@@ -71,8 +71,7 @@ namespace prism::log
 		{
 			const unsigned int record_type = ReadPhysicalRecord(&fragment);
 
-			const uint64_t physical_record_offset =
-			    end_of_buffer_offset_ - fragment.size() - kHeaderSize - buffer_.size();
+			const uint64_t physical_record_offset = end_of_buffer_offset_ - fragment.size() - kHeaderSize - buffer_.size();
 
 			if (resyncing_)
 			{
@@ -152,8 +151,7 @@ namespace prism::log
 				}
 				break;
 
-			default:
-			{
+			default: {
 				char buf[40];
 				std::snprintf(buf, sizeof(buf), "unknown record type %u", record_type);
 				ReportCorruption(fragment.size() + (in_fragmented_record ? scratch->size() : 0), buf);
@@ -165,10 +163,7 @@ namespace prism::log
 		}
 	}
 
-	void Reader::ReportCorruption(uint64_t bytes, const char* reason)
-	{
-		ReportDrop(bytes, Status::Corruption(reason));
-	}
+	void Reader::ReportCorruption(uint64_t bytes, const char* reason) { ReportDrop(bytes, Status::Corruption(reason)); }
 
 	void Reader::ReportDrop(uint64_t bytes, const Status& reason)
 	{
@@ -240,8 +235,7 @@ namespace prism::log
 				const uint32_t expected_crc = Unmask(header.checksum);
 				const char type_byte = static_cast<char>(header.type);
 				uint32_t actual_crc = crc32c::Crc32c(&type_byte, 1);
-				actual_crc = crc32c::Extend(actual_crc,
-				    reinterpret_cast<const uint8_t*>(header_bytes + kHeaderSize), length);
+				actual_crc = crc32c::Extend(actual_crc, reinterpret_cast<const uint8_t*>(header_bytes + kHeaderSize), length);
 				if (actual_crc != expected_crc)
 				{
 					const size_t drop_size = buffer_.size();
@@ -264,4 +258,3 @@ namespace prism::log
 		}
 	}
 }
-

@@ -69,9 +69,7 @@ namespace prism
 		alignas(BytewiseComparatorImpl) static std::byte buf[sizeof(BytewiseComparatorImpl)];
 		static BytewiseComparatorImpl* singleton = nullptr;
 
-		std::call_once(flag, [] {
-			singleton = new (buf) BytewiseComparatorImpl();
-		});
+		std::call_once(flag, [] { singleton = new (buf) BytewiseComparatorImpl(); });
 		return singleton;
 	}
 }

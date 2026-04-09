@@ -284,7 +284,7 @@ namespace prism
 			const InternalKeyComparator* icmp_;
 			std::vector<FileMetaData*> files_;
 			size_t index_ = 0;
-			mutable char value_buf_[16]{};
+			mutable char value_buf_[16]{ };
 		};
 
 		Iterator* OpenCompactionFileIterator(void* arg, const ReadOptions& options, const Slice& value)
@@ -1039,7 +1039,7 @@ namespace prism
 
 			output.file = std::move(file_result.value());
 			output.builder = std::make_unique<TableBuilder>(options_, output.file.get());
-			output.meta = CompactionOutputMeta{};
+			output.meta = CompactionOutputMeta{ };
 			output.meta.number = file_number;
 			return Status::OK();
 		};
@@ -1938,7 +1938,7 @@ namespace prism
 			// Ignore error in case directory does not exist
 			return Status::OK();
 		}
-		Status result{};
+		Status result{ };
 
 		const std::string lockname = LockFileName(dbname);
 		auto lock = env->LockFile(lockname);
