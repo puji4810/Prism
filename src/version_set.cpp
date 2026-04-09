@@ -368,6 +368,10 @@ namespace prism
 		{
 			edit->SetLogNumber(log_number_);
 		}
+		if (!edit->HasPrevLogNumber())
+		{
+			edit->SetPrevLogNumber(prev_log_number_);
+		}
 
 		uint64_t next_file_number = next_file_number_;
 		uint64_t manifest_file_number = manifest_file_number_;
@@ -436,6 +440,7 @@ namespace prism
 			AppendVersion(v.release());
 			manifest_file_number_ = manifest_file_number;
 			log_number_ = edit->GetLogNumber();
+			prev_log_number_ = edit->GetPrevLogNumber();
 			next_file_number_ = edit->GetNextFileNumber();
 			last_sequence_ = edit->GetLastSequence();
 		}

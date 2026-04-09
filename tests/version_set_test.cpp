@@ -385,6 +385,131 @@ namespace prism
 		prism::Env::Default()->RemoveDir(tmp_dir);
 	}
 
+	TEST_F(VersionSetTest, LogAndApplyUpdatesInMemoryPrevLogNumber)
+	{
+		std::string tmp_dir = "/tmp/prism_version_set_prevlog_test_" + std::to_string(::getpid());
+		prism::Env::Default()->CreateDir(tmp_dir);
+
+		Options options;
+		options.create_if_missing = true;
+		VersionSet vset(tmp_dir, &options, nullptr, &icmp_);
+
+		VersionEdit edit;
+		edit.SetLogNumber(0);
+		edit.SetPrevLogNumber(8);
+
+		std::shared_mutex mu;
+		mu.lock();
+		Status s = vset.LogAndApply(&edit, &mu);
+		mu.unlock();
+		ASSERT_TRUE(s.ok()) << s.ToString();
+
+		EXPECT_EQ(8u, vset.PrevLogNumber());
+
+		prism::Env::Default()->RemoveFile(tmp_dir + "/CURRENT");
+		auto children = prism::Env::Default()->GetChildren(tmp_dir);
+		if (children.has_value())
+		{
+			for (const auto& name : children.value())
+			{
+				if (name.find("MANIFEST") != std::string::npos)
+				{
+					prism::Env::Default()->RemoveFile(tmp_dir + "/" + name);
+				}
+			}
+		}
+		prism::Env::Default()->RemoveDir(tmp_dir);
+	}
+
+	TEST_F(VersionSetTest, LogAndApplyPreservesPrevLogNumberWhenEditOmitsIt)
+	{
+		std::string tmp_dir = "/tmp/prism_version_set_prevlog_preserve_test_" + std::to_string(::getpid());
+		prism::Env::Default()->CreateDir(tmp_dir);
+
+		Options options;
+		options.create_if_missing = true;
+		VersionSet vset(tmp_dir, &options, nullptr, &icmp_);
+
+		std::shared_mutex mu;
+
+		VersionEdit first;
+		first.SetLogNumber(0);
+		first.SetPrevLogNumber(8);
+		mu.lock();
+		Status s = vset.LogAndApply(&first, &mu);
+		mu.unlock();
+		ASSERT_TRUE(s.ok()) << s.ToString();
+		ASSERT_EQ(8u, vset.PrevLogNumber());
+
+		VersionEdit second;
+		second.SetLogNumber(1);
+		mu.lock();
+		s = vset.LogAndApply(&second, &mu);
+		mu.unlock();
+		ASSERT_TRUE(s.ok()) << s.ToString();
+
+		EXPECT_EQ(8u, vset.PrevLogNumber());
+
+		prism::Env::Default()->RemoveFile(tmp_dir + "/CURRENT");
+		auto children = prism::Env::Default()->GetChildren(tmp_dir);
+		if (children.has_value())
+		{
+			for (const auto& name : children.value())
+			{
+				if (name.find("MANIFEST") != std::string::npos)
+				{
+					prism::Env::Default()->RemoveFile(tmp_dir + "/" + name);
+				}
+			}
+		}
+		prism::Env::Default()->RemoveDir(tmp_dir);
+	}
+
+	TEST_F(VersionSetTest, LogAndApplyClearsInMemoryPrevLogNumber)
+	{
+		std::string tmp_dir = "/tmp/prism_version_set_prevlog_clear_test_" + std::to_string(::getpid());
+		prism::Env::Default()->CreateDir(tmp_dir);
+
+		Options options;
+		options.create_if_missing = true;
+		VersionSet vset(tmp_dir, &options, nullptr, &icmp_);
+
+		std::shared_mutex mu;
+
+		VersionEdit first;
+		first.SetLogNumber(0);
+		first.SetPrevLogNumber(8);
+		mu.lock();
+		Status s = vset.LogAndApply(&first, &mu);
+		mu.unlock();
+		ASSERT_TRUE(s.ok()) << s.ToString();
+		ASSERT_EQ(8u, vset.PrevLogNumber());
+
+		VersionEdit second;
+		second.SetLogNumber(1);
+		second.SetPrevLogNumber(0);
+		mu.lock();
+		s = vset.LogAndApply(&second, &mu);
+		mu.unlock();
+		ASSERT_TRUE(s.ok()) << s.ToString();
+
+		EXPECT_EQ(0u, vset.PrevLogNumber());
+
+		prism::Env::Default()->RemoveFile(tmp_dir + "/CURRENT");
+		auto children = prism::Env::Default()->GetChildren(tmp_dir);
+		if (children.has_value())
+		{
+			for (const auto& name : children.value())
+			{
+				if (name.find("MANIFEST") != std::string::npos)
+				{
+					prism::Env::Default()->RemoveFile(tmp_dir + "/" + name);
+				}
+			}
+		}
+		prism::Env::Default()->RemoveDir(tmp_dir);
+	}
+
 	TEST_F(VersionSetTest, AddLiveFilesIncludesPinnedOlderVersions)
 	{
 		std::string tmp_dir = "/tmp/prism_version_set_live_files_test_" + std::to_string(::getpid());
