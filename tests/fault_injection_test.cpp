@@ -210,6 +210,33 @@ protected:
 	std::string tmp_path_;
 };
 
+namespace
+{
+	std::string ReadCurrentManifest(const std::string& db_path)
+	{
+		std::string current_target;
+		Status s = ReadFileToString(Env::Default(), CurrentFileName(db_path), &current_target);
+		if (!s.ok())
+		{
+			return "";
+		}
+		if (!current_target.empty() && current_target.back() == '\n')
+		{
+			current_target.pop_back();
+		}
+		return current_target;
+	}
+
+	Status ApplyVersionEdit(VersionSet* version_set, VersionEdit* edit)
+	{
+		std::shared_mutex mu;
+		mu.lock();
+		Status s = version_set->LogAndApply(edit, &mu);
+		mu.unlock();
+		return s;
+	}
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -369,4 +396,47 @@ TEST_F(FaultInjectionTest, CrashAfterManifestSyncBeforeCurrent)
 	EXPECT_TRUE(s.IsIOError());
 	EXPECT_FALSE(Env::Default()->FileExists(CurrentFileName(tmp_path_)));
 	EXPECT_EQ(0u, version_set.current()->files(0).size());
+}
+
+TEST_F(FaultInjectionTest, FailedManifestRewritePreservesCurrentManifestAfterRecover)
+{
+	Options options;
+	options.env = env_.get();
+	options.comparator = BytewiseComparator();
+	options.create_if_missing = true;
+
+	TableCache table_cache(tmp_path_, options, 16);
+	InternalKeyComparator icmp(options.comparator);
+
+	VersionSet writer(tmp_path_, &options, &table_cache, &icmp);
+	VersionEdit initial;
+	initial.AddFile(0, 101, 4096, InternalKey("a", 100, kTypeValue), InternalKey("m", 100, kTypeValue));
+	ASSERT_TRUE(ApplyVersionEdit(&writer, &initial).ok());
+
+	const std::string original_manifest_name = ReadCurrentManifest(tmp_path_);
+	ASSERT_FALSE(original_manifest_name.empty());
+	ASSERT_TRUE(Env::Default()->FileExists(tmp_path_ + "/" + original_manifest_name));
+
+	VersionSet recovered(tmp_path_, &options, &table_cache, &icmp);
+	bool save_manifest = false;
+	ASSERT_TRUE(recovered.Recover(&save_manifest).ok());
+
+	VersionEdit failing_edit;
+	failing_edit.AddFile(0, 202, 4096, InternalKey("n", 100, kTypeValue), InternalKey("z", 100, kTypeValue));
+
+	env_->SetFailSync(true);
+	Status s = ApplyVersionEdit(&recovered, &failing_edit);
+	env_->SetFailSync(false);
+
+	EXPECT_FALSE(s.ok());
+	EXPECT_TRUE(s.IsIOError());
+	EXPECT_EQ(original_manifest_name, ReadCurrentManifest(tmp_path_));
+	EXPECT_TRUE(Env::Default()->FileExists(tmp_path_ + "/" + original_manifest_name));
+
+	VersionSet reopen(tmp_path_, &options, &table_cache, &icmp);
+	bool reopen_save_manifest = false;
+	ASSERT_TRUE(reopen.Recover(&reopen_save_manifest).ok());
+
+	ASSERT_EQ(1u, reopen.current()->files(0).size());
+	EXPECT_EQ(101u, reopen.current()->files(0)[0]->number);
 }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <mutex>
 #include <shared_mutex>
 
 #include "env.h"
@@ -173,6 +174,11 @@ namespace prism
 	Version::~Version()
 	{
 		assert(refs_.load(std::memory_order_acquire) == 0);
+		std::unique_lock<std::mutex> list_lock;
+		if (vset_ != nullptr)
+		{
+			list_lock = std::unique_lock<std::mutex>(vset_->version_list_mutex_);
+		}
 		prev_->next_ = next_;
 		next_->prev_ = prev_;
 		prev_ = nullptr;
@@ -330,15 +336,18 @@ namespace prism
 	{
 		assert(v != nullptr);
 		Version* old = current_;
-		if (old != nullptr)
 		{
-			v->next_ = old->next_;
-			v->prev_ = old;
-			old->next_->prev_ = v;
-			old->next_ = v;
+			std::lock_guard<std::mutex> lock(version_list_mutex_);
+			if (old != nullptr)
+			{
+				v->next_ = old->next_;
+				v->prev_ = old;
+				old->next_->prev_ = v;
+				old->next_ = v;
+			}
+			current_ = v;
+			current_->Ref();
 		}
-		current_ = v;
-		current_->Ref();
 		if (old != nullptr)
 		{
 			old->Unref();
@@ -360,7 +369,17 @@ namespace prism
 			edit->SetLogNumber(log_number_);
 		}
 
-		edit->SetNextFile(next_file_number_);
+		uint64_t next_file_number = next_file_number_;
+		uint64_t manifest_file_number = manifest_file_number_;
+		std::string new_manifest_file;
+		bool created_new_manifest = false;
+		if (!descriptor_log_)
+		{
+			manifest_file_number = next_file_number++;
+			created_new_manifest = true;
+		}
+
+		edit->SetNextFile(next_file_number);
 		edit->SetLastSequence(last_sequence_);
 
 		std::unique_ptr<Version> v(NewVersion());
@@ -371,11 +390,10 @@ namespace prism
 		}
 		Finalize(v.get());
 
-		std::string new_manifest_file;
 		Status s;
-		if (!descriptor_log_)
+		if (created_new_manifest)
 		{
-			new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
+			new_manifest_file = DescriptorFileName(dbname_, manifest_file_number);
 			auto descriptor_result = env_->NewWritableFile(new_manifest_file);
 			if (!descriptor_result.has_value())
 			{
@@ -408,7 +426,7 @@ namespace prism
 
 		if (s.ok() && !new_manifest_file.empty())
 		{
-			s = SetCurrentFile(env_, dbname_, manifest_file_number_);
+			s = SetCurrentFile(env_, dbname_, manifest_file_number);
 		}
 
 		mu->lock();
@@ -416,6 +434,7 @@ namespace prism
 		if (s.ok())
 		{
 			AppendVersion(v.release());
+			manifest_file_number_ = manifest_file_number;
 			log_number_ = edit->GetLogNumber();
 			next_file_number_ = edit->GetNextFileNumber();
 			last_sequence_ = edit->GetLastSequence();
@@ -906,6 +925,7 @@ namespace prism
 
 	void VersionSet::AddLiveFiles(std::set<uint64_t>* live)
 	{
+		std::lock_guard<std::mutex> lock(version_list_mutex_);
 		if (current_ == nullptr)
 		{
 			return;

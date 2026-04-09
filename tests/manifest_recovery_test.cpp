@@ -545,6 +545,44 @@ TEST_F(ManifestRecoveryTest, RecoverUsesManifestAsSourceOfTruth)
 	EXPECT_TRUE(save_manifest);
 }
 
+TEST_F(ManifestRecoveryTest, RecoverRestoresPersistedNextFileNumberExactly)
+{
+	Options options;
+	options.env = Env::Default();
+	options.comparator = BytewiseComparator();
+
+	const uint64_t manifest_file_number = 17;
+	const uint64_t persisted_next_file = 42;
+
+	auto manifest = Env::Default()->NewWritableFile(DescriptorFileName(db_path_, manifest_file_number));
+	ASSERT_TRUE(manifest.has_value()) << manifest.error().ToString();
+
+	log::Writer writer(manifest.value().get());
+	VersionEdit snapshot;
+	snapshot.SetComparatorName(options.comparator->Name());
+	snapshot.SetLogNumber(0);
+	snapshot.SetPrevLogNumber(0);
+	snapshot.SetNextFile(persisted_next_file);
+	snapshot.SetLastSequence(0);
+
+	std::string record;
+	snapshot.EncodeTo(&record);
+	ASSERT_TRUE(writer.AddRecord(record).ok());
+	ASSERT_TRUE(manifest.value()->Close().ok());
+	ASSERT_TRUE(SetCurrentFile(Env::Default(), db_path_, manifest_file_number).ok());
+
+	TableCache table_cache(db_path_, options, 16);
+	InternalKeyComparator icmp(options.comparator);
+
+	VersionSet recovered(db_path_, &options, &table_cache, &icmp);
+	bool save_manifest = false;
+	Status s = recovered.Recover(&save_manifest);
+	ASSERT_TRUE(s.ok()) << s.ToString();
+
+	EXPECT_EQ(persisted_next_file, recovered.NextFileNumber());
+	EXPECT_TRUE(save_manifest);
+}
+
 TEST_F(ManifestRecoveryTest, ReuseLogsDisabledDuringManifestRollout)
 {
 	Options options;

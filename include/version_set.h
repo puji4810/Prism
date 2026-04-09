@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <atomic>
+#include <mutex>
 #include <memory>
 #include <shared_mutex>
 #include <set>
@@ -71,6 +72,8 @@ namespace prism
 	class VersionSet
 	{
 	public:
+		friend class Version;
+
 		explicit VersionSet(const Options* options, const InternalKeyComparator& icmp)
 		    : VersionSet("", options, nullptr, &icmp)
 		{
@@ -158,6 +161,7 @@ namespace prism
 		TableCache* table_cache_;
 		const InternalKeyComparator* icmp_;
 		Env* env_;
+		mutable std::mutex version_list_mutex_;
 		Version* current_;
 
 		std::unique_ptr<WritableFile> descriptor_file_;
