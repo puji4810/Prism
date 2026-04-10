@@ -20,9 +20,11 @@ namespace prism
 		virtual ~DB();
 
 		// Legacy API - prefer Database::Open for new code during the transition.
+		// DB::Open returns a unique_ptr, which is being phased out in favor of
+		// the by-value Database handle. This API is kept for backward compatibility.
+		//
 		// Open the database with the specified "name".
-		// Returns a pointer to a heap-allocated database on success.
-		// Returns a Result
+		// Returns a Result containing a heap-allocated database pointer.
 		static Result<std::unique_ptr<DB>> Open(const Options& opts, const std::string& dbname);
 		static Result<std::unique_ptr<DB>> Open(const std::string& dbname);
 
@@ -62,6 +64,11 @@ namespace prism
 		virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
 	};
 
+	// Database: Preferred move-only handle for the KV store.
+	//
+	// New code should prefer Database::Open over the legacy DB::Open.
+	// This handle owns the underlying DB instance and provides a cleaner
+	// by-value interface for modern C++.
 	class Database
 	{
 	public:
@@ -71,6 +78,8 @@ namespace prism
 		Database& operator=(Database&& other) noexcept;
 		~Database();
 
+		// Opens the database and returns a by-value Database handle.
+		// This is the recommended entry point for new applications.
 		static Result<Database> Open(const Options& options, const std::string& dbname);
 		static Result<Database> Open(const std::string& dbname);
 

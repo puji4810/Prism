@@ -108,6 +108,8 @@ namespace prism
 	public:
 		AsyncEnv(ThreadPoolScheduler& scheduler, Env* env);
 
+		// All file factory methods return by-value handles (e.g., Result<AsyncWritableFile>).
+		// The previous unique_ptr-returning signatures are deprecated.
 		AsyncOp<Result<AsyncRandomAccessFile>> NewRandomAccessFileAsync(std::string fname);
 		AsyncOp<Result<AsyncWritableFile>> NewWritableFileAsync(std::string fname);
 		AsyncOp<Result<AsyncWritableFile>> NewAppendableFileAsync(std::string fname);
