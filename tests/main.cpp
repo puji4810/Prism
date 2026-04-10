@@ -3,7 +3,7 @@
 
 int main()
 {
-	auto db_result = prism::DB::Open("my_database");
+	auto db_result = prism::Database::Open("my_database");
 	if (!db_result.has_value())
 	{
 		printf("Open failed: %s\n", db_result.error().ToString().c_str());
@@ -19,7 +19,7 @@ int main()
 	// }
 
 	// Example: Get a value
-	auto value_result = db->Get("key2");
+	auto value_result = db.Get("key2");
 	if (value_result.has_value())
 	{
 		printf("Got value: %s\n", value_result.value().c_str());
