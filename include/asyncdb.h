@@ -43,7 +43,10 @@ namespace prism
 		AsyncDB(AsyncDB&&) = default;
 		AsyncDB& operator=(AsyncDB&&) = default;
 
-		// Opens a database asynchronously.
+		// Opens a database asynchronously and returns a by-value handle.
+		// The AsyncDB handle is move-only and internally uses shared_ptr for async safety.
+		//
+		// Migration Note: The previous unique_ptr-returning signature is deprecated.
 		// Internally calls synchronous DB::Open() on a thread pool thread.
 		static AsyncOp<Result<AsyncDB>> OpenAsync(ThreadPoolScheduler& scheduler, const Options& options, std::string dbname);
 
