@@ -178,49 +178,47 @@ namespace prism
 	{
 	}
 
-	AsyncOp<Result<std::unique_ptr<AsyncRandomAccessFile>>> AsyncEnv::NewRandomAccessFileAsync(std::string fname)
+	AsyncOp<Result<AsyncRandomAccessFile>> AsyncEnv::NewRandomAccessFileAsync(std::string fname)
 	{
 		auto env = env_;
 		auto scheduler = scheduler_;
-		return AsyncOp<Result<std::unique_ptr<AsyncRandomAccessFile>>>(
-		    *scheduler_, [env, scheduler, fname = std::move(fname)]() -> Result<std::unique_ptr<AsyncRandomAccessFile>> {
+		return AsyncOp<Result<AsyncRandomAccessFile>>(
+		    *scheduler_, [env, scheduler, fname = std::move(fname)]() -> Result<AsyncRandomAccessFile> {
 			    auto f = env->NewRandomAccessFile(fname);
 			    if (!f.has_value())
 			    {
 				    return std::unexpected(f.error());
 			    }
-			    return std::make_unique<AsyncRandomAccessFile>(*scheduler, std::shared_ptr<RandomAccessFile>(std::move(f.value())));
+			    return AsyncRandomAccessFile(*scheduler, std::shared_ptr<RandomAccessFile>(std::move(f.value())));
 		    });
 	}
 
-	AsyncOp<Result<std::unique_ptr<AsyncWritableFile>>> AsyncEnv::NewWritableFileAsync(std::string fname)
+	AsyncOp<Result<AsyncWritableFile>> AsyncEnv::NewWritableFileAsync(std::string fname)
 	{
 		auto env = env_;
 		auto scheduler = scheduler_;
-		return AsyncOp<Result<std::unique_ptr<AsyncWritableFile>>>(
-		    *scheduler_, [env, scheduler, fname = std::move(fname)]() -> Result<std::unique_ptr<AsyncWritableFile>> {
-			    auto f = env->NewWritableFile(fname);
-			    if (!f.has_value())
-			    {
-				    return std::unexpected(f.error());
-			    }
-			    return std::make_unique<AsyncWritableFile>(*scheduler, std::move(f.value()));
-		    });
+		return AsyncOp<Result<AsyncWritableFile>>(*scheduler_, [env, scheduler, fname = std::move(fname)]() -> Result<AsyncWritableFile> {
+			auto f = env->NewWritableFile(fname);
+			if (!f.has_value())
+			{
+				return std::unexpected(f.error());
+			}
+			return AsyncWritableFile(*scheduler, std::move(f.value()));
+		});
 	}
 
-	AsyncOp<Result<std::unique_ptr<AsyncWritableFile>>> AsyncEnv::NewAppendableFileAsync(std::string fname)
+	AsyncOp<Result<AsyncWritableFile>> AsyncEnv::NewAppendableFileAsync(std::string fname)
 	{
 		auto env = env_;
 		auto scheduler = scheduler_;
-		return AsyncOp<Result<std::unique_ptr<AsyncWritableFile>>>(
-		    *scheduler_, [env, scheduler, fname = std::move(fname)]() -> Result<std::unique_ptr<AsyncWritableFile>> {
-			    auto f = env->NewAppendableFile(fname);
-			    if (!f.has_value())
-			    {
-				    return std::unexpected(f.error());
-			    }
-			    return std::make_unique<AsyncWritableFile>(*scheduler, std::move(f.value()));
-		    });
+		return AsyncOp<Result<AsyncWritableFile>>(*scheduler_, [env, scheduler, fname = std::move(fname)]() -> Result<AsyncWritableFile> {
+			auto f = env->NewAppendableFile(fname);
+			if (!f.has_value())
+			{
+				return std::unexpected(f.error());
+			}
+			return AsyncWritableFile(*scheduler, std::move(f.value()));
+		});
 	}
 
 	AsyncOp<Status> AsyncEnv::RemoveFileAsync(std::string fname)
