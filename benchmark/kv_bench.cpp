@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <semaphore>
 
 #include <unistd.h>
@@ -125,15 +126,15 @@ namespace prism::bench
 		(void)std::filesystem::remove_all(dir);
 	}
 
-	static Detached RunAsyncOpen(AsyncDB*& out_db, ThreadPoolScheduler& scheduler, const Options& options, const std::string& dir,
-	    std::binary_semaphore& sem, std::exception_ptr& exc)
+	static Detached RunAsyncOpen(std::optional<AsyncDB>& out_db, ThreadPoolScheduler& scheduler, const Options& options,
+	    const std::string& dir, std::binary_semaphore& sem, std::exception_ptr& exc)
 	{
 		try
 		{
 			auto result = co_await AsyncDB::OpenAsync(scheduler, options, dir);
 			if (result.has_value())
 			{
-				out_db = result.value().release();
+				out_db.emplace(std::move(result.value()));
 			}
 		}
 		catch (...)
@@ -184,21 +185,15 @@ namespace prism::bench
 		}
 
 		auto open_sem = std::binary_semaphore(0);
-		AsyncDB* adb_ptr = nullptr;
+		std::optional<AsyncDB> adb;
 		std::exception_ptr open_exc;
-		RunAsyncOpen(adb_ptr, scheduler, options, dir, open_sem, open_exc);
+		RunAsyncOpen(adb, scheduler, options, dir, open_sem, open_exc);
 
 		open_sem.acquire();
 		if (open_exc)
 		{
 			std::rethrow_exception(open_exc);
 		}
-		if (!adb_ptr)
-		{
-			std::fprintf(stderr, "async open failed\n");
-			return;
-		}
-		std::unique_ptr<AsyncDB> adb(adb_ptr);
 
 		std::printf("scheduler_threads=%zu inflight_per_client=%d\n", scheduler.WorkerCount(), cfg.inflight_per_client);
 
