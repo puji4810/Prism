@@ -7,6 +7,7 @@
 #include "env.h"
 #include "comparator.h"
 #include "iterator.h"
+#include "filename.h"
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <vector>
@@ -320,4 +321,102 @@ TEST(TableTest, BlockCacheFillAndBypass)
 
 	delete table;
 	std::filesystem::remove(fname);
+}
+
+// Characterization test: locks the current table-cache ownership contract
+// before any RAII refactoring. Verifies that iterators keep the table alive
+// through cache pinning even after cache eviction.
+class TableCacheOwnershipTest: public ::testing::Test
+{
+protected:
+	void SetUp() override
+	{
+		env_ = Env::Default();
+		// Create a temporary directory for the test database
+		dbname_ = std::filesystem::temp_directory_path() / "prism_table_cache_test";
+		std::filesystem::create_directories(dbname_);
+
+		// Build a small SSTable file
+		Options options;
+		options.comparator = BytewiseComparator();
+
+		const uint64_t file_number = 1;
+		std::string fname = TableFileName(dbname_.string(), file_number);
+
+		auto result = env_->NewWritableFile(fname);
+		ASSERT_TRUE(result.has_value());
+		auto wf = std::move(result.value());
+		{
+			TableBuilder builder(options, wf.get());
+			builder.Add(Slice("key1"), Slice("value1"));
+			builder.Add(Slice("key2"), Slice("value2"));
+			builder.Add(Slice("key3"), Slice("value3"));
+			ASSERT_TRUE(builder.Finish().ok());
+		}
+		ASSERT_TRUE(wf->Close().ok());
+
+		file_size_ = std::filesystem::file_size(fname);
+		file_number_ = file_number;
+	}
+
+	void TearDown() override
+	{
+		// Clean up test database
+		if (std::filesystem::exists(dbname_))
+		{
+			std::filesystem::remove_all(dbname_);
+		}
+	}
+
+	Env* env_;
+	std::filesystem::path dbname_;
+	uint64_t file_number_;
+	uint64_t file_size_;
+};
+
+TEST_F(TableCacheOwnershipTest, IteratorKeepsTableAliveAfterEvict)
+{
+	// This test verifies the ownership contract:
+	// 1. TableCache::NewIterator returns an iterator that holds a cache handle
+	// 2. The iterator registers cleanup to release the handle when destroyed
+	// 3. Even after Evict(), the underlying TableAndFile stays alive
+	//    because the iterator holds a reference via the cache handle
+
+	Options options;
+	options.comparator = BytewiseComparator();
+
+	// Create a TableCache with capacity for 1 entry
+	TableCache cache(dbname_.string(), options, 1);
+
+	// Get an iterator from the cache
+	ReadOptions read_options;
+	std::unique_ptr<Iterator> iter(cache.NewIterator(read_options, file_number_, file_size_));
+	ASSERT_TRUE(iter != nullptr);
+	ASSERT_TRUE(iter->status().ok());
+
+	// Evict the cache entry - this should NOT invalidate the iterator
+	// because the iterator holds a reference to the cache entry
+	cache.Evict(file_number_);
+
+	// Verify the iterator still works after eviction
+	// The iterator keeps the TableAndFile alive through cache pinning
+	iter->SeekToFirst();
+	ASSERT_TRUE(iter->Valid());
+	EXPECT_EQ(iter->key().ToString(), "key1");
+	EXPECT_EQ(iter->value().ToString(), "value1");
+
+	iter->Next();
+	ASSERT_TRUE(iter->Valid());
+	EXPECT_EQ(iter->key().ToString(), "key2");
+	EXPECT_EQ(iter->value().ToString(), "value2");
+
+	iter->Next();
+	ASSERT_TRUE(iter->Valid());
+	EXPECT_EQ(iter->key().ToString(), "key3");
+	EXPECT_EQ(iter->value().ToString(), "value3");
+
+	iter->Next();
+	EXPECT_FALSE(iter->Valid());
+
+	// Iterator destruction will release the cache handle
 }

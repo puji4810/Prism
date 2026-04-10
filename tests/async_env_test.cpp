@@ -371,3 +371,45 @@ TEST_F(AsyncEnvTest, QueuedSecondCloseReturnsIoError)
 	EXPECT_TRUE(first.ok()) << first.ToString();
 	EXPECT_TRUE(second.IsIOError()) << "Second queued CloseAsync should fail deterministically: " << second.ToString();
 }
+
+// AsyncWritableFileMoveAndDestroySafety: Moved async file handles keep FIFO/close
+// safety semantics, and no UAF occurs after wrapper destruction.
+TEST_F(AsyncEnvTest, AsyncWritableFileMoveAndDestroySafety)
+{
+	ThreadPoolScheduler scheduler(4);
+	const std::string path = TestFile("move_safety.txt");
+
+	// Create original AsyncWritableFile
+	auto wf_raw = env_->NewWritableFile(path);
+	ASSERT_TRUE(wf_raw.has_value()) << wf_raw.error().ToString();
+	auto async_wf1 = std::make_shared<AsyncWritableFile>(scheduler, std::move(wf_raw.value()));
+
+	// Move-construct a second AsyncWritableFile from the first
+	auto async_wf2 = std::make_shared<AsyncWritableFile>(std::move(*async_wf1));
+	// async_wf1 now holds moved-from state; async_wf2 owns the file
+
+	// Verify moved-to handle works (Append + Close)
+	auto append_task
+	    = [](std::shared_ptr<AsyncWritableFile> wf) -> Task<Status> { co_return co_await wf->AppendAsync("moved_data"); }(async_wf2);
+	Status append_status = append_task.SyncWait();
+	EXPECT_TRUE(append_status.ok()) << append_status.ToString();
+
+	auto close_task = [](std::shared_ptr<AsyncWritableFile> wf) -> Task<Status> { co_return co_await wf->CloseAsync(); }(async_wf2);
+	Status close_status = close_task.SyncWait();
+	EXPECT_TRUE(close_status.ok()) << close_status.ToString();
+
+	// Explicitly destroy moved-from handle - must not crash or double-free
+	// The moved-from AsyncWritableFile has default move ctor which leaves
+	// file_ and serial_ as nullptr (shared_ptr move leaves nullptr in source)
+	async_wf1.reset();
+
+	// Verify file content is correct (moved-to handle wrote successfully)
+	auto rf = env_->NewRandomAccessFile(path);
+	ASSERT_TRUE(rf.has_value()) << rf.error().ToString();
+	auto size_res = env_->GetFileSize(path);
+	ASSERT_TRUE(size_res.has_value());
+	std::string content(size_res.value(), '\0');
+	auto read_res = rf.value()->ReadAt(0, std::as_writable_bytes(std::span(content)));
+	ASSERT_TRUE(read_res.has_value());
+	EXPECT_EQ(content, "moved_data");
+}

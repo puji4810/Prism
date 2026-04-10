@@ -1575,7 +1575,14 @@ namespace prism
 		SequenceNumber snapshot = 0;
 		{
 			std::shared_lock<std::shared_mutex> lock(mutex_);
-			snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
+			if (read_options.snapshot != nullptr)
+			{
+				snapshot = static_cast<const SnapshotImpl*>(read_options.snapshot)->GetSequenceNumber();
+			}
+			else
+			{
+				snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
+			}
 			mem = mem_;
 			if (mem != nullptr)
 				mem->Ref();
@@ -1768,16 +1775,18 @@ namespace prism
 			delete sv;
 		};
 
-		if (read_options.snapshot != nullptr)
-		{
-			return std::make_unique<EmptyIterator>(Status::NotSupported("snapshot"));
-		}
-
 		SuperVersionLite* sv = nullptr;
 		{
 			std::shared_lock<std::shared_mutex> lock(mutex_);
 			sv = new SuperVersionLite;
-			sv->snapshot = sequence_ - 1;
+			if (read_options.snapshot != nullptr)
+			{
+				sv->snapshot = static_cast<const SnapshotImpl*>(read_options.snapshot)->GetSequenceNumber();
+			}
+			else
+			{
+				sv->snapshot = sequence_ - 1;
+			}
 
 			sv->mem = mem_;
 			if (sv->mem != nullptr)
@@ -1826,10 +1835,14 @@ namespace prism
 	const Snapshot* DBImpl::GetSnapshot()
 	{
 		std::lock_guard<std::shared_mutex> lock(mutex_);
-		return nullptr;
+		return new SnapshotImpl(sequence_ - 1);
 	}
 
-	void DBImpl::ReleaseSnapshot(const Snapshot* /*snapshot*/) { std::lock_guard<std::shared_mutex> lock(mutex_); }
+	void DBImpl::ReleaseSnapshot(const Snapshot* snapshot)
+	{
+		std::lock_guard<std::shared_mutex> lock(mutex_);
+		delete static_cast<const SnapshotImpl*>(snapshot);
+	}
 
 	Version* DBImpl::TEST_CurrentVersion() const
 	{

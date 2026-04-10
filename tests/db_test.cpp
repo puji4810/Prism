@@ -1,5 +1,6 @@
 #include "db.h"
 #include "write_batch.h"
+#include "env.h"
 
 #include <gtest/gtest.h>
 #include <atomic>
@@ -284,4 +285,194 @@ TEST_F(DBTest, ThreadSafeConcurrentPutGet)
 			ASSERT_EQ(r.value(), value_for(w, i));
 		}
 	}
+}
+
+TEST_F(DBTest, SnapshotReadRemainsStableAcrossWrites)
+{
+	auto res = DB::Open("test_db");
+	ASSERT_TRUE(res.has_value());
+	auto db = std::move(res.value());
+
+	ASSERT_TRUE(db->Put("k1", "v1").ok());
+
+	const Snapshot* snap = db->GetSnapshot();
+	ASSERT_NE(snap, nullptr);
+
+	ASSERT_TRUE(db->Put("k1", "v2").ok());
+
+	ReadOptions snap_opts;
+	snap_opts.snapshot = snap;
+	auto snap_result = db->Get(snap_opts, "k1");
+	ASSERT_TRUE(snap_result.has_value());
+	EXPECT_EQ("v1", snap_result.value()) << "Snapshot read should return value at snapshot time";
+
+	auto current_result = db->Get("k1");
+	ASSERT_TRUE(current_result.has_value());
+	EXPECT_EQ("v2", current_result.value()) << "Current read should return latest value";
+
+	ASSERT_TRUE(db->Delete("k1").ok());
+
+	snap_result = db->Get(snap_opts, "k1");
+	ASSERT_TRUE(snap_result.has_value());
+	EXPECT_EQ("v1", snap_result.value()) << "Snapshot read should still return v1 after delete";
+
+	current_result = db->Get("k1");
+	EXPECT_TRUE(current_result.error().IsNotFound()) << "Current read should return NotFound after delete";
+
+	db->ReleaseSnapshot(snap);
+}
+
+TEST_F(DBTest, SnapshotIteratorSeesStableView)
+{
+	auto res = DB::Open("test_db");
+	ASSERT_TRUE(res.has_value());
+	auto db = std::move(res.value());
+
+	ASSERT_TRUE(db->Put("a", "1").ok());
+	ASSERT_TRUE(db->Put("b", "2").ok());
+	ASSERT_TRUE(db->Put("c", "3").ok());
+
+	const Snapshot* snap = db->GetSnapshot();
+	ASSERT_NE(snap, nullptr);
+
+	ASSERT_TRUE(db->Delete("b").ok());
+	ASSERT_TRUE(db->Put("c", "33").ok());
+	ASSERT_TRUE(db->Put("d", "4").ok());
+
+	ReadOptions snap_opts;
+	snap_opts.snapshot = snap;
+	std::unique_ptr<Iterator> it(db->NewIterator(snap_opts));
+
+	it->SeekToFirst();
+	ASSERT_TRUE(it->Valid());
+	EXPECT_EQ(it->key().ToString(), "a");
+	EXPECT_EQ(it->value().ToString(), "1");
+
+	it->Next();
+	ASSERT_TRUE(it->Valid());
+	EXPECT_EQ(it->key().ToString(), "b") << "Iterator should see deleted key 'b'";
+	EXPECT_EQ(it->value().ToString(), "2");
+
+	it->Next();
+	ASSERT_TRUE(it->Valid());
+	EXPECT_EQ(it->key().ToString(), "c");
+	EXPECT_EQ(it->value().ToString(), "3") << "Iterator should see original value for 'c'";
+
+	it->Next();
+	EXPECT_FALSE(it->Valid()) << "Iterator should not see key 'd' added after snapshot";
+	EXPECT_TRUE(it->status().ok()) << it->status().ToString();
+
+	db->ReleaseSnapshot(snap);
+}
+
+// ===========================================================================
+// Characterization tests for DB::Open ownership/lifetime behavior
+// These tests lock current behavior BEFORE any RAII refactoring.
+// ===========================================================================
+
+// Helper Env wrapper that can inject failures after lock acquisition
+class FaultAfterLockEnv: public EnvWrapper
+{
+public:
+	explicit FaultAfterLockEnv(Env* base)
+	    : EnvWrapper(base)
+	    , fail_get_children_{ false }
+	{
+	}
+
+	void SetFailGetChildren(bool v) { fail_get_children_.store(v, std::memory_order_release); }
+
+	Result<std::vector<std::string>> GetChildren(const std::string& dir) override
+	{
+		if (fail_get_children_.load(std::memory_order_acquire))
+			return std::unexpected(Status::IOError(dir, "injected GetChildren failure"));
+		return target()->GetChildren(dir);
+	}
+
+private:
+	std::atomic<bool> fail_get_children_;
+};
+
+// When DB::Open fails after acquiring the DB lock, the lock must be released
+// so that a subsequent open on the same path can succeed.
+TEST_F(DBTest, OpenFailureReleasesLockAndAllowsRetry)
+{
+	const std::string test_path = "test_db_lock_release";
+	std::error_code ec;
+	std::filesystem::remove_all(test_path, ec);
+
+	FaultAfterLockEnv fault_env(Env::Default());
+
+	// First open attempt: inject failure after lock acquisition
+	// The lock is acquired in Recover() before GetChildren is called
+	Options opts;
+	opts.env = &fault_env;
+	opts.create_if_missing = true;
+
+	fault_env.SetFailGetChildren(true);
+	auto res1 = DB::Open(opts, test_path);
+	EXPECT_FALSE(res1.has_value()) << "First open should fail due to injected fault";
+	EXPECT_TRUE(res1.error().IsIOError()) << "Error should be IOError: " << res1.error().ToString();
+
+	// Reset fault injection
+	fault_env.SetFailGetChildren(false);
+
+	// Second open attempt: should succeed because lock was released
+	auto res2 = DB::Open(opts, test_path);
+	ASSERT_TRUE(res2.has_value()) << "Second open should succeed after lock release: " << res2.error().ToString();
+
+	auto db = std::move(res2.value());
+	EXPECT_TRUE(db->Put("key", "value").ok());
+
+	// Cleanup
+	db.reset();
+	std::filesystem::remove_all(test_path, ec);
+}
+
+// Opening a non-existent DB with create_if_missing=false should return an error.
+TEST_F(DBTest, OpenHonorsCreateIfMissingFalse)
+{
+	const std::string test_path = "test_db_create_if_missing_false";
+	std::error_code ec;
+	std::filesystem::remove_all(test_path, ec);
+
+	Options opts;
+	opts.create_if_missing = false; // Do not create if missing
+
+	auto res = DB::Open(opts, test_path);
+	EXPECT_FALSE(res.has_value()) << "Open should fail for non-existent DB with create_if_missing=false";
+	EXPECT_TRUE(res.error().IsInvalidArgument()) << "Error should be InvalidArgument: " << res.error().ToString();
+
+	// Cleanup (should be no-op since DB was never created)
+	std::filesystem::remove_all(test_path, ec);
+}
+
+// Opening an existing DB with error_if_exists=true should return an error.
+TEST_F(DBTest, OpenHonorsErrorIfExistsTrue)
+{
+	const std::string test_path = "test_db_error_if_exists";
+	std::error_code ec;
+	std::filesystem::remove_all(test_path, ec);
+
+	// First, create the database
+	{
+		Options create_opts;
+		create_opts.create_if_missing = true;
+		auto res = DB::Open(create_opts, test_path);
+		ASSERT_TRUE(res.has_value()) << "Initial DB creation should succeed: " << res.error().ToString();
+		auto db = std::move(res.value());
+		EXPECT_TRUE(db->Put("key", "value").ok());
+	}
+
+	// Now try to open with error_if_exists=true
+	{
+		Options error_opts;
+		error_opts.error_if_exists = true;
+		auto res = DB::Open(error_opts, test_path);
+		EXPECT_FALSE(res.has_value()) << "Open should fail for existing DB with error_if_exists=true";
+		EXPECT_TRUE(res.error().IsInvalidArgument()) << "Error should be InvalidArgument: " << res.error().ToString();
+	}
+
+	// Cleanup
+	std::filesystem::remove_all(test_path, ec);
 }

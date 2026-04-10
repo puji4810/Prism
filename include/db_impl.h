@@ -2,6 +2,7 @@
 #define PRISM_DB_IMPL_H
 
 #include "db.h"
+#include "dbformat.h"
 #include "options.h"
 #include "log_writer.h"
 #include "memtable.h"
@@ -19,6 +20,19 @@ namespace prism
 	class FileLock;
 	class TableCache;
 	class CompactionExecutionTest;
+
+	class SnapshotImpl: public Snapshot
+	{
+	public:
+		explicit SnapshotImpl(SequenceNumber seq)
+		    : sequence_number_(seq)
+		{
+		}
+		SequenceNumber GetSequenceNumber() const { return sequence_number_; }
+
+	private:
+		SequenceNumber sequence_number_;
+	};
 
 	class DBImpl: public DB
 	{
