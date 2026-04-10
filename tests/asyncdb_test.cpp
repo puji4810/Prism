@@ -1,10 +1,7 @@
 #include "asyncdb.h"
 
-#include <coroutine>
 #include <filesystem>
 #include <gtest/gtest.h>
-#include <optional>
-#include <semaphore>
 #include <stdexcept>
 
 #include "coro_task.h"
@@ -14,6 +11,27 @@ using namespace prism::tests;
 
 namespace
 {
+	Task<Result<AsyncDB>> OpenAsyncViaLegacyDBOpen(ThreadPoolScheduler& scheduler, const Options& options, const std::string& path)
+	{
+		auto db_res = DB::Open(options, path);
+		if (!db_res.has_value())
+		{
+			co_return std::unexpected(db_res.error());
+		}
+
+		co_return AsyncDB(scheduler, std::shared_ptr<DB>(std::move(db_res.value())));
+	}
+
+	Task<AsyncDB> OpenValueHandleAsyncDB(ThreadPoolScheduler& scheduler, const Options& options, const std::string& path)
+	{
+		auto db_res = co_await AsyncDB::OpenAsync(scheduler, options, path);
+		if (!db_res.has_value())
+		{
+			throw std::runtime_error(db_res.error().ToString());
+		}
+
+		co_return std::move(db_res.value());
+	}
 
 	class AsyncDBTest: public ::testing::Test
 	{
@@ -22,12 +40,20 @@ namespace
 		{
 			std::error_code ec;
 			std::filesystem::remove_all("test_async_db", ec);
+			std::filesystem::remove_all("test_async_db_legacy", ec);
+			std::filesystem::remove_all("test_async_db_value", ec);
+			std::filesystem::remove_all("test_async_db_missing_legacy", ec);
+			std::filesystem::remove_all("test_async_db_missing_value", ec);
 		}
 
 		void TearDown() override
 		{
 			std::error_code ec;
 			std::filesystem::remove_all("test_async_db", ec);
+			std::filesystem::remove_all("test_async_db_legacy", ec);
+			std::filesystem::remove_all("test_async_db_value", ec);
+			std::filesystem::remove_all("test_async_db_missing_legacy", ec);
+			std::filesystem::remove_all("test_async_db_missing_value", ec);
 		}
 	};
 
@@ -40,16 +66,7 @@ TEST_F(AsyncDBTest, BasicPutGet)
 	Options options;
 	options.create_if_missing = true;
 
-	auto open = [&]() -> Task<AsyncDB> {
-		auto db_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
-		if (!db_res.has_value())
-		{
-			throw std::runtime_error(db_res.error().ToString());
-		}
-		co_return std::move(db_res.value());
-	}();
-
-	auto adb = open.SyncWait();
+	auto adb = OpenValueHandleAsyncDB(scheduler, options, "test_async_db").SyncWait();
 
 	auto put = [&]() -> Task<Status> { co_return co_await adb.PutAsync(WriteOptions(), "k", "v"); }();
 
@@ -86,15 +103,7 @@ TEST_F(AsyncDBTest, DestroyBeforeAwait)
 	// Obtain an AsyncOp from PutAsync, then destroy the AsyncDB before awaiting.
 	// With shared_ptr capture the lambda keeps DB alive - must not UAF.
 	AsyncOp<Status> put_op = [&]() {
-		auto open_task = [&]() -> Task<AsyncDB> {
-			auto db_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
-			if (!db_res.has_value())
-			{
-				throw std::runtime_error(db_res.error().ToString());
-			}
-			co_return std::move(db_res.value());
-		}();
-		auto adb = open_task.SyncWait();
+		auto adb = OpenValueHandleAsyncDB(scheduler, options, "test_async_db").SyncWait();
 
 		// Capture AsyncOp before adb is destroyed
 		auto op = adb.PutAsync(WriteOptions(), "destroy_key", "destroy_val");
@@ -118,16 +127,7 @@ TEST_F(AsyncDBTest, ValueHandleMoveConstruction)
 	Options options;
 	options.create_if_missing = true;
 
-	// Open first AsyncDB
-	auto open_task1 = [&]() -> Task<AsyncDB> {
-		auto db_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
-		if (!db_res.has_value())
-		{
-			throw std::runtime_error(db_res.error().ToString());
-		}
-		co_return std::move(db_res.value());
-	}();
-	auto adb1 = open_task1.SyncWait();
+	auto adb1 = OpenValueHandleAsyncDB(scheduler, options, "test_async_db").SyncWait();
 
 	// Move-construct a second AsyncDB from the first
 	AsyncDB adb2(std::move(adb1));
@@ -151,4 +151,45 @@ TEST_F(AsyncDBTest, ValueHandleMoveConstruction)
 	auto get_result2 = get_task2.SyncWait();
 	ASSERT_TRUE(get_result2.has_value()) << get_result2.error().ToString();
 	EXPECT_EQ(get_result2.value(), "move_val");
+}
+
+TEST_F(AsyncDBTest, LegacyAndValueHandleOpenParity)
+{
+	ThreadPoolScheduler scheduler(4);
+	Options options;
+	options.create_if_missing = true;
+
+	auto legacy_open = OpenAsyncViaLegacyDBOpen(scheduler, options, "test_async_db_legacy").SyncWait();
+	auto value_db = OpenValueHandleAsyncDB(scheduler, options, "test_async_db_value").SyncWait();
+
+	ASSERT_TRUE(legacy_open.has_value()) << legacy_open.error().ToString();
+	auto legacy_db = std::move(legacy_open.value());
+
+	auto legacy_put = [&]() -> Task<Status> { co_return co_await legacy_db.PutAsync(WriteOptions(), "k", "v"); }().SyncWait();
+	auto value_put = [&]() -> Task<Status> { co_return co_await value_db.PutAsync(WriteOptions(), "k", "v"); }().SyncWait();
+	EXPECT_EQ(legacy_put.ok(), value_put.ok());
+
+	auto legacy_get = [&]() -> Task<Result<std::string>> { co_return co_await legacy_db.GetAsync(ReadOptions(), "k"); }().SyncWait();
+	auto value_get = [&]() -> Task<Result<std::string>> { co_return co_await value_db.GetAsync(ReadOptions(), "k"); }().SyncWait();
+	ASSERT_TRUE(legacy_get.has_value()) << legacy_get.error().ToString();
+	ASSERT_TRUE(value_get.has_value()) << value_get.error().ToString();
+	EXPECT_EQ(legacy_get.value(), value_get.value());
+
+	auto legacy_delete = [&]() -> Task<Status> { co_return co_await legacy_db.DeleteAsync(WriteOptions(), "k"); }().SyncWait();
+	auto value_delete = [&]() -> Task<Status> { co_return co_await value_db.DeleteAsync(WriteOptions(), "k"); }().SyncWait();
+	EXPECT_EQ(legacy_delete.ok(), value_delete.ok());
+
+	Options missing_options;
+	missing_options.create_if_missing = false;
+	auto legacy_missing = OpenAsyncViaLegacyDBOpen(scheduler, missing_options, "test_async_db_missing_legacy").SyncWait();
+	auto value_missing = [&]() -> Task<Result<AsyncDB>> {
+		co_return co_await AsyncDB::OpenAsync(scheduler, missing_options, "test_async_db_missing_value");
+	}()
+	                                  .SyncWait();
+	EXPECT_EQ(legacy_missing.has_value(), value_missing.has_value());
+	ASSERT_FALSE(legacy_missing.has_value());
+	ASSERT_FALSE(value_missing.has_value());
+	EXPECT_EQ(legacy_missing.error().IsInvalidArgument(), value_missing.error().IsInvalidArgument());
+	EXPECT_NE(legacy_missing.error().ToString().find("does not exist (create_if_missing is false)"), std::string::npos);
+	EXPECT_NE(value_missing.error().ToString().find("does not exist (create_if_missing is false)"), std::string::npos);
 }

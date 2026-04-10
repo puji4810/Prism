@@ -3,13 +3,53 @@
 #include "db.h"
 #include "scheduler.h"
 
+#include "coro_task.h"
+
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 
 namespace
 {
 	std::string MakeTestDir() { return prism::bench::MakeTempDir("async_matrix_test"); }
+
+	prism::Database OpenDatabase(const prism::Options& options, const std::string& db_dir)
+	{
+		auto db_result = prism::Database::Open(options, db_dir);
+		EXPECT_TRUE(db_result.has_value()) << db_result.error().ToString();
+		if (!db_result.has_value())
+		{
+			throw std::runtime_error(db_result.error().ToString());
+		}
+		return std::move(db_result.value());
+	}
+
+	prism::AsyncDB OpenAsyncDatabase(prism::ThreadPoolScheduler& scheduler, const prism::Options& options, const std::string& db_dir)
+	{
+		auto open_task = [&]() -> prism::tests::Task<prism::AsyncDB> {
+			auto db_result = co_await prism::AsyncDB::OpenAsync(scheduler, options, db_dir);
+			if (!db_result.has_value())
+			{
+				throw std::runtime_error(db_result.error().ToString());
+			}
+			co_return std::move(db_result.value());
+		}();
+		return open_task.SyncWait();
+	}
+
+	void PrefillDatabase(
+	    prism::Database& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size)
+	{
+		const std::string value = prism::bench::MakeValue(value_size);
+		for (const auto& client_keys : keys)
+		{
+			for (std::size_t i = 0; i < ops_per_client; ++i)
+			{
+				ASSERT_TRUE(db.Put(client_keys[i], value).ok());
+			}
+		}
+	}
 
 	TEST(KVBenchAsyncMatrixTest, ConfigDefaults)
 	{
@@ -181,12 +221,8 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024 * 1024;
 
-		auto db_result = prism::DB::Open(options, db_dir);
-		ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-		auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
-
 		prism::ThreadPoolScheduler scheduler(2);
-		prism::AsyncDB async_db(scheduler, db);
+		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
 
 		prism::bench::Config cfg;
 		cfg.clients = 2;
@@ -212,12 +248,8 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024 * 1024;
 
-		auto db_result = prism::DB::Open(options, db_dir);
-		ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-		auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
-
 		prism::ThreadPoolScheduler scheduler(4);
-		prism::AsyncDB async_db(scheduler, db);
+		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
 
 		prism::bench::Config cfg;
 		cfg.clients = 2;
@@ -244,12 +276,7 @@ namespace
 			options.create_if_missing = true;
 			options.write_buffer_size = 4 * 1024;
 
-			auto db_result = prism::DB::Open(options, db_dir);
-			ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-			auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
-
-			prism::ThreadPoolScheduler scheduler(2);
-			prism::AsyncDB async_db(scheduler, db);
+			auto db = OpenDatabase(options, db_dir);
 
 			prism::bench::Config cfg;
 			cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
@@ -262,8 +289,26 @@ namespace
 			cfg.prefill = 1;
 
 			auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
-			prism::bench::Prefill(*db, keys, cfg.ops_per_client, cfg.value_size);
+			PrefillDatabase(db, keys, cfg.ops_per_client, cfg.value_size);
+		}
 
+		{
+			prism::Options options;
+			options.create_if_missing = true;
+			options.write_buffer_size = 4 * 1024;
+			prism::ThreadPoolScheduler scheduler(2);
+			auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+
+			prism::bench::Config cfg;
+			cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
+			cfg.clients = 4;
+			cfg.workers = 2;
+			cfg.ops_per_client = 50;
+			cfg.value_size = 100;
+			cfg.inflight_per_client = 1;
+			cfg.no_latency = true;
+			cfg.prefill = 1;
+			auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
 			auto stats = prism::bench::RunAsyncCompactionOverlap(async_db, scheduler, cfg, keys);
 
 			EXPECT_GT(stats.seconds, 0);
@@ -281,12 +326,7 @@ namespace
 			options.create_if_missing = true;
 			options.write_buffer_size = 4 * 1024;
 
-			auto db_result = prism::DB::Open(options, db_dir);
-			ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-			auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
-
-			prism::ThreadPoolScheduler scheduler(2);
-			prism::AsyncDB async_db(scheduler, db);
+			auto db = OpenDatabase(options, db_dir);
 
 			prism::bench::Config cfg;
 			cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
@@ -299,8 +339,26 @@ namespace
 			cfg.prefill = 1;
 
 			auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
-			prism::bench::Prefill(*db, keys, cfg.ops_per_client, cfg.value_size);
+			PrefillDatabase(db, keys, cfg.ops_per_client, cfg.value_size);
+		}
 
+		{
+			prism::Options options;
+			options.create_if_missing = true;
+			options.write_buffer_size = 4 * 1024;
+			prism::ThreadPoolScheduler scheduler(2);
+			auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+
+			prism::bench::Config cfg;
+			cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
+			cfg.clients = 4;
+			cfg.workers = 2;
+			cfg.ops_per_client = 50;
+			cfg.value_size = 100;
+			cfg.inflight_per_client = 1;
+			cfg.no_latency = true;
+			cfg.prefill = 1;
+			auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
 			auto stats = prism::bench::RunAsyncCompactionOverlap(async_db, scheduler, cfg, keys);
 
 			EXPECT_GE(stats.bg_scheduled, 0);
@@ -326,20 +384,18 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024;
 
-		auto db_result = prism::DB::Open(options, db_dir);
-		ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-		auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
-
-		// Prefill the database to ensure SST files exist
 		prism::bench::Config prefill_cfg;
 		prefill_cfg.clients = 2;
 		prefill_cfg.ops_per_client = 100;
 		prefill_cfg.value_size = 100;
 		auto keys = prism::bench::MakeKeys(prefill_cfg.clients, prefill_cfg.ops_per_client);
-		prism::bench::Prefill(*db, keys, prefill_cfg.ops_per_client, prefill_cfg.value_size);
+		{
+			auto db = OpenDatabase(options, db_dir);
+			PrefillDatabase(db, keys, prefill_cfg.ops_per_client, prefill_cfg.value_size);
+		}
 
 		prism::ThreadPoolScheduler scheduler(2);
-		prism::AsyncDB async_db(scheduler, db);
+		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
 
 		prism::bench::Config cfg;
 		cfg.mode = prism::bench::BenchMode::kSstReadPipeline;
@@ -386,12 +442,8 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024 * 1024;
 
-		auto db_result = prism::DB::Open(options, db_dir);
-		ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-		auto db = std::shared_ptr<prism::DB>(std::move(db_result.value()));
-
 		prism::ThreadPoolScheduler scheduler(2);
-		prism::AsyncDB async_db(scheduler, db);
+		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
 
 		prism::bench::Config cfg;
 		cfg.mode = prism::bench::BenchMode::kDurabilityWrite;

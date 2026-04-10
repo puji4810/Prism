@@ -10,6 +10,55 @@
 
 using namespace prism;
 
+namespace
+{
+	struct DbOperationParity
+	{
+		Status put_status;
+		Result<std::string> get_before_delete;
+		Status delete_status;
+		Result<std::string> get_after_delete;
+	};
+
+	DbOperationParity RunLegacyOperations(const std::string& path)
+	{
+		auto open = DB::Open(path);
+		EXPECT_TRUE(open.has_value()) << open.error().ToString();
+		if (!open.has_value())
+		{
+			return { Status::IOError("legacy open failed"), std::unexpected(Status::IOError("legacy open failed")),
+				Status::IOError("legacy open failed"), std::unexpected(Status::IOError("legacy open failed")) };
+		}
+
+		auto db = std::move(open.value());
+		DbOperationParity result;
+		result.put_status = db->Put("parity_key", "parity_value");
+		result.get_before_delete = db->Get("parity_key");
+		result.delete_status = db->Delete("parity_key");
+		result.get_after_delete = db->Get("parity_key");
+		return result;
+	}
+
+	DbOperationParity RunDatabaseOperations(const std::string& path)
+	{
+		auto open = Database::Open(path);
+		EXPECT_TRUE(open.has_value()) << open.error().ToString();
+		if (!open.has_value())
+		{
+			return { Status::IOError("database open failed"), std::unexpected(Status::IOError("database open failed")),
+				Status::IOError("database open failed"), std::unexpected(Status::IOError("database open failed")) };
+		}
+
+		auto db = std::move(open.value());
+		DbOperationParity result;
+		result.put_status = db.Put("parity_key", "parity_value");
+		result.get_before_delete = db.Get("parity_key");
+		result.delete_status = db.Delete("parity_key");
+		result.get_after_delete = db.Get("parity_key");
+		return result;
+	}
+}
+
 // Test fixture for DB tests
 class DBTest: public ::testing::Test
 {
@@ -21,6 +70,10 @@ protected:
 		std::filesystem::remove_all("test_db", ec);
 		std::filesystem::remove_all("test_db_large", ec);
 		std::filesystem::remove_all("test_db_multi_large", ec);
+		std::filesystem::remove_all("test_db_legacy_parity", ec);
+		std::filesystem::remove_all("test_db_database_parity", ec);
+		std::filesystem::remove_all("test_db_missing_legacy_parity", ec);
+		std::filesystem::remove_all("test_db_missing_database_parity", ec);
 	}
 
 	void TearDown() override
@@ -30,34 +83,38 @@ protected:
 		std::filesystem::remove_all("test_db", ec);
 		std::filesystem::remove_all("test_db_large", ec);
 		std::filesystem::remove_all("test_db_multi_large", ec);
+		std::filesystem::remove_all("test_db_legacy_parity", ec);
+		std::filesystem::remove_all("test_db_database_parity", ec);
+		std::filesystem::remove_all("test_db_missing_legacy_parity", ec);
+		std::filesystem::remove_all("test_db_missing_database_parity", ec);
 	}
 };
 
 TEST_F(DBTest, BasicPutGetDelete)
 {
-	auto res = DB::Open("test_db");
+	auto res = Database::Open("test_db");
 	ASSERT_TRUE(res.has_value());
 
 	auto db = std::move(res.value());
 
 	// Put
-	Status s1 = db->Put("key1", "value1");
+	Status s1 = db.Put("key1", "value1");
 	EXPECT_TRUE(s1.ok()) << "Put should succeed: " << s1.ToString();
 
 	// Get
 	std::string value;
-	auto s2 = db->Get("key1");
+	auto s2 = db.Get("key1");
 	ASSERT_TRUE(s2.has_value()) << "Get should succeed";
 	value = s2.value();
 	EXPECT_EQ("value1", value) << "Value should match";
 
 	// Delete
-	Status s3 = db->Delete("key1");
+	Status s3 = db.Delete("key1");
 	EXPECT_TRUE(s3.ok()) << "Delete should succeed: " << s3.ToString();
 
 	// Get after delete
 	std::string value2;
-	auto s4 = db->Get("key1");
+	auto s4 = db.Get("key1");
 	EXPECT_TRUE(s4.error().IsNotFound()) << "Get should return NotFound after delete";
 }
 
@@ -84,7 +141,7 @@ TEST_F(DBTest, DatabaseHandleBasicPutGetDelete)
 
 TEST_F(DBTest, BatchWrite)
 {
-	auto res = DB::Open("test_db");
+	auto res = Database::Open("test_db");
 	ASSERT_TRUE(res.has_value());
 
 	auto db = std::move(res.value());
@@ -94,14 +151,14 @@ TEST_F(DBTest, BatchWrite)
 	batch.Put("batch_key2", "batch_value2");
 	batch.Delete("key1");
 
-	Status s = db->Write(batch);
+	Status s = db.Write(batch);
 	EXPECT_TRUE(s.ok()) << "Batch write should succeed: " << s.ToString();
 
-	auto s1 = db->Get("batch_key1");
+	auto s1 = db.Get("batch_key1");
 	ASSERT_TRUE(s1.has_value());
 	EXPECT_EQ("batch_value1", s1.value());
 
-	auto s2 = db->Get("batch_key2");
+	auto s2 = db.Get("batch_key2");
 	ASSERT_TRUE(s2.has_value());
 	EXPECT_EQ("batch_value2", s2.value());
 }
@@ -109,20 +166,20 @@ TEST_F(DBTest, BatchWrite)
 TEST_F(DBTest, Recovery)
 {
 	{
-		auto res = DB::Open("test_db");
+		auto res = Database::Open("test_db");
 		ASSERT_TRUE(res.has_value());
 
 		auto db = std::move(res.value());
-		Status s = db->Put("persistent_key", "persistent_value");
+		Status s = db.Put("persistent_key", "persistent_value");
 		ASSERT_TRUE(s.ok()) << s.ToString();
 	}
 
 	{
-		auto res = DB::Open("test_db");
+		auto res = Database::Open("test_db");
 		ASSERT_TRUE(res.has_value());
 
 		auto db = std::move(res.value());
-		auto s = db->Get("persistent_key");
+		auto s = db.Get("persistent_key");
 		ASSERT_TRUE(s.has_value());
 		EXPECT_EQ("persistent_value", s.value()) << "Recovered value should match";
 	}
@@ -152,38 +209,35 @@ TEST_F(DBTest, DatabaseHandleRecovery)
 
 TEST_F(DBTest, LargeValueFragmentation)
 {
-	auto res = DB::Open("test_db_large");
-	ASSERT_TRUE(res.has_value());
-
-	auto db = std::move(res.value());
-
 	// Create a large value that will require fragmentation (> 32KB)
 	std::string large_value(40000, 'X'); // 40KB of 'X'
 
-	// Put the large value
-	Status s1 = db->Put("large_key", large_value);
-	ASSERT_TRUE(s1.ok()) << "Put large value should succeed: " << s1.ToString();
+	{
+		auto res = Database::Open("test_db_large");
+		ASSERT_TRUE(res.has_value());
+		auto db = std::move(res.value());
 
-	// Get it back
-	auto s2 = db->Get("large_key");
-	ASSERT_TRUE(s2.has_value());
-	EXPECT_EQ(large_value, s2.value()) << "Large value should match after fragmentation";
+		Status s1 = db.Put("large_key", large_value);
+		ASSERT_TRUE(s1.ok()) << "Put large value should succeed: " << s1.ToString();
 
-	// Test recovery with large value
-	db.reset(); // Close DB
+		auto s2 = db.Get("large_key");
+		ASSERT_TRUE(s2.has_value());
+		EXPECT_EQ(large_value, s2.value()) << "Large value should match after fragmentation";
+	}
 
-	res = DB::Open("test_db_large");
-	ASSERT_TRUE(res.has_value());
-
-	db = std::move(res.value());
-	auto s3 = db->Get("large_key");
-	ASSERT_TRUE(s3.has_value());
-	EXPECT_EQ(large_value, s3.value()) << "Recovered large value should match";
+	{
+		auto res = Database::Open("test_db_large");
+		ASSERT_TRUE(res.has_value());
+		auto db = std::move(res.value());
+		auto s3 = db.Get("large_key");
+		ASSERT_TRUE(s3.has_value());
+		EXPECT_EQ(large_value, s3.value()) << "Recovered large value should match";
+	}
 }
 
 TEST_F(DBTest, MultipleLargeRecords)
 {
-	auto res = DB::Open("test_db_multi_large");
+	auto res = Database::Open("test_db_multi_large");
 	ASSERT_TRUE(res.has_value());
 
 	auto db = std::move(res.value());
@@ -193,18 +247,18 @@ TEST_F(DBTest, MultipleLargeRecords)
 	std::string value2(35000, 'B'); // 35KB
 	std::string value3(45000, 'C'); // 45KB
 
-	Status s1 = db->Put("key1", value1);
-	Status s2 = db->Put("key2", value2);
-	Status s3 = db->Put("key3", value3);
+	Status s1 = db.Put("key1", value1);
+	Status s2 = db.Put("key2", value2);
+	Status s3 = db.Put("key3", value3);
 
 	ASSERT_TRUE(s1.ok()) << s1.ToString();
 	ASSERT_TRUE(s2.ok()) << s2.ToString();
 	ASSERT_TRUE(s3.ok()) << s3.ToString();
 
 	// Verify all values
-	auto r1 = db->Get("key1");
-	auto r2 = db->Get("key2");
-	auto r3 = db->Get("key3");
+	auto r1 = db.Get("key1");
+	auto r2 = db.Get("key2");
+	auto r3 = db.Get("key3");
 
 	ASSERT_TRUE(r1.has_value());
 	ASSERT_TRUE(r2.has_value());
@@ -220,18 +274,18 @@ TEST_F(DBTest, Iterator)
 	Options options;
 	options.create_if_missing = true;
 	options.write_buffer_size = 256;
-	auto res = DB::Open(options, "test_db");
+	auto res = Database::Open(options, "test_db");
 	ASSERT_TRUE(res.has_value());
 
 	auto db = std::move(res.value());
 
-	ASSERT_TRUE(db->Put("b", "2").ok());
-	ASSERT_TRUE(db->Put("a", "1").ok());
-	ASSERT_TRUE(db->Put("c", "3").ok());
-	ASSERT_TRUE(db->Delete("b").ok());
+	ASSERT_TRUE(db.Put("b", "2").ok());
+	ASSERT_TRUE(db.Put("a", "1").ok());
+	ASSERT_TRUE(db.Put("c", "3").ok());
+	ASSERT_TRUE(db.Delete("b").ok());
 
 	ReadOptions ro;
-	std::unique_ptr<Iterator> it(db->NewIterator(ro));
+	std::unique_ptr<Iterator> it = db.NewIterator(ro);
 	it->SeekToFirst();
 
 	ASSERT_TRUE(it->Valid());
@@ -250,7 +304,7 @@ TEST_F(DBTest, Iterator)
 
 TEST_F(DBTest, ThreadSafeConcurrentPutGet)
 {
-	auto res = DB::Open("test_db");
+	auto res = Database::Open("test_db");
 	ASSERT_TRUE(res.has_value());
 	auto db = std::move(res.value());
 
@@ -275,7 +329,7 @@ TEST_F(DBTest, ThreadSafeConcurrentPutGet)
 			}
 			for (int i = 0; i < kKeysPerWriter; ++i)
 			{
-				ASSERT_TRUE(db->Put(key_for(t, i), value_for(t, i)).ok());
+				ASSERT_TRUE(db.Put(key_for(t, i), value_for(t, i)).ok());
 			}
 		});
 	}
@@ -292,7 +346,7 @@ TEST_F(DBTest, ThreadSafeConcurrentPutGet)
 				{
 					for (int i = 0; i < kKeysPerWriter; i += 17)
 					{
-						auto r = db->Get(key_for(w, i));
+						auto r = db.Get(key_for(w, i));
 						if (r.has_value())
 						{
 							ASSERT_EQ(r.value(), value_for(w, i));
@@ -323,7 +377,7 @@ TEST_F(DBTest, ThreadSafeConcurrentPutGet)
 	{
 		for (int i = 0; i < kKeysPerWriter; ++i)
 		{
-			auto r = db->Get(key_for(w, i));
+			auto r = db.Get(key_for(w, i));
 			ASSERT_TRUE(r.has_value());
 			ASSERT_EQ(r.value(), value_for(w, i));
 		}
@@ -332,59 +386,59 @@ TEST_F(DBTest, ThreadSafeConcurrentPutGet)
 
 TEST_F(DBTest, SnapshotReadRemainsStableAcrossWrites)
 {
-	auto res = DB::Open("test_db");
+	auto res = Database::Open("test_db");
 	ASSERT_TRUE(res.has_value());
 	auto db = std::move(res.value());
 
-	ASSERT_TRUE(db->Put("k1", "v1").ok());
+	ASSERT_TRUE(db.Put("k1", "v1").ok());
 
-	const Snapshot* snap = db->GetSnapshot();
+	const Snapshot* snap = db.GetSnapshot();
 	ASSERT_NE(snap, nullptr);
 
-	ASSERT_TRUE(db->Put("k1", "v2").ok());
+	ASSERT_TRUE(db.Put("k1", "v2").ok());
 
 	ReadOptions snap_opts;
 	snap_opts.snapshot = snap;
-	auto snap_result = db->Get(snap_opts, "k1");
+	auto snap_result = db.Get(snap_opts, "k1");
 	ASSERT_TRUE(snap_result.has_value());
 	EXPECT_EQ("v1", snap_result.value()) << "Snapshot read should return value at snapshot time";
 
-	auto current_result = db->Get("k1");
+	auto current_result = db.Get("k1");
 	ASSERT_TRUE(current_result.has_value());
 	EXPECT_EQ("v2", current_result.value()) << "Current read should return latest value";
 
-	ASSERT_TRUE(db->Delete("k1").ok());
+	ASSERT_TRUE(db.Delete("k1").ok());
 
-	snap_result = db->Get(snap_opts, "k1");
+	snap_result = db.Get(snap_opts, "k1");
 	ASSERT_TRUE(snap_result.has_value());
 	EXPECT_EQ("v1", snap_result.value()) << "Snapshot read should still return v1 after delete";
 
-	current_result = db->Get("k1");
+	current_result = db.Get("k1");
 	EXPECT_TRUE(current_result.error().IsNotFound()) << "Current read should return NotFound after delete";
 
-	db->ReleaseSnapshot(snap);
+	db.ReleaseSnapshot(snap);
 }
 
 TEST_F(DBTest, SnapshotIteratorSeesStableView)
 {
-	auto res = DB::Open("test_db");
+	auto res = Database::Open("test_db");
 	ASSERT_TRUE(res.has_value());
 	auto db = std::move(res.value());
 
-	ASSERT_TRUE(db->Put("a", "1").ok());
-	ASSERT_TRUE(db->Put("b", "2").ok());
-	ASSERT_TRUE(db->Put("c", "3").ok());
+	ASSERT_TRUE(db.Put("a", "1").ok());
+	ASSERT_TRUE(db.Put("b", "2").ok());
+	ASSERT_TRUE(db.Put("c", "3").ok());
 
-	const Snapshot* snap = db->GetSnapshot();
+	const Snapshot* snap = db.GetSnapshot();
 	ASSERT_NE(snap, nullptr);
 
-	ASSERT_TRUE(db->Delete("b").ok());
-	ASSERT_TRUE(db->Put("c", "33").ok());
-	ASSERT_TRUE(db->Put("d", "4").ok());
+	ASSERT_TRUE(db.Delete("b").ok());
+	ASSERT_TRUE(db.Put("c", "33").ok());
+	ASSERT_TRUE(db.Put("d", "4").ok());
 
 	ReadOptions snap_opts;
 	snap_opts.snapshot = snap;
-	std::unique_ptr<Iterator> it(db->NewIterator(snap_opts));
+	std::unique_ptr<Iterator> it = db.NewIterator(snap_opts);
 
 	it->SeekToFirst();
 	ASSERT_TRUE(it->Valid());
@@ -405,7 +459,44 @@ TEST_F(DBTest, SnapshotIteratorSeesStableView)
 	EXPECT_FALSE(it->Valid()) << "Iterator should not see key 'd' added after snapshot";
 	EXPECT_TRUE(it->status().ok()) << it->status().ToString();
 
-	db->ReleaseSnapshot(snap);
+	db.ReleaseSnapshot(snap);
+}
+
+TEST_F(DBTest, LegacyAndDatabaseHandleOpenParity)
+{
+	const std::string legacy_path = "test_db_legacy_parity";
+	const std::string database_path = "test_db_database_parity";
+	const std::string missing_legacy_path = "test_db_missing_legacy_parity";
+	const std::string missing_database_path = "test_db_missing_database_parity";
+	std::error_code ec;
+	std::filesystem::remove_all(legacy_path, ec);
+	std::filesystem::remove_all(database_path, ec);
+	std::filesystem::remove_all(missing_legacy_path, ec);
+	std::filesystem::remove_all(missing_database_path, ec);
+
+	auto legacy = RunLegacyOperations(legacy_path);
+	auto database = RunDatabaseOperations(database_path);
+
+	EXPECT_EQ(legacy.put_status.ok(), database.put_status.ok());
+	EXPECT_EQ(legacy.get_before_delete.has_value(), database.get_before_delete.has_value());
+	ASSERT_TRUE(legacy.get_before_delete.has_value());
+	ASSERT_TRUE(database.get_before_delete.has_value());
+	EXPECT_EQ(legacy.get_before_delete.value(), database.get_before_delete.value());
+	EXPECT_EQ(legacy.delete_status.ok(), database.delete_status.ok());
+	EXPECT_EQ(legacy.get_after_delete.has_value(), database.get_after_delete.has_value());
+	EXPECT_TRUE(legacy.get_after_delete.error().IsNotFound());
+	EXPECT_TRUE(database.get_after_delete.error().IsNotFound());
+
+	Options missing_options;
+	missing_options.create_if_missing = false;
+	auto legacy_missing = DB::Open(missing_options, missing_legacy_path);
+	auto database_missing = Database::Open(missing_options, missing_database_path);
+	EXPECT_EQ(legacy_missing.has_value(), database_missing.has_value());
+	ASSERT_FALSE(legacy_missing.has_value());
+	ASSERT_FALSE(database_missing.has_value());
+	EXPECT_EQ(legacy_missing.error().IsInvalidArgument(), database_missing.error().IsInvalidArgument());
+	EXPECT_NE(legacy_missing.error().ToString().find("does not exist (create_if_missing is false)"), std::string::npos);
+	EXPECT_NE(database_missing.error().ToString().find("does not exist (create_if_missing is false)"), std::string::npos);
 }
 
 // ===========================================================================
