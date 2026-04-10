@@ -4,22 +4,28 @@
 #include "coding.h"
 #include "filename.h"
 
+#include <memory>
+
 namespace prism
 {
 
-	struct TableAndFile
+	class TableCacheEntry
 	{
-		RandomAccessFile* file;
-		Table* table;
+	public:
+		TableCacheEntry(std::unique_ptr<RandomAccessFile> file, std::unique_ptr<Table> table)
+		    : file_(std::move(file))
+		    , table_(std::move(table))
+		{
+		}
+
+		Table* table() const { return table_.get(); }
+
+	private:
+		std::unique_ptr<RandomAccessFile> file_;
+		std::unique_ptr<Table> table_;
 	};
 
-	static void DeleteEntry(const Slice& key, void* value)
-	{
-		TableAndFile* tf = reinterpret_cast<TableAndFile*>(value);
-		delete tf->table;
-		delete tf->file;
-		delete tf;
-	}
+	static void DeleteEntry(const Slice& key, void* value) { delete reinterpret_cast<TableCacheEntry*>(value); }
 
 	static void UnrefEntry(void* arg1, void* arg2)
 	{
@@ -65,10 +71,8 @@ namespace prism
 				return table_result;
 			}
 			assert(table != nullptr);
-			TableAndFile* tf = new TableAndFile;
-			tf->file = file.value().release(); //  release the ownership to tf
-			tf->table = table;
-			*handle = cache_->Insert(key, tf, 1, &DeleteEntry);
+			auto entry = std::make_unique<TableCacheEntry>(std::move(file.value()), std::unique_ptr<Table>(table));
+			*handle = cache_->Insert(key, entry.release(), 1, &DeleteEntry);
 		}
 		return Status::OK();
 	}
@@ -87,7 +91,7 @@ namespace prism
 			return NewErrorIterator(s);
 		}
 
-		Table* table = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
+		Table* table = reinterpret_cast<TableCacheEntry*>(cache_->Value(handle))->table();
 		Iterator* result = table->NewIterator(options);
 		result->RegisterCleanup(&UnrefEntry, cache_, handle);
 		if (tableptr != nullptr)
@@ -104,7 +108,7 @@ namespace prism
 		Status s = FindTable(file_number, file_size, &handle);
 		if (s.ok())
 		{
-			Table* t = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
+			Table* t = reinterpret_cast<TableCacheEntry*>(cache_->Value(handle))->table();
 			s = t->InternalGet(options, k, arg, handle_result);
 			cache_->Release(handle);
 		}

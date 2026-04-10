@@ -4,7 +4,6 @@
 #include "db.h"
 #include "dbformat.h"
 #include "options.h"
-#include "log_writer.h"
 #include "memtable.h"
 #include "result.h"
 #include "version_set.h"
@@ -75,6 +74,7 @@ namespace prism
 		friend class CompactionExecutionTest;
 
 		class RecoveryHandler;
+		class LogFileGuard;
 
 		Status Recover();
 		Status ApplyBatch(WriteBatch& batch);
@@ -104,8 +104,7 @@ namespace prism
 
 		std::unique_ptr<FileLock> db_lock_;
 
-		WritableFile* logfile_ = nullptr;
-		std::unique_ptr<log::Writer> log_;
+		std::unique_ptr<LogFileGuard> log_file_guard_;
 		uint64_t logfile_number_ = 0;
 
 		MemTable* mem_;
