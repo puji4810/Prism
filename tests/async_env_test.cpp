@@ -71,7 +71,7 @@ TEST_F(AsyncEnvTest, ReadAtStringAsync)
 			co_return;
 		auto file = std::move(file_res.value());
 
-		auto read_res = co_await file->ReadAtStringAsync(0, 11);
+		auto read_res = co_await file.ReadAtStringAsync(0, 11);
 		EXPECT_TRUE(read_res.has_value()) << read_res.error().ToString();
 		if (!read_res.has_value())
 			co_return;
@@ -107,7 +107,7 @@ TEST_F(AsyncEnvTest, ReadAtAsync)
 		if (!file_res.has_value())
 			co_return std::string{ };
 		auto file = std::move(file_res.value());
-		auto n_res = co_await file->ReadAtAsync(0, std::span<std::byte>(buf));
+		auto n_res = co_await file.ReadAtAsync(0, std::span<std::byte>(buf));
 		if (!n_res.has_value() || n_res.value() == 0)
 			co_return std::string{ };
 		co_return std::string(reinterpret_cast<const char*>(buf.data()), n_res.value());
@@ -140,7 +140,7 @@ TEST_F(AsyncEnvTest, ReadAtStringAsyncExact)
 		if (!file_res.has_value())
 			co_return std::string{ };
 		auto file = std::move(file_res.value());
-		auto read_res = co_await file->ReadAtStringAsync(0, 2);
+		auto read_res = co_await file.ReadAtStringAsync(0, 2);
 		if (!read_res.has_value())
 			co_return std::string{ };
 		co_return read_res.value();
@@ -176,14 +176,14 @@ TEST_F(AsyncEnvTest, AppendAfterClose)
 			co_return;
 		auto wf = std::move(wf_res.value());
 
-		auto s = co_await wf->AppendAsync("hello");
+		auto s = co_await wf.AppendAsync("hello");
 		EXPECT_TRUE(s.ok()) << s.ToString();
 
-		s = co_await wf->CloseAsync();
+		s = co_await wf.CloseAsync();
 		EXPECT_TRUE(s.ok()) << s.ToString();
 
 		// After close, further appends must fail.
-		s = co_await wf->AppendAsync("world");
+		s = co_await wf.AppendAsync("world");
 		EXPECT_FALSE(s.ok()) << "Expected IOError after close";
 		EXPECT_TRUE(s.IsIOError()) << s.ToString();
 	}();
@@ -300,13 +300,13 @@ TEST_F(AsyncEnvTest, DestroyBeforeAwait)
 	}
 
 	// Obtain the AsyncOp while async_env is alive, then destroy async_env.
-	AsyncOp<Result<std::unique_ptr<AsyncRandomAccessFile>>> op = [&] {
+	AsyncOp<Result<AsyncRandomAccessFile>> op = [&] {
 		AsyncEnv async_env(scheduler, env_);
 		return async_env.NewRandomAccessFileAsync(path);
 	}(); // async_env destroyed here
 
 	// Await the op — must not crash or UAF even though AsyncEnv wrapper is gone.
-	auto task = [](AsyncOp<Result<std::unique_ptr<AsyncRandomAccessFile>>> o) -> Task<bool> {
+	auto task = [](AsyncOp<Result<AsyncRandomAccessFile>> o) -> Task<bool> {
 		auto res = co_await std::move(o);
 		co_return res.has_value();
 	}(std::move(op));

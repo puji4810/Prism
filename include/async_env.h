@@ -84,8 +84,8 @@ namespace prism
 		{
 			std::mutex mu;
 			std::condition_variable cv;
-			uint64_t next_ticket{ 0 };   // incremented at call-time (under mu)
-			uint64_t now_serving{ 0 };   // incremented after each op completes
+			uint64_t next_ticket{ 0 }; // incremented at call-time (under mu)
+			uint64_t now_serving{ 0 }; // incremented after each op completes
 			bool closed{ false };
 		};
 
@@ -108,9 +108,9 @@ namespace prism
 	public:
 		AsyncEnv(ThreadPoolScheduler& scheduler, Env* env);
 
-		AsyncOp<Result<std::unique_ptr<AsyncRandomAccessFile>>> NewRandomAccessFileAsync(std::string fname);
-		AsyncOp<Result<std::unique_ptr<AsyncWritableFile>>> NewWritableFileAsync(std::string fname);
-		AsyncOp<Result<std::unique_ptr<AsyncWritableFile>>> NewAppendableFileAsync(std::string fname);
+		AsyncOp<Result<AsyncRandomAccessFile>> NewRandomAccessFileAsync(std::string fname);
+		AsyncOp<Result<AsyncWritableFile>> NewWritableFileAsync(std::string fname);
+		AsyncOp<Result<AsyncWritableFile>> NewAppendableFileAsync(std::string fname);
 
 		AsyncOp<Status> RemoveFileAsync(std::string fname);
 		AsyncOp<Status> CreateDirAsync(std::string dirname);
