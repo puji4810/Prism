@@ -4,6 +4,7 @@
 // later tasks can include it as a helper header if needed; for now it lives
 // here to keep the footprint minimal.
 
+#include "db.h"
 #include "env.h"
 #include "filename.h"
 #include "comparator.h"
@@ -98,6 +99,7 @@ public:
 	    , fail_close_{ false }
 	    , fail_rename_{ false }
 	    , fail_remove_{ false }
+	    , fail_get_children_{ false }
 	{
 	}
 
@@ -110,6 +112,7 @@ public:
 	void SetFailClose(bool v) { fail_close_.store(v, std::memory_order_release); }
 	void SetFailRename(bool v) { fail_rename_.store(v, std::memory_order_release); }
 	void SetFailRemoveFile(bool v) { fail_remove_.store(v, std::memory_order_release); }
+	void SetFailGetChildren(bool v) { fail_get_children_.store(v, std::memory_order_release); }
 
 	// Reset all flags to non-failing.
 	void ResetFaults()
@@ -121,6 +124,7 @@ public:
 		fail_close_.store(false, std::memory_order_release);
 		fail_rename_.store(false, std::memory_order_release);
 		fail_remove_.store(false, std::memory_order_release);
+		fail_get_children_.store(false, std::memory_order_release);
 	}
 
 	// ── Overridden Env methods ───────────────────────────────────────────────
@@ -165,6 +169,13 @@ public:
 		return target()->RemoveFile(f);
 	}
 
+	Result<std::vector<std::string>> GetChildren(const std::string& dir) override
+	{
+		if (fail_get_children_.load(std::memory_order_acquire))
+			return std::unexpected(Status::IOError(dir, "injected GetChildren failure"));
+		return target()->GetChildren(dir);
+	}
+
 private:
 	std::atomic<bool> fail_new_writable_;
 	std::atomic<bool> fail_new_appendable_;
@@ -173,6 +184,7 @@ private:
 	std::atomic<bool> fail_close_;
 	std::atomic<bool> fail_rename_;
 	std::atomic<bool> fail_remove_;
+	std::atomic<bool> fail_get_children_;
 };
 
 // ===========================================================================
@@ -439,4 +451,90 @@ TEST_F(FaultInjectionTest, FailedManifestRewritePreservesCurrentManifestAfterRec
 
 	ASSERT_EQ(1u, reopen.current()->files(0).size());
 	EXPECT_EQ(101u, reopen.current()->files(0)[0]->number);
+}
+
+// ── WAL Append failure propagates cleanly through write path. ────────────────
+// Characterizes: When WAL append fails, the write returns the error, and the DB
+// remains stable (no crash, no ownership corruption). The DB can be reopened.
+TEST_F(FaultInjectionTest, WalAppendFailurePropagatesCleanly)
+{
+	Options options;
+	options.env = env_.get();
+	options.comparator = BytewiseComparator();
+	options.create_if_missing = true;
+
+	// Open DB and write some data successfully.
+	auto db_result = DB::Open(options, tmp_path_);
+	ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
+	auto db = std::move(db_result.value());
+
+	Status s = db->Put(WriteOptions(), "key1", "value1");
+	ASSERT_TRUE(s.ok()) << s.ToString();
+
+	// Inject append failure on the WAL file.
+	env_->SetFailAppend(true);
+
+	// Attempt a write - should fail with IOError.
+	s = db->Put(WriteOptions(), "key2", "value2");
+	EXPECT_FALSE(s.ok()) << "Expected write to fail with injected append error";
+	EXPECT_TRUE(s.IsIOError()) << "Expected IOError, got: " << s.ToString();
+
+	// Clear fault injection.
+	env_->SetFailAppend(false);
+
+	// Close the DB.
+	db.reset();
+
+	// Reopen the DB - should succeed and recover the first write.
+	auto reopen_result = DB::Open(options, tmp_path_);
+	ASSERT_TRUE(reopen_result.has_value()) << reopen_result.error().ToString();
+	auto reopened_db = std::move(reopen_result.value());
+
+	// Verify the first write is present.
+	auto get_result = reopened_db->Get(ReadOptions(), "key1");
+	EXPECT_TRUE(get_result.has_value()) << get_result.error().ToString();
+	EXPECT_EQ(get_result.value(), "value1");
+
+	// Verify the failed write was not persisted.
+	auto get2_result = reopened_db->Get(ReadOptions(), "key2");
+	EXPECT_FALSE(get2_result.has_value()) << "Expected key2 to not exist";
+}
+
+// ── WAL Close failure surfaces but doesn't poison recovery. ───────────────────
+// Characterizes: When WAL close fails, the error is surfaced, and subsequent
+// recovery/open path remains deterministic per characterized behavior.
+TEST_F(FaultInjectionTest, WalCloseFailureDoesNotPoisonReopen)
+{
+	Options options;
+	options.env = env_.get();
+	options.comparator = BytewiseComparator();
+	options.create_if_missing = true;
+
+	// Open DB and write some data successfully.
+	auto db_result = DB::Open(options, tmp_path_);
+	ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
+	auto db = std::move(db_result.value());
+
+	Status s = db->Put(WriteOptions(), "key1", "value1");
+	ASSERT_TRUE(s.ok()) << s.ToString();
+
+	// Inject close failure on the WAL file.
+	env_->SetFailClose(true);
+
+	// Close the DB - destructor calls CloseLogFile which should fail.
+	// The error is logged/recorded but the DB should still be destructible.
+	db.reset();
+
+	// Clear fault injection for reopen.
+	env_->SetFailClose(false);
+
+	// Reopen the DB - should succeed and recover the write.
+	auto reopen_result = DB::Open(options, tmp_path_);
+	ASSERT_TRUE(reopen_result.has_value()) << reopen_result.error().ToString();
+	auto reopened_db = std::move(reopen_result.value());
+
+	// Verify the write is present.
+	auto get_result = reopened_db->Get(ReadOptions(), "key1");
+	EXPECT_TRUE(get_result.has_value()) << get_result.error().ToString();
+	EXPECT_EQ(get_result.value(), "value1");
 }

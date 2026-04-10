@@ -16,7 +16,12 @@ namespace prism
 	class Env;
 	class FilterPolicy;
 	class Logger;
-	class Snapshot;
+
+	class Snapshot
+	{
+	protected:
+		virtual ~Snapshot() = default;
+	};
 
 	// DB contents are stored in a set of blocks, each of which holds a
 	// sequence of key,value pairs.  Each block may be compressed before

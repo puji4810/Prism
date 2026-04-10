@@ -109,3 +109,48 @@ TEST_F(AsyncDBTest, DestroyBeforeAwait)
 	}();
 	task.SyncWait();
 }
+
+// ValueHandleMoveConstruction: A moved-to AsyncDB handle works correctly,
+// and a moved-from handle is safely destructible (no double-free, no UAF).
+TEST_F(AsyncDBTest, ValueHandleMoveConstruction)
+{
+	ThreadPoolScheduler scheduler(4);
+	Options options;
+	options.create_if_missing = true;
+
+	// Open first AsyncDB
+	auto open_task1 = [&]() -> Task<std::unique_ptr<AsyncDB>> {
+		auto db_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+		if (!db_res.has_value())
+		{
+			throw std::runtime_error(db_res.error().ToString());
+		}
+		co_return std::move(db_res.value());
+	}();
+	auto adb1 = open_task1.SyncWait();
+
+	// Move-construct a second AsyncDB from the first
+	AsyncDB adb2(std::move(*adb1));
+	// adb1 now holds moved-from state; adb2 owns the DB
+
+	// Verify moved-to handle works (Put/Get)
+	auto put_task = [&]() -> Task<Status> { co_return co_await adb2.PutAsync(WriteOptions(), "move_key", "move_val"); }();
+	Status put_status = put_task.SyncWait();
+	EXPECT_TRUE(put_status.ok()) << put_status.ToString();
+
+	auto get_task = [&]() -> Task<Result<std::string>> { co_return co_await adb2.GetAsync(ReadOptions(), "move_key"); }();
+	auto get_result = get_task.SyncWait();
+	ASSERT_TRUE(get_result.has_value()) << get_result.error().ToString();
+	EXPECT_EQ(get_result.value(), "move_val");
+
+	// Explicitly destroy moved-from handle - must not crash or double-free
+	// The moved-from AsyncDB has default move ctor which leaves db_ as nullptr
+	// (shared_ptr move leaves nullptr in source)
+	adb1.reset(); // Safe destruction of moved-from unique_ptr<AsyncDB>
+
+	// Verify adb2 still works after moved-from handle destruction
+	auto get_task2 = [&]() -> Task<Result<std::string>> { co_return co_await adb2.GetAsync(ReadOptions(), "move_key"); }();
+	auto get_result2 = get_task2.SyncWait();
+	ASSERT_TRUE(get_result2.has_value()) << get_result2.error().ToString();
+	EXPECT_EQ(get_result2.value(), "move_val");
+}
