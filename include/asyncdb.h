@@ -45,8 +45,7 @@ namespace prism
 
 		// Opens a database asynchronously.
 		// Internally calls synchronous DB::Open() on a thread pool thread.
-		static AsyncOp<Result<std::unique_ptr<AsyncDB>>> OpenAsync(
-		    ThreadPoolScheduler& scheduler, const Options& options, std::string dbname);
+		static AsyncOp<Result<AsyncDB>> OpenAsync(ThreadPoolScheduler& scheduler, const Options& options, std::string dbname);
 
 		// TODO(phase-b): GetAsync should fast-path mem/imm without scheduling.
 		// TODO(phase-b): Offload only table/file IO via AsyncEnv/Table.

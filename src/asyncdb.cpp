@@ -15,17 +15,16 @@ namespace prism
 
 	AsyncDB::~AsyncDB() = default;
 
-	AsyncOp<Result<std::unique_ptr<AsyncDB>>> AsyncDB::OpenAsync(ThreadPoolScheduler& scheduler, const Options& options, std::string dbname)
+	AsyncOp<Result<AsyncDB>> AsyncDB::OpenAsync(ThreadPoolScheduler& scheduler, const Options& options, std::string dbname)
 	{
-		return AsyncOp<Result<std::unique_ptr<AsyncDB>>>(
-		    scheduler, [&scheduler, options, dbname = std::move(dbname)]() -> Result<std::unique_ptr<AsyncDB>> {
-			    auto db = DB::Open(options, dbname);
-			    if (!db.has_value())
-			    {
-				    return std::unexpected(db.error());
-			    }
-			    return std::make_unique<AsyncDB>(scheduler, std::shared_ptr<DB>(std::move(db.value())));
-		    });
+		return AsyncOp<Result<AsyncDB>>(scheduler, [&scheduler, options, dbname = std::move(dbname)]() -> Result<AsyncDB> {
+			auto db = DB::Open(options, dbname);
+			if (!db.has_value())
+			{
+				return std::unexpected(db.error());
+			}
+			return AsyncDB(scheduler, std::shared_ptr<DB>(std::move(db.value())));
+		});
 	}
 
 	AsyncOp<Status> AsyncDB::PutAsync(const WriteOptions& options, std::string key, std::string value)
