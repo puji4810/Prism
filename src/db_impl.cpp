@@ -612,6 +612,41 @@ namespace prism
 		SequenceNumber sequence_;
 	};
 
+	class DBImpl::LogFileGuard
+	{
+	public:
+		explicit LogFileGuard(std::unique_ptr<WritableFile> file)
+		    : file_(std::move(file))
+		    , writer_(std::make_unique<log::Writer>(file_.get()))
+		{
+		}
+
+		LogFileGuard(const LogFileGuard&) = delete;
+		LogFileGuard& operator=(const LogFileGuard&) = delete;
+		LogFileGuard(LogFileGuard&&) = delete;
+		LogFileGuard& operator=(LogFileGuard&&) = delete;
+
+		log::Writer* writer() const { return writer_.get(); }
+		WritableFile* file() const { return file_.get(); }
+
+		Status Close()
+		{
+			writer_.reset();
+			if (file_ == nullptr)
+			{
+				return Status::OK();
+			}
+
+			Status s = file_->Close();
+			file_.reset();
+			return s;
+		}
+
+	private:
+		std::unique_ptr<WritableFile> file_;
+		std::unique_ptr<log::Writer> writer_;
+	};
+
 	DB::~DB() = default;
 
 	Result<std::unique_ptr<DB>> DB::Open(const Options& options, const std::string& dbname)
@@ -692,15 +727,13 @@ namespace prism
 
 	Status DBImpl::CloseLogFile()
 	{
-		log_.reset();
-		if (logfile_ == nullptr)
+		if (log_file_guard_ == nullptr)
 		{
 			logfile_number_ = 0;
 			return Status::OK();
 		}
-		Status s = logfile_->Close();
-		delete logfile_;
-		logfile_ = nullptr;
+		Status s = log_file_guard_->Close();
+		log_file_guard_.reset();
 		logfile_number_ = 0;
 		return s;
 	}
@@ -713,10 +746,8 @@ namespace prism
 		{
 			return result.error();
 		}
-		auto file = std::move(result.value());
-		logfile_ = file.release();
+		log_file_guard_ = std::make_unique<LogFileGuard>(std::move(result.value()));
 		logfile_number_ = new_log_number;
-		log_ = std::make_unique<log::Writer>(logfile_);
 		return Status::OK();
 	}
 
@@ -827,7 +858,7 @@ namespace prism
 
 		versions_->SetLastSequence(sequence_ - 1);
 
-		if (log_ == nullptr)
+		if (log_file_guard_ == nullptr)
 		{
 			s = NewLogFile();
 			if (s.ok())
@@ -1343,7 +1374,7 @@ namespace prism
 				s = bg_error_;
 				break;
 			}
-			if (log_ == nullptr || logfile_ == nullptr)
+			if (log_file_guard_ == nullptr || log_file_guard_->writer() == nullptr || log_file_guard_->file() == nullptr)
 			{
 				s = Status::InvalidArgument("log file not open");
 				break;
@@ -1379,11 +1410,11 @@ namespace prism
 					break;
 				}
 
-				const Status close_status = logfile_->Close();
-				delete logfile_;
-				logfile_ = new_log_file.value().release();
+				auto new_log_guard = std::make_unique<LogFileGuard>(std::move(new_log_file.value()));
+				auto old_log_guard = std::move(log_file_guard_);
+				const Status close_status = old_log_guard != nullptr ? old_log_guard->Close() : Status::OK();
+				log_file_guard_ = std::move(new_log_guard);
 				logfile_number_ = new_log_number;
-				log_ = std::make_unique<log::Writer>(logfile_);
 
 				if (!close_status.ok())
 				{
@@ -1707,7 +1738,7 @@ namespace prism
 		{
 			return s;
 		}
-		if (log_ == nullptr || logfile_ == nullptr)
+		if (log_file_guard_ == nullptr || log_file_guard_->writer() == nullptr || log_file_guard_->file() == nullptr)
 		{
 			return Status::InvalidArgument("log file not open");
 		}
@@ -1717,10 +1748,10 @@ namespace prism
 		versions_->SetLastSequence(sequence_ - 1);
 
 		Slice record = WriteBatchInternal::Contents(&batch);
-		s = log_->AddRecord(record);
+		s = log_file_guard_->writer()->AddRecord(record);
 		if (s.ok() && write_options.sync)
 		{
-			s = logfile_->Sync();
+			s = log_file_guard_->file()->Sync();
 		}
 		if (!s.ok())
 		{
