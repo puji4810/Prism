@@ -19,6 +19,7 @@ namespace prism
 		DB() = default;
 		virtual ~DB();
 
+		// Legacy API - prefer Database::Open for new code during the transition.
 		// Open the database with the specified "name".
 		// Returns a pointer to a heap-allocated database on success.
 		// Returns a Result
@@ -59,6 +60,41 @@ namespace prism
 
 		virtual const Snapshot* GetSnapshot() = 0;
 		virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
+	};
+
+	class Database
+	{
+	public:
+		Database(const Database&) = delete;
+		Database& operator=(const Database&) = delete;
+		Database(Database&& other) noexcept;
+		Database& operator=(Database&& other) noexcept;
+		~Database();
+
+		static Result<Database> Open(const Options& options, const std::string& dbname);
+		static Result<Database> Open(const std::string& dbname);
+
+		Status Put(const WriteOptions& options, const Slice& key, const Slice& value);
+		Status Put(const Slice& key, const Slice& value) { return Put(WriteOptions(), key, value); }
+
+		Result<std::string> Get(const ReadOptions& options, const Slice& key);
+		Result<std::string> Get(const Slice& key) { return Get(ReadOptions(), key); }
+
+		Status Delete(const WriteOptions& options, const Slice& key);
+		Status Delete(const Slice& key) { return Delete(WriteOptions(), key); }
+
+		Status Write(const WriteOptions& options, WriteBatch batch);
+		Status Write(WriteBatch batch) { return Write(WriteOptions(), std::move(batch)); }
+
+		std::unique_ptr<Iterator> NewIterator(const ReadOptions& options);
+
+		const Snapshot* GetSnapshot();
+		void ReleaseSnapshot(const Snapshot* snapshot);
+
+	private:
+		explicit Database(std::unique_ptr<DB> impl);
+
+		std::unique_ptr<DB> impl_;
 	};
 
 	Status DestroyDB(const std::string& dbname, const Options& options);

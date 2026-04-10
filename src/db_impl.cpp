@@ -649,6 +649,48 @@ namespace prism
 
 	DB::~DB() = default;
 
+	Database::Database(std::unique_ptr<DB> impl)
+	    : impl_(std::move(impl))
+	{
+	}
+
+	Database::Database(Database&& other) noexcept = default;
+
+	Database& Database::operator=(Database&& other) noexcept = default;
+
+	Database::~Database() = default;
+
+	Result<Database> Database::Open(const Options& options, const std::string& dbname)
+	{
+		auto result = DB::Open(options, dbname);
+		if (!result.has_value())
+		{
+			return std::unexpected(result.error());
+		}
+		return Database(std::move(result.value()));
+	}
+
+	Result<Database> Database::Open(const std::string& dbname)
+	{
+		Options options;
+		options.create_if_missing = true;
+		return Open(options, dbname);
+	}
+
+	Status Database::Put(const WriteOptions& options, const Slice& key, const Slice& value) { return impl_->Put(options, key, value); }
+
+	Result<std::string> Database::Get(const ReadOptions& options, const Slice& key) { return impl_->Get(options, key); }
+
+	Status Database::Delete(const WriteOptions& options, const Slice& key) { return impl_->Delete(options, key); }
+
+	Status Database::Write(const WriteOptions& options, WriteBatch batch) { return impl_->Write(options, std::move(batch)); }
+
+	std::unique_ptr<Iterator> Database::NewIterator(const ReadOptions& options) { return impl_->NewIterator(options); }
+
+	const Snapshot* Database::GetSnapshot() { return impl_->GetSnapshot(); }
+
+	void Database::ReleaseSnapshot(const Snapshot* snapshot) { impl_->ReleaseSnapshot(snapshot); }
+
 	Result<std::unique_ptr<DB>> DB::Open(const Options& options, const std::string& dbname)
 	{
 		Options opts = options;

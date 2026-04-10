@@ -61,6 +61,27 @@ TEST_F(DBTest, BasicPutGetDelete)
 	EXPECT_TRUE(s4.error().IsNotFound()) << "Get should return NotFound after delete";
 }
 
+TEST_F(DBTest, DatabaseHandleBasicPutGetDelete)
+{
+	auto res = Database::Open("test_db");
+	ASSERT_TRUE(res.has_value());
+
+	auto db = std::move(res.value());
+
+	Status s1 = db.Put("key1", "value1");
+	EXPECT_TRUE(s1.ok()) << "Put should succeed: " << s1.ToString();
+
+	auto s2 = db.Get("key1");
+	ASSERT_TRUE(s2.has_value()) << "Get should succeed";
+	EXPECT_EQ("value1", s2.value()) << "Value should match";
+
+	Status s3 = db.Delete("key1");
+	EXPECT_TRUE(s3.ok()) << "Delete should succeed: " << s3.ToString();
+
+	auto s4 = db.Get("key1");
+	EXPECT_TRUE(s4.error().IsNotFound()) << "Get should return NotFound after delete";
+}
+
 TEST_F(DBTest, BatchWrite)
 {
 	auto res = DB::Open("test_db");
@@ -102,6 +123,28 @@ TEST_F(DBTest, Recovery)
 
 		auto db = std::move(res.value());
 		auto s = db->Get("persistent_key");
+		ASSERT_TRUE(s.has_value());
+		EXPECT_EQ("persistent_value", s.value()) << "Recovered value should match";
+	}
+}
+
+TEST_F(DBTest, DatabaseHandleRecovery)
+{
+	{
+		auto res = Database::Open("test_db");
+		ASSERT_TRUE(res.has_value());
+
+		auto db = std::move(res.value());
+		Status s = db.Put("persistent_key", "persistent_value");
+		ASSERT_TRUE(s.ok()) << s.ToString();
+	}
+
+	{
+		auto res = Database::Open("test_db");
+		ASSERT_TRUE(res.has_value());
+
+		auto db = std::move(res.value());
+		auto s = db.Get("persistent_key");
 		ASSERT_TRUE(s.has_value());
 		EXPECT_EQ("persistent_value", s.value()) << "Recovered value should match";
 	}
