@@ -41,6 +41,8 @@ namespace prism
 		Status Put(const WriteOptions& options, const Slice& key, const Slice& value) override;
 		Result<std::string> Get(const ReadOptions& options, const Slice& key) override;
 		Status Delete(const WriteOptions& options, const Slice& key) override;
+		// TODO(wal-rotation): Write() will gain a leader/follower group-commit queue.
+		//   Batching policy: contiguous, same-sync, same-epoch, bounded by count/bytes.
 		Status Write(const WriteOptions& options, WriteBatch batch) override;
 		std::unique_ptr<Iterator> NewIterator(const ReadOptions& options) override;
 		const Snapshot* GetSnapshot() override;
@@ -104,6 +106,9 @@ namespace prism
 
 		std::unique_ptr<FileLock> db_lock_;
 
+		// TODO(wal-rotation): Will add retired_wal_guard_ (unique_ptr<LogFileGuard>) and
+		//   retired_wal_number_ (uint64_t) to track the single recovery-live retired WAL slot.
+		//   Invariant: at most one retired recovery-live WAL exists alongside the active log.
 		std::unique_ptr<LogFileGuard> log_file_guard_;
 		uint64_t logfile_number_ = 0;
 

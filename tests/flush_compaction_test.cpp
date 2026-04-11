@@ -118,6 +118,13 @@ namespace
 	}
 }
 
+// ===========================================================================
+// TODO(wal-rotation): Test coverage for obsolete-file lifecycle guard
+// - WAL rotation + flush/compaction lifecycle integration
+// - retired WAL not deleted before memtable flush + VersionSet advance
+// - grouped append/sync within rotation/obsolescence boundaries
+// ===========================================================================
+
 class FlushCompactionTest: public ::testing::Test
 {
 protected:

@@ -612,6 +612,8 @@ namespace prism
 		SequenceNumber sequence_;
 	};
 
+	// TODO(wal-rotation): LogFileGuard will gain a WalState enum (active / retired-but-recovery-live / obsolete)
+	//   and a file_number() accessor so the retired-WAL lifecycle can track state outside the main mutex.
 	class DBImpl::LogFileGuard
 	{
 	public:
@@ -629,6 +631,10 @@ namespace prism
 		log::Writer* writer() const { return writer_.get(); }
 		WritableFile* file() const { return file_.get(); }
 
+		// TODO(wal-rotation): Close() will be moved off the main mutex in MakeRoomForWrite.
+		//   The retired LogFileGuard will be handed to a background close path so new-epoch
+		//   writers are not blocked. Failure will be reported via sticky bg_error_ with the
+		//   retired WAL file number for observability.
 		Status Close()
 		{
 			writer_.reset();
@@ -886,6 +892,8 @@ namespace prism
 		std::vector<uint64_t> logs_to_recover;
 		for (uint64_t number : log_numbers)
 		{
+			// TODO(wal-rotation): Recovery replay boundary must remain [LogNumber(), ∞) ∪ {PrevLogNumber()}.
+			//   Retired-but-recovery-live WALs must be replayable even if their Close() was deferred.
 			if (number >= versions_->LogNumber() || number == versions_->PrevLogNumber())
 			{
 				logs_to_recover.push_back(number);
@@ -941,6 +949,9 @@ namespace prism
 			bool keep = true;
 			switch (type)
 			{
+			// TODO(wal-rotation): kLogFile keep logic must account for retired-but-recovery-live
+			//   WALs. A closed WAL is NOT obsolete until its memtable flush is installed and
+			//   VersionSet::LogNumber() advances past it.
 			case FileType::kLogFile:
 				keep = (number >= versions_->LogNumber());
 				break;
@@ -1297,6 +1308,8 @@ namespace prism
 		}
 	}
 
+	// TODO(wal-rotation): RecordBackgroundError will be extended to record the retired
+	//   WAL file number alongside the sticky error for observability.
 	void DBImpl::RecordBackgroundError(const Status& status)
 	{
 		if (bg_error_.ok())
@@ -1405,6 +1418,9 @@ namespace prism
 		background_work_finished_signal_.notify_all();
 	}
 
+	// TODO(wal-rotation): MakeRoomForWrite will be refactored into explicit epoch helpers:
+	//   (a) writer grouping/selection seam, (b) WAL epoch freeze, (c) room accounting
+	//   against batch size, (d) append/sync/apply completion.
 	Status DBImpl::MakeRoomForWrite(bool force, std::unique_lock<std::shared_mutex>& lock)
 	{
 		Status s;
@@ -1442,6 +1458,9 @@ namespace prism
 			}
 			else
 			{
+				// TODO(wal-rotation): WAL rotation will publish new epoch under mutex, then hand
+				//   old LogFileGuard to a background close path. The invariant is: at most one
+				//   retired recovery-live WAL exists at any time (single-imm model).
 				assert(versions_->PrevLogNumber() == 0);
 				const uint64_t new_log_number = versions_->NewFileNumber();
 				auto new_log_file = env_->NewWritableFile(LogFileName(dbname_, new_log_number));
@@ -1765,6 +1784,9 @@ namespace prism
 		return std::unexpected(Status::NotFound(Slice()));
 	}
 
+	// TODO(wal-rotation): Write() will gain a leader/follower group selection queue
+	//   that batches only contiguous same-sync, same-epoch writers. Group formation
+	//   freezes before room-making and never crosses a WAL rotation boundary.
 	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch batch)
 	{
 		std::unique_lock<std::shared_mutex> lock(mutex_);
