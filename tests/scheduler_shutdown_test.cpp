@@ -27,6 +27,13 @@ static bool WaitUntil(Pred pred, std::chrono::milliseconds timeout = 10s)
 	return pred();
 }
 
+// ===========================================================================
+// TODO(wal-rotation): Test coverage for shutdown drain of retired-close work
+// - scheduler/background work coordination for WAL rotation
+// - exact-once drain/shutdown pattern for retired-close background path
+// - shutdown drain for all retired-WAL close background tasks
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
 // ImmediateTasks
 // Submit a large batch of immediate tasks, then let the scheduler go out of

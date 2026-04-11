@@ -188,6 +188,13 @@ private:
 };
 
 // ===========================================================================
+// TODO(wal-rotation): Test coverage for retired-close & group-commit WAL paths
+// - retired-close failure + group append/sync failure fanout
+// - off-mutex retired-close unblock + sticky error handling
+// - grouped WAL append/sync fanout with failure propagation
+// ===========================================================================
+
+// ===========================================================================
 // Test fixture
 // ===========================================================================
 class FaultInjectionTest: public ::testing::Test

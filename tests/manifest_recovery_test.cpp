@@ -122,6 +122,13 @@ protected:
 	std::unique_ptr<DB> db_;
 };
 
+// ===========================================================================
+// TODO(wal-rotation): Test coverage for crash/recovery around retired WAL close
+// - recovery boundaries around WAL rotation + retired-close lifecycle
+// - crash during retired-close remains recoverable without double-apply
+// - retired WAL not deleted before VersionSet advances replay boundary
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
 // Legacy-bootstrap helpers
 // ---------------------------------------------------------------------------

@@ -59,6 +59,13 @@ namespace
 	}
 }
 
+// ===========================================================================
+// TODO(wal-rotation): Test coverage for same-sync/same-epoch group boundaries
+// - mixed sync batching prohibition + WAL rotation boundaries
+// - same-sync/same-epoch group selection without rotation crossings
+// - grouped append/sync fanout + sequence ordering preservation
+// ===========================================================================
+
 // Test fixture for DB tests
 class DBTest: public ::testing::Test
 {
