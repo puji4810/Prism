@@ -1,9 +1,8 @@
 #ifndef PRISM_DB_H
 #define PRISM_DB_H
 
-#include <expected>
-#include <string>
 #include <memory>
+#include <string>
 #include "options.h"
 #include "status.h"
 #include "result.h"
@@ -13,62 +12,19 @@
 
 namespace prism
 {
-	class DB
-	{
-	public:
-		DB() = default;
-		virtual ~DB();
+	class AsyncDB;
+	class DBImpl;
 
-		// Legacy API - prefer Database::Open for new code during the transition.
-		// DB::Open returns a unique_ptr, which is being phased out in favor of
-		// the by-value Database handle. This API is kept for backward compatibility.
-		//
-		// Open the database with the specified "name".
-		// Returns a Result containing a heap-allocated database pointer.
-		static Result<std::unique_ptr<DB>> Open(const Options& opts, const std::string& dbname);
-		static Result<std::unique_ptr<DB>> Open(const std::string& dbname);
-
-		// Set the database entry for "key" to "value".
-		// Returns OK on success, and a non-OK status on error.
-		virtual Status Put(const WriteOptions& options, const Slice& key, const Slice& value) = 0;
-
-		// For all this kinds of api, we just wrap the Func(Options, Args...) by default options
-		Status Put(const Slice& key, const Slice& value) { return Put(WriteOptions(), key, value); }
-
-		// If the database contains an entry for "key" store the
-		// corresponding value in *value and return OK.
-		//
-		// If there is no entry for "key" leave *value unchanged and return
-		// a status for which Status::IsNotFound() returns true.
-		//
-		// May return some other Status on an error.
-		virtual Result<std::string> Get(const ReadOptions& options, const Slice& key) = 0;
-		Result<std::string> Get(const Slice& key) { return Get(ReadOptions(), key); }
-
-		// Remove the database entry (if any) for "key".  Returns OK on
-		// success, and a non-OK status on error.  It is not an error if "key"
-		// did not exist in the database.
-		virtual Status Delete(const WriteOptions& options, const Slice& key) = 0;
-		Status Delete(const Slice& key) { return Delete(WriteOptions(), key); }
-
-		// Apply the specified updates to the database.
-		// Returns OK on success, non-OK on failure.
-		virtual Status Write(const WriteOptions& options, WriteBatch batch) = 0;
-		Status Write(WriteBatch batch) { return Write(WriteOptions(), std::move(batch)); }
-
-		// Return a heap-allocated iterator over the contents of the database.
-		// The caller must delete the iterator when it is no longer needed.
-		virtual std::unique_ptr<Iterator> NewIterator(const ReadOptions& options) = 0;
-
-		virtual const Snapshot* GetSnapshot() = 0;
-		virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
-	};
-
-	// Database: Preferred move-only handle for the KV store.
+	// Database: move-only public handle for the KV store.
 	//
-	// New code should prefer Database::Open over the legacy DB::Open.
-	// This handle owns the underlying DB instance and provides a cleaner
-	// by-value interface for modern C++.
+	// This handle owns the concrete engine directly and is the shipped sync
+	// entry point for open/CRUD/iterator/snapshot behavior.
+	//
+	// Public API surface summary:
+	// - Database: synchronous by-value handle.
+	// - AsyncDB: coroutine-friendly wrapper for the same engine.
+	// - Snapshot: cheap-copy RAII handle captured from Database and passed
+	//   back through the snapshot_handle field on ReadOptions.
 	class Database
 	{
 	public:
@@ -79,7 +35,7 @@ namespace prism
 		~Database();
 
 		// Opens the database and returns a by-value Database handle.
-		// This is the recommended entry point for new applications.
+		// Use AsyncDB::OpenAsync(...) for coroutine-based callers.
 		static Result<Database> Open(const Options& options, const std::string& dbname);
 		static Result<Database> Open(const std::string& dbname);
 
@@ -97,13 +53,14 @@ namespace prism
 
 		std::unique_ptr<Iterator> NewIterator(const ReadOptions& options);
 
-		const Snapshot* GetSnapshot();
-		void ReleaseSnapshot(const Snapshot* snapshot);
+		// Captures a cheap-copy Snapshot RAII handle for point-in-time reads.
+		// Store it in the snapshot_handle field on ReadOptions when issuing snapshot reads.
+		Snapshot CaptureSnapshot();
 
 	private:
-		explicit Database(std::unique_ptr<DB> impl);
+		explicit Database(std::unique_ptr<DBImpl> impl);
 
-		std::unique_ptr<DB> impl_;
+		std::unique_ptr<DBImpl> impl_;
 	};
 
 	Status DestroyDB(const std::string& dbname, const Options& options);

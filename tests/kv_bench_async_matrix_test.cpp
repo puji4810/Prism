@@ -7,7 +7,6 @@
 
 #include <gtest/gtest.h>
 #include <filesystem>
-#include <memory>
 #include <stdexcept>
 
 namespace
@@ -28,7 +27,7 @@ namespace
 	prism::AsyncDB OpenAsyncDatabase(prism::ThreadPoolScheduler& scheduler, const prism::Options& options, const std::string& db_dir)
 	{
 		auto open_task = [&]() -> prism::tests::Task<prism::AsyncDB> {
-			auto db_result = co_await prism::AsyncDB::OpenAsync(scheduler, options, db_dir);
+			auto db_result = co_await prism::AsyncDB ::OpenAsync(scheduler, options, db_dir);
 			if (!db_result.has_value())
 			{
 				throw std::runtime_error(db_result.error().ToString());
@@ -476,7 +475,7 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024 * 1024;
 
-		auto db_result = prism::DB::Open(options, db_dir);
+		auto db_result = prism::Database::Open(options, db_dir);
 		ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
 		auto db = std::move(db_result.value());
 
@@ -489,7 +488,7 @@ namespace
 		cfg.no_latency = true;
 
 		auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
-		auto stats = prism::bench::RunSyncDurabilityWrite(*db, cfg, keys);
+		auto stats = prism::bench::RunSyncDurabilityWrite(db, cfg, keys);
 
 		// Verify that write_sync is set to 1
 		EXPECT_EQ(stats.write_sync, 1);

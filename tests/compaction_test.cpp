@@ -145,12 +145,12 @@ protected:
 		std::filesystem::remove_all(kDbName, ec);
 	}
 
-	std::unique_ptr<DB> OpenDB()
+	std::unique_ptr<DBImpl> OpenDB()
 	{
 		Options opts;
 		opts.create_if_missing = true;
-		auto res = DB::Open(opts, kDbName);
-		EXPECT_TRUE(res.has_value()) << "DB::Open failed";
+		auto res = DBImpl::OpenInternal(opts, kDbName);
+		EXPECT_TRUE(res.has_value()) << "DBImpl::OpenInternal failed";
 		if (!res.has_value())
 			return nullptr;
 		return std::move(res.value());
@@ -174,7 +174,7 @@ TEST_F(CompactionTest, IteratorPinsFilesUntilRelease)
 	ASSERT_TRUE(db->Put("beta", "2").ok());
 	ASSERT_TRUE(db->Put("gamma", "3").ok());
 
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 
 	// Before creating iterator: the current version has exactly 1 ref
 	// (held by VersionSet::current_).
@@ -219,7 +219,7 @@ TEST_F(CompactionTest, GetUsesPinnedCurrentVersion)
 
 	ASSERT_TRUE(db->Put("key", "value").ok());
 
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 
 	int refs_before = impl->TEST_CurrentVersionRefs();
 
@@ -246,7 +246,7 @@ TEST_F(CompactionTest, MultipleIteratorsPinIndependently)
 	ASSERT_TRUE(db->Put("x", "1").ok());
 	ASSERT_TRUE(db->Put("y", "2").ok());
 
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 	int base_refs = impl->TEST_CurrentVersionRefs();
 
 	{
@@ -277,10 +277,10 @@ TEST_F(CompactionTest, SingleBackgroundCompactionScheduled)
 	opts.create_if_missing = true;
 	opts.write_buffer_size = 128;
 
-	auto open = DB::Open(opts, kDbName);
+	auto open = DBImpl::OpenInternal(opts, kDbName);
 	ASSERT_TRUE(open.has_value()) << open.error().ToString();
 	auto db = std::move(open.value());
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 
 	for (int i = 0; i < 64; ++i)
 	{
@@ -326,7 +326,7 @@ TEST_F(CompactionTest, BackgroundErrorBecomesSticky)
 	opts.create_if_missing = true;
 	opts.write_buffer_size = 128;
 
-	auto open = DB::Open(opts, kDbName);
+	auto open = DBImpl::OpenInternal(opts, kDbName);
 	ASSERT_TRUE(open.has_value()) << open.error().ToString();
 	auto db = std::move(open.value());
 
@@ -354,10 +354,10 @@ TEST_F(CompactionTest, TrivialMoveInstallsViaManifestOnly)
 	Options opts;
 	opts.create_if_missing = true;
 
-	auto open = DB::Open(opts, kDbName);
+	auto open = DBImpl::OpenInternal(opts, kDbName);
 	ASSERT_TRUE(open.has_value()) << open.error().ToString();
 	auto db = std::move(open.value());
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 
 	const uint64_t moved_file = CreateSingleKeyTableFile(impl, kDbName, "k", "v");
 	ASSERT_NE(moved_file, 0ULL);

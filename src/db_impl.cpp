@@ -28,9 +28,32 @@
 
 namespace prism
 {
+	struct SnapshotOwnerToken
+	{
+		std::atomic<size_t> active_snapshots{ 0 };
+	};
+
+	struct SnapshotState
+	{
+		SnapshotState(SequenceNumber sequence_number, std::shared_ptr<SnapshotOwnerToken> owner_token_value)
+		    : sequence(sequence_number)
+		    , owner_token(std::move(owner_token_value))
+		{
+		}
+
+		~SnapshotState() { owner_token->active_snapshots.fetch_sub(1, std::memory_order_acq_rel); }
+
+		const SequenceNumber sequence;
+		const std::shared_ptr<SnapshotOwnerToken> owner_token;
+	};
+
 	namespace
 	{
 		constexpr int kNumNonTableCacheFiles = 10;
+
+		Status InvalidSnapshotOwnerStatus() { return Status::InvalidArgument("snapshot does not belong to this database"); }
+
+		Status EmptySnapshotHandleStatus() { return Status::InvalidArgument("snapshot handle is empty"); }
 
 		// ─────────────────────────────────────────────────────────────────────────
 		// ReadView – a pinned snapshot of the DB read state.
@@ -71,6 +94,20 @@ namespace prism
 		{
 			const int entries = options.max_open_files - kNumNonTableCacheFiles;
 			return (entries > 0) ? entries : 1;
+		}
+
+		Options SanitizeOpenOptions(const Options& options)
+		{
+			Options opts = options;
+			if (opts.env == nullptr)
+			{
+				opts.env = Env::Default();
+			}
+			if (opts.comparator == nullptr)
+			{
+				opts.comparator = BytewiseComparator();
+			}
+			return opts;
 		}
 
 		Status BuildTable(const std::string& dbname, Env* env, const Options& options, TableCache* table_cache, uint64_t file_number,
@@ -653,9 +690,7 @@ namespace prism
 		std::unique_ptr<log::Writer> writer_;
 	};
 
-	DB::~DB() = default;
-
-	Database::Database(std::unique_ptr<DB> impl)
+	Database::Database(std::unique_ptr<DBImpl> impl)
 	    : impl_(std::move(impl))
 	{
 	}
@@ -668,7 +703,7 @@ namespace prism
 
 	Result<Database> Database::Open(const Options& options, const std::string& dbname)
 	{
-		auto result = DB::Open(options, dbname);
+		auto result = DBImpl::OpenInternal(options, dbname);
 		if (!result.has_value())
 		{
 			return std::unexpected(result.error());
@@ -693,21 +728,11 @@ namespace prism
 
 	std::unique_ptr<Iterator> Database::NewIterator(const ReadOptions& options) { return impl_->NewIterator(options); }
 
-	const Snapshot* Database::GetSnapshot() { return impl_->GetSnapshot(); }
+	Snapshot Database::CaptureSnapshot() { return impl_->CaptureSnapshot(); }
 
-	void Database::ReleaseSnapshot(const Snapshot* snapshot) { impl_->ReleaseSnapshot(snapshot); }
-
-	Result<std::unique_ptr<DB>> DB::Open(const Options& options, const std::string& dbname)
+	Result<std::unique_ptr<DBImpl>> DBImpl::OpenInternal(const Options& options, const std::string& dbname)
 	{
-		Options opts = options;
-		if (opts.env == nullptr)
-		{
-			opts.env = Env::Default();
-		}
-		if (opts.comparator == nullptr)
-		{
-			opts.comparator = BytewiseComparator();
-		}
+		Options opts = SanitizeOpenOptions(options);
 
 		auto impl = std::make_unique<DBImpl>(opts, dbname);
 		Status s = impl->Recover();
@@ -715,14 +740,14 @@ namespace prism
 		{
 			return std::unexpected(s);
 		}
-		return std::unique_ptr<DB>(std::move(impl));
+		return impl;
 	}
 
-	Result<std::unique_ptr<DB>> DB::Open(const std::string& dbname)
+	Result<std::unique_ptr<DBImpl>> DBImpl::OpenInternal(const std::string& dbname)
 	{
 		Options options;
 		options.create_if_missing = true;
-		return Open(options, dbname);
+		return OpenInternal(options, dbname);
 	}
 
 	DBImpl::DBImpl(const Options& options, const std::string& dbname)
@@ -733,6 +758,7 @@ namespace prism
 	    , mem_(nullptr)
 	    , internal_comparator_(options.comparator)
 	    , versions_(nullptr)
+	    , snapshot_owner_token_(std::make_shared<SnapshotOwnerToken>())
 	{
 		options_.comparator = &internal_comparator_;
 
@@ -1667,14 +1693,12 @@ namespace prism
 		SequenceNumber snapshot = 0;
 		{
 			std::shared_lock<std::shared_mutex> lock(mutex_);
-			if (read_options.snapshot != nullptr)
+			auto snapshot_result = ResolveSnapshotSequence(read_options.snapshot_handle);
+			if (!snapshot_result.has_value())
 			{
-				snapshot = static_cast<const SnapshotImpl*>(read_options.snapshot)->GetSequenceNumber();
+				return std::unexpected(snapshot_result.error());
 			}
-			else
-			{
-				snapshot = (sequence_ == 0 ? 0 : sequence_ - 1);
-			}
+			snapshot = snapshot_result.value();
 			mem = mem_;
 			if (mem != nullptr)
 				mem->Ref();
@@ -1874,14 +1898,13 @@ namespace prism
 		{
 			std::shared_lock<std::shared_mutex> lock(mutex_);
 			sv = new SuperVersionLite;
-			if (read_options.snapshot != nullptr)
+			auto snapshot_result = ResolveSnapshotSequence(read_options.snapshot_handle);
+			if (!snapshot_result.has_value())
 			{
-				sv->snapshot = static_cast<const SnapshotImpl*>(read_options.snapshot)->GetSequenceNumber();
+				delete sv;
+				return std::unique_ptr<Iterator>(NewErrorIterator(snapshot_result.error()));
 			}
-			else
-			{
-				sv->snapshot = sequence_ - 1;
-			}
+			sv->snapshot = snapshot_result.value();
 
 			sv->mem = mem_;
 			if (sv->mem != nullptr)
@@ -1927,16 +1950,31 @@ namespace prism
 		return iter;
 	}
 
-	const Snapshot* DBImpl::GetSnapshot()
+	Snapshot DBImpl::CaptureSnapshot()
 	{
 		std::lock_guard<std::shared_mutex> lock(mutex_);
-		return new SnapshotImpl(sequence_ - 1);
+		snapshot_owner_token_->active_snapshots.fetch_add(1, std::memory_order_acq_rel);
+		return Snapshot(std::make_shared<SnapshotState>(sequence_ - 1, snapshot_owner_token_));
 	}
 
-	void DBImpl::ReleaseSnapshot(const Snapshot* snapshot)
+	Result<SequenceNumber> DBImpl::ResolveSnapshotSequence(const std::optional<Snapshot>& snapshot_handle) const
 	{
-		std::lock_guard<std::shared_mutex> lock(mutex_);
-		delete static_cast<const SnapshotImpl*>(snapshot);
+		if (!snapshot_handle.has_value())
+		{
+			return (sequence_ == 0 ? 0 : sequence_ - 1);
+		}
+
+		if (!snapshot_handle->state_)
+		{
+			return std::unexpected(EmptySnapshotHandleStatus());
+		}
+
+		if (snapshot_handle->state_->owner_token.get() != snapshot_owner_token_.get())
+		{
+			return std::unexpected(InvalidSnapshotOwnerStatus());
+		}
+
+		return snapshot_handle->state_->sequence;
 	}
 
 	Version* DBImpl::TEST_CurrentVersion() const
@@ -2036,6 +2074,8 @@ namespace prism
 		std::lock_guard<std::shared_mutex> lock(mutex_);
 		return pending_outputs_.empty();
 	}
+
+	size_t DBImpl::TEST_ActiveSnapshotCount() const { return snapshot_owner_token_->active_snapshots.load(std::memory_order_acquire); }
 
 	Status DestroyDB(const std::string& dbname, const Options& options)
 	{

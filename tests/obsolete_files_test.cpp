@@ -9,11 +9,8 @@
 //   • Only when all iterators are destroyed does the version become eligible
 //     for collection.
 
-#include "db.h"
 #include "db_impl.h"
 #include "filename.h"
-#include "version_set.h"
-#include "write_batch.h"
 
 #include <filesystem>
 #include <fstream>
@@ -44,12 +41,12 @@ protected:
 		std::filesystem::remove_all(kDbName, ec);
 	}
 
-	std::unique_ptr<DB> OpenDB()
+	std::unique_ptr<DBImpl> OpenDB()
 	{
 		Options opts;
 		opts.create_if_missing = true;
-		auto res = DB::Open(opts, kDbName);
-		EXPECT_TRUE(res.has_value()) << "DB::Open failed";
+		auto res = DBImpl::OpenInternal(opts, kDbName);
+		EXPECT_TRUE(res.has_value()) << "DBImpl::OpenInternal failed";
 		if (!res.has_value())
 			return nullptr;
 		return std::move(res.value());
@@ -107,7 +104,7 @@ TEST_F(ObsoleteFilesTest, LiveIteratorPreventsDeletion)
 		ASSERT_TRUE(db->Put(k, v).ok());
 	}
 
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 
 	// Baseline ref count.
 	int base_refs = impl->TEST_CurrentVersionRefs();
@@ -156,7 +153,7 @@ TEST_F(ObsoleteFilesTest, GetDoesNotLeakVersionRef)
 
 	ASSERT_TRUE(db->Put("leak_check", "ok").ok());
 
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 	int refs_before = impl->TEST_CurrentVersionRefs();
 
 	for (int i = 0; i < 5; ++i)
@@ -185,7 +182,7 @@ TEST_F(ObsoleteFilesTest, IteratorAndGetInterleaved)
 		ASSERT_TRUE(db->Put("k" + std::to_string(i), "v" + std::to_string(i)).ok());
 	}
 
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 	int base_refs = impl->TEST_CurrentVersionRefs();
 
 	// Create iterator – pins the version.
@@ -215,7 +212,7 @@ TEST_F(ObsoleteFilesTest, PendingOutputIsNotDeleted)
 	auto db = OpenDB();
 	ASSERT_NE(db, nullptr);
 
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 	const uint64_t pending_number = 900001;
 	impl->TEST_AddPendingOutput(pending_number);
 
@@ -232,7 +229,7 @@ TEST_F(ObsoleteFilesTest, ObsoleteTableEvictsCacheBeforeDelete)
 	Options opts;
 	opts.create_if_missing = true;
 	opts.write_buffer_size = 128;
-	auto open_res = DB::Open(opts, kDbName);
+	auto open_res = DBImpl::OpenInternal(opts, kDbName);
 	ASSERT_TRUE(open_res.has_value());
 	auto db = std::move(open_res.value());
 
@@ -250,10 +247,10 @@ TEST_F(ObsoleteFilesTest, ObsoleteTableEvictsCacheBeforeDelete)
 	CreateDummyFile(stale_file);
 	ASSERT_TRUE(std::filesystem::exists(stale_file));
 
-	auto reopen_res = DB::Open(opts, kDbName);
+	auto reopen_res = DBImpl::OpenInternal(opts, kDbName);
 	ASSERT_TRUE(reopen_res.has_value());
 	auto reopened = std::move(reopen_res.value());
-	auto* impl = static_cast<DBImpl*>(reopened.get());
+	auto* impl = reopened.get();
 
 	impl->TEST_RemoveObsoleteFiles();
 	EXPECT_FALSE(std::filesystem::exists(stale_file));
@@ -264,7 +261,7 @@ TEST_F(ObsoleteFilesTest, RecoveryRemovesDeadLogsButKeepsLiveTables)
 	Options opts;
 	opts.create_if_missing = true;
 	opts.write_buffer_size = 128;
-	auto open_res = DB::Open(opts, kDbName);
+	auto open_res = DBImpl::OpenInternal(opts, kDbName);
 	ASSERT_TRUE(open_res.has_value());
 	auto db = std::move(open_res.value());
 
@@ -281,10 +278,10 @@ TEST_F(ObsoleteFilesTest, RecoveryRemovesDeadLogsButKeepsLiveTables)
 	CreateDummyFile(stale_log);
 	ASSERT_TRUE(std::filesystem::exists(stale_log));
 
-	auto reopen_res = DB::Open(opts, kDbName);
+	auto reopen_res = DBImpl::OpenInternal(opts, kDbName);
 	ASSERT_TRUE(reopen_res.has_value());
 	auto reopened = std::move(reopen_res.value());
-	auto* impl = static_cast<DBImpl*>(reopened.get());
+	auto* impl = reopened.get();
 
 	impl->TEST_RemoveObsoleteFiles();
 	EXPECT_FALSE(std::filesystem::exists(stale_log));
@@ -306,7 +303,7 @@ TEST_F(ObsoleteFilesTest, VersionRefsReturnToBaselineAfterVersionTurnover)
 	auto db = OpenDB();
 	ASSERT_NE(db, nullptr);
 
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 	int baseline = impl->TEST_CurrentVersionRefs();
 
 	// Write enough data to trigger compaction or version turnover.
@@ -345,7 +342,7 @@ TEST_F(ObsoleteFilesTest, ConcurrentGetsAfterRecoveryDoNotAccumulateVersionRefs)
 	auto db = OpenDB();
 	ASSERT_NE(db, nullptr);
 
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 	int baseline = impl->TEST_CurrentVersionRefs();
 
 	// Run concurrent Get() operations.

@@ -19,34 +19,28 @@ namespace prism
 	class FileLock;
 	class TableCache;
 	class CompactionExecutionTest;
+	struct SnapshotOwnerToken;
 
-	class SnapshotImpl: public Snapshot
+	class DBImpl
 	{
 	public:
-		explicit SnapshotImpl(SequenceNumber seq)
-		    : sequence_number_(seq)
-		{
-		}
-		SequenceNumber GetSequenceNumber() const { return sequence_number_; }
+		static Result<std::unique_ptr<DBImpl>> OpenInternal(const Options& options, const std::string& dbname);
+		static Result<std::unique_ptr<DBImpl>> OpenInternal(const std::string& dbname);
 
-	private:
-		SequenceNumber sequence_number_;
-	};
-
-	class DBImpl: public DB
-	{
-	public:
 		DBImpl(const Options& options, const std::string& dbname);
-		~DBImpl() override;
-		Status Put(const WriteOptions& options, const Slice& key, const Slice& value) override;
-		Result<std::string> Get(const ReadOptions& options, const Slice& key) override;
-		Status Delete(const WriteOptions& options, const Slice& key) override;
+		~DBImpl();
+		Status Put(const WriteOptions& options, const Slice& key, const Slice& value);
+		Status Put(const Slice& key, const Slice& value) { return Put(WriteOptions(), key, value); }
+		Result<std::string> Get(const ReadOptions& options, const Slice& key);
+		Result<std::string> Get(const Slice& key) { return Get(ReadOptions(), key); }
+		Status Delete(const WriteOptions& options, const Slice& key);
+		Status Delete(const Slice& key) { return Delete(WriteOptions(), key); }
 		// TODO(wal-rotation): Write() will gain a leader/follower group-commit queue.
 		//   Batching policy: contiguous, same-sync, same-epoch, bounded by count/bytes.
-		Status Write(const WriteOptions& options, WriteBatch batch) override;
-		std::unique_ptr<Iterator> NewIterator(const ReadOptions& options) override;
-		const Snapshot* GetSnapshot() override;
-		void ReleaseSnapshot(const Snapshot* snapshot) override;
+		Status Write(const WriteOptions& options, WriteBatch batch);
+		Status Write(WriteBatch batch) { return Write(WriteOptions(), std::move(batch)); }
+		std::unique_ptr<Iterator> NewIterator(const ReadOptions& options);
+		Snapshot CaptureSnapshot();
 
 		// ── Test-only accessors ──────────────────────────────────────────────
 		// Returns the current Version pointer (no additional Ref).
@@ -70,9 +64,9 @@ namespace prism
 		const Options& TEST_Options() const { return options_; }
 		const std::string& TEST_DBName() const { return dbname_; }
 		bool TEST_PendingOutputsEmpty() const;
+		size_t TEST_ActiveSnapshotCount() const;
 
 	private:
-		friend class DB;
 		friend class CompactionExecutionTest;
 
 		class RecoveryHandler;
@@ -95,6 +89,7 @@ namespace prism
 		void RemoveObsoleteFiles();
 		Status NewLogFile();
 		Status CloseLogFile();
+		Result<SequenceNumber> ResolveSnapshotSequence(const std::optional<Snapshot>& snapshot_handle) const;
 
 		mutable std::shared_mutex mutex_;
 		std::condition_variable_any background_work_finished_signal_;
@@ -125,6 +120,7 @@ namespace prism
 		Status bg_error_;
 		bool bg_compaction_scheduled_ = false;
 		std::atomic<bool> shutting_down_{ false };
+		std::shared_ptr<SnapshotOwnerToken> snapshot_owner_token_;
 	};
 } // namespace prism
 

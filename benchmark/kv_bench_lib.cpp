@@ -126,7 +126,7 @@ namespace prism::bench
 		return v[idx];
 	}
 
-	void Prefill(DB& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size)
+	void Prefill(Database& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size)
 	{
 		const std::string value = MakeValue(value_size);
 		for (std::size_t t = 0; t < keys.size(); ++t)
@@ -142,7 +142,7 @@ namespace prism::bench
 		}
 	}
 
-	Stats RunSyncMixed(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	Stats RunSyncMixed(Database& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
 		if (!cfg.no_latency)
@@ -247,7 +247,7 @@ namespace prism::bench
 		return out;
 	}
 
-	Stats RunSyncDiskRead(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	Stats RunSyncDiskRead(Database& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
 		if (!cfg.no_latency)
@@ -334,7 +334,7 @@ namespace prism::bench
 		return out;
 	}
 
-	Stats RunSyncDurabilityWrite(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	Stats RunSyncDurabilityWrite(Database& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
 		if (!cfg.no_latency)

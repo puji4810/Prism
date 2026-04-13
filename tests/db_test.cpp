@@ -1,4 +1,5 @@
 #include "db.h"
+#include "db_impl.h"
 #include "write_batch.h"
 #include "env.h"
 
@@ -12,51 +13,8 @@ using namespace prism;
 
 namespace
 {
-	struct DbOperationParity
-	{
-		Status put_status;
-		Result<std::string> get_before_delete;
-		Status delete_status;
-		Result<std::string> get_after_delete;
-	};
-
-	DbOperationParity RunLegacyOperations(const std::string& path)
-	{
-		auto open = DB::Open(path);
-		EXPECT_TRUE(open.has_value()) << open.error().ToString();
-		if (!open.has_value())
-		{
-			return { Status::IOError("legacy open failed"), std::unexpected(Status::IOError("legacy open failed")),
-				Status::IOError("legacy open failed"), std::unexpected(Status::IOError("legacy open failed")) };
-		}
-
-		auto db = std::move(open.value());
-		DbOperationParity result;
-		result.put_status = db->Put("parity_key", "parity_value");
-		result.get_before_delete = db->Get("parity_key");
-		result.delete_status = db->Delete("parity_key");
-		result.get_after_delete = db->Get("parity_key");
-		return result;
-	}
-
-	DbOperationParity RunDatabaseOperations(const std::string& path)
-	{
-		auto open = Database::Open(path);
-		EXPECT_TRUE(open.has_value()) << open.error().ToString();
-		if (!open.has_value())
-		{
-			return { Status::IOError("database open failed"), std::unexpected(Status::IOError("database open failed")),
-				Status::IOError("database open failed"), std::unexpected(Status::IOError("database open failed")) };
-		}
-
-		auto db = std::move(open.value());
-		DbOperationParity result;
-		result.put_status = db.Put("parity_key", "parity_value");
-		result.get_before_delete = db.Get("parity_key");
-		result.delete_status = db.Delete("parity_key");
-		result.get_after_delete = db.Get("parity_key");
-		return result;
-	}
+	// Characters used for large value generation
+	const char kValueChar = 'X';
 }
 
 // ===========================================================================
@@ -77,10 +35,8 @@ protected:
 		std::filesystem::remove_all("test_db", ec);
 		std::filesystem::remove_all("test_db_large", ec);
 		std::filesystem::remove_all("test_db_multi_large", ec);
-		std::filesystem::remove_all("test_db_legacy_parity", ec);
-		std::filesystem::remove_all("test_db_database_parity", ec);
-		std::filesystem::remove_all("test_db_missing_legacy_parity", ec);
-		std::filesystem::remove_all("test_db_missing_database_parity", ec);
+		std::filesystem::remove_all("test_db_open_path", ec);
+		std::filesystem::remove_all("test_db_missing_database_path", ec);
 	}
 
 	void TearDown() override
@@ -90,10 +46,8 @@ protected:
 		std::filesystem::remove_all("test_db", ec);
 		std::filesystem::remove_all("test_db_large", ec);
 		std::filesystem::remove_all("test_db_multi_large", ec);
-		std::filesystem::remove_all("test_db_legacy_parity", ec);
-		std::filesystem::remove_all("test_db_database_parity", ec);
-		std::filesystem::remove_all("test_db_missing_legacy_parity", ec);
-		std::filesystem::remove_all("test_db_missing_database_parity", ec);
+		std::filesystem::remove_all("test_db_open_path", ec);
+		std::filesystem::remove_all("test_db_missing_database_path", ec);
 	}
 };
 
@@ -144,6 +98,23 @@ TEST_F(DBTest, DatabaseHandleBasicPutGetDelete)
 
 	auto s4 = db.Get("key1");
 	EXPECT_TRUE(s4.error().IsNotFound()) << "Get should return NotFound after delete";
+}
+
+// Characterization baseline for engine-facing open expectations.
+TEST_F(DBTest, DatabaseHandleOpenBaseline)
+{
+	Options options;
+	options.create_if_missing = true;
+
+	auto res = Database::Open(options, "test_db");
+	ASSERT_TRUE(res.has_value()) << res.error().ToString();
+
+	auto db = std::move(res.value());
+	ASSERT_TRUE(db.Put("engine_baseline_key", "engine_baseline_value").ok());
+
+	auto get_result = db.Get("engine_baseline_key");
+	ASSERT_TRUE(get_result.has_value()) << get_result.error().ToString();
+	EXPECT_EQ(get_result.value(), "engine_baseline_value");
 }
 
 TEST_F(DBTest, BatchWrite)
@@ -399,13 +370,12 @@ TEST_F(DBTest, SnapshotReadRemainsStableAcrossWrites)
 
 	ASSERT_TRUE(db.Put("k1", "v1").ok());
 
-	const Snapshot* snap = db.GetSnapshot();
-	ASSERT_NE(snap, nullptr);
+	Snapshot snap = db.CaptureSnapshot();
 
 	ASSERT_TRUE(db.Put("k1", "v2").ok());
 
 	ReadOptions snap_opts;
-	snap_opts.snapshot = snap;
+	snap_opts.snapshot_handle = snap;
 	auto snap_result = db.Get(snap_opts, "k1");
 	ASSERT_TRUE(snap_result.has_value());
 	EXPECT_EQ("v1", snap_result.value()) << "Snapshot read should return value at snapshot time";
@@ -422,8 +392,6 @@ TEST_F(DBTest, SnapshotReadRemainsStableAcrossWrites)
 
 	current_result = db.Get("k1");
 	EXPECT_TRUE(current_result.error().IsNotFound()) << "Current read should return NotFound after delete";
-
-	db.ReleaseSnapshot(snap);
 }
 
 TEST_F(DBTest, SnapshotIteratorSeesStableView)
@@ -436,15 +404,14 @@ TEST_F(DBTest, SnapshotIteratorSeesStableView)
 	ASSERT_TRUE(db.Put("b", "2").ok());
 	ASSERT_TRUE(db.Put("c", "3").ok());
 
-	const Snapshot* snap = db.GetSnapshot();
-	ASSERT_NE(snap, nullptr);
+	Snapshot snap = db.CaptureSnapshot();
 
 	ASSERT_TRUE(db.Delete("b").ok());
 	ASSERT_TRUE(db.Put("c", "33").ok());
 	ASSERT_TRUE(db.Put("d", "4").ok());
 
 	ReadOptions snap_opts;
-	snap_opts.snapshot = snap;
+	snap_opts.snapshot_handle = snap;
 	std::unique_ptr<Iterator> it = db.NewIterator(snap_opts);
 
 	it->SeekToFirst();
@@ -465,49 +432,112 @@ TEST_F(DBTest, SnapshotIteratorSeesStableView)
 	it->Next();
 	EXPECT_FALSE(it->Valid()) << "Iterator should not see key 'd' added after snapshot";
 	EXPECT_TRUE(it->status().ok()) << it->status().ToString();
-
-	db.ReleaseSnapshot(snap);
 }
 
-TEST_F(DBTest, LegacyAndDatabaseHandleOpenParity)
+TEST_F(DBTest, SnapshotReadOptionsCopyKeepsViewAlive)
 {
-	const std::string legacy_path = "test_db_legacy_parity";
-	const std::string database_path = "test_db_database_parity";
-	const std::string missing_legacy_path = "test_db_missing_legacy_parity";
-	const std::string missing_database_path = "test_db_missing_database_parity";
+	auto res = Database::Open("test_db");
+	ASSERT_TRUE(res.has_value());
+	auto db = std::move(res.value());
+
+	ASSERT_TRUE(db.Put("copy_key", "before").ok());
+
+	ReadOptions copied_options;
+	{
+		Snapshot snapshot = db.CaptureSnapshot();
+		ReadOptions original_options;
+		original_options.snapshot_handle = snapshot;
+		copied_options = original_options;
+	}
+
+	ASSERT_TRUE(db.Put("copy_key", "after").ok());
+
+	auto snapshot_result = db.Get(copied_options, "copy_key");
+	ASSERT_TRUE(snapshot_result.has_value()) << snapshot_result.error().ToString();
+	EXPECT_EQ("before", snapshot_result.value());
+}
+
+TEST_F(DBTest, SnapshotRejectsCrossDatabaseUse)
+{
+	auto left_result = Database::Open("test_db");
+	ASSERT_TRUE(left_result.has_value()) << left_result.error().ToString();
+	auto left_db = std::move(left_result.value());
+
+	auto right_result = Database::Open("test_db_large");
+	ASSERT_TRUE(right_result.has_value()) << right_result.error().ToString();
+	auto right_db = std::move(right_result.value());
+
+	ASSERT_TRUE(left_db.Put("shared_key", "left_value").ok());
+	ASSERT_TRUE(right_db.Put("shared_key", "right_value").ok());
+
+	ReadOptions wrong_options;
+	wrong_options.snapshot_handle = left_db.CaptureSnapshot();
+
+	auto get_result = right_db.Get(wrong_options, "shared_key");
+	ASSERT_FALSE(get_result.has_value());
+	EXPECT_TRUE(get_result.error().IsInvalidArgument()) << get_result.error().ToString();
+
+	auto iter = right_db.NewIterator(wrong_options);
+	ASSERT_NE(iter, nullptr);
+	EXPECT_FALSE(iter->Valid());
+	EXPECT_TRUE(iter->status().IsInvalidArgument()) << iter->status().ToString();
+}
+
+TEST_F(DBTest, SnapshotLastOwnerReleaseUnpinsState)
+{
+	Options options;
+	options.create_if_missing = true;
+
+	auto open_result = DBImpl::OpenInternal(options, "test_db");
+	ASSERT_TRUE(open_result.has_value()) << open_result.error().ToString();
+	auto db = std::move(open_result.value());
+
+	EXPECT_EQ(0U, db->TEST_ActiveSnapshotCount());
+
+	Snapshot snapshot = db->CaptureSnapshot();
+	EXPECT_EQ(1U, db->TEST_ActiveSnapshotCount());
+
+	{
+		Snapshot copy_one = snapshot;
+		Snapshot copy_two = copy_one;
+		EXPECT_EQ(1U, db->TEST_ActiveSnapshotCount());
+	}
+
+	EXPECT_EQ(1U, db->TEST_ActiveSnapshotCount());
+	snapshot = Snapshot();
+	EXPECT_EQ(0U, db->TEST_ActiveSnapshotCount());
+}
+
+TEST_F(DBTest, DatabaseHandleOpen)
+{
+	const std::string default_path = "test_db_open_path";
+	const std::string missing_database_path = "test_db_missing_database_path";
 	std::error_code ec;
-	std::filesystem::remove_all(legacy_path, ec);
-	std::filesystem::remove_all(database_path, ec);
-	std::filesystem::remove_all(missing_legacy_path, ec);
+	std::filesystem::remove_all(default_path, ec);
 	std::filesystem::remove_all(missing_database_path, ec);
 
-	auto legacy = RunLegacyOperations(legacy_path);
-	auto database = RunDatabaseOperations(database_path);
-
-	EXPECT_EQ(legacy.put_status.ok(), database.put_status.ok());
-	EXPECT_EQ(legacy.get_before_delete.has_value(), database.get_before_delete.has_value());
-	ASSERT_TRUE(legacy.get_before_delete.has_value());
-	ASSERT_TRUE(database.get_before_delete.has_value());
-	EXPECT_EQ(legacy.get_before_delete.value(), database.get_before_delete.value());
-	EXPECT_EQ(legacy.delete_status.ok(), database.delete_status.ok());
-	EXPECT_EQ(legacy.get_after_delete.has_value(), database.get_after_delete.has_value());
-	EXPECT_TRUE(legacy.get_after_delete.error().IsNotFound());
-	EXPECT_TRUE(database.get_after_delete.error().IsNotFound());
+	{
+		auto res = Database::Open(default_path);
+		ASSERT_TRUE(res.has_value());
+		auto db = std::move(res.value());
+		ASSERT_TRUE(db.Put("key", "value").ok());
+		auto get_res = db.Get("key");
+		ASSERT_TRUE(get_res.has_value());
+		EXPECT_EQ(get_res.value(), "value");
+		ASSERT_TRUE(db.Delete("key").ok());
+		auto get_after = db.Get("key");
+		EXPECT_TRUE(get_after.error().IsNotFound());
+	}
 
 	Options missing_options;
 	missing_options.create_if_missing = false;
-	auto legacy_missing = DB::Open(missing_options, missing_legacy_path);
 	auto database_missing = Database::Open(missing_options, missing_database_path);
-	EXPECT_EQ(legacy_missing.has_value(), database_missing.has_value());
-	ASSERT_FALSE(legacy_missing.has_value());
 	ASSERT_FALSE(database_missing.has_value());
-	EXPECT_EQ(legacy_missing.error().IsInvalidArgument(), database_missing.error().IsInvalidArgument());
-	EXPECT_NE(legacy_missing.error().ToString().find("does not exist (create_if_missing is false)"), std::string::npos);
 	EXPECT_NE(database_missing.error().ToString().find("does not exist (create_if_missing is false)"), std::string::npos);
 }
 
 // ===========================================================================
-// Characterization tests for DB::Open ownership/lifetime behavior
+// Characterization tests for Database::Open ownership/lifetime behavior
 // These tests lock current behavior BEFORE any RAII refactoring.
 // ===========================================================================
 
@@ -534,7 +564,7 @@ private:
 	std::atomic<bool> fail_get_children_;
 };
 
-// When DB::Open fails after acquiring the DB lock, the lock must be released
+// When Database::Open fails after acquiring the DB lock, the lock must be released
 // so that a subsequent open on the same path can succeed.
 TEST_F(DBTest, OpenFailureReleasesLockAndAllowsRetry)
 {
@@ -551,7 +581,7 @@ TEST_F(DBTest, OpenFailureReleasesLockAndAllowsRetry)
 	opts.create_if_missing = true;
 
 	fault_env.SetFailGetChildren(true);
-	auto res1 = DB::Open(opts, test_path);
+	auto res1 = Database::Open(opts, test_path);
 	EXPECT_FALSE(res1.has_value()) << "First open should fail due to injected fault";
 	EXPECT_TRUE(res1.error().IsIOError()) << "Error should be IOError: " << res1.error().ToString();
 
@@ -559,14 +589,13 @@ TEST_F(DBTest, OpenFailureReleasesLockAndAllowsRetry)
 	fault_env.SetFailGetChildren(false);
 
 	// Second open attempt: should succeed because lock was released
-	auto res2 = DB::Open(opts, test_path);
+	auto res2 = Database::Open(opts, test_path);
 	ASSERT_TRUE(res2.has_value()) << "Second open should succeed after lock release: " << res2.error().ToString();
 
 	auto db = std::move(res2.value());
-	EXPECT_TRUE(db->Put("key", "value").ok());
+	EXPECT_TRUE(db.Put("key", "value").ok());
 
 	// Cleanup
-	db.reset();
 	std::filesystem::remove_all(test_path, ec);
 }
 
@@ -580,7 +609,7 @@ TEST_F(DBTest, OpenHonorsCreateIfMissingFalse)
 	Options opts;
 	opts.create_if_missing = false; // Do not create if missing
 
-	auto res = DB::Open(opts, test_path);
+	auto res = Database::Open(opts, test_path);
 	EXPECT_FALSE(res.has_value()) << "Open should fail for non-existent DB with create_if_missing=false";
 	EXPECT_TRUE(res.error().IsInvalidArgument()) << "Error should be InvalidArgument: " << res.error().ToString();
 
@@ -599,17 +628,17 @@ TEST_F(DBTest, OpenHonorsErrorIfExistsTrue)
 	{
 		Options create_opts;
 		create_opts.create_if_missing = true;
-		auto res = DB::Open(create_opts, test_path);
+		auto res = Database::Open(create_opts, test_path);
 		ASSERT_TRUE(res.has_value()) << "Initial DB creation should succeed: " << res.error().ToString();
 		auto db = std::move(res.value());
-		EXPECT_TRUE(db->Put("key", "value").ok());
+		EXPECT_TRUE(db.Put("key", "value").ok());
 	}
 
 	// Now try to open with error_if_exists=true
 	{
 		Options error_opts;
 		error_opts.error_if_exists = true;
-		auto res = DB::Open(error_opts, test_path);
+		auto res = Database::Open(error_opts, test_path);
 		EXPECT_FALSE(res.has_value()) << "Open should fail for existing DB with error_if_exists=true";
 		EXPECT_TRUE(res.error().IsInvalidArgument()) << "Error should be InvalidArgument: " << res.error().ToString();
 	}

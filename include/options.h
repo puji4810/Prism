@@ -7,20 +7,39 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <optional>
 
 namespace prism
 {
 
 	class Cache;
 	class Comparator;
+	class DBImpl;
 	class Env;
 	class FilterPolicy;
 	class Logger;
+	struct SnapshotState;
 
 	class Snapshot
 	{
-	protected:
-		virtual ~Snapshot() = default;
+	public:
+		Snapshot() = default;
+		Snapshot(const Snapshot&) = default;
+		Snapshot(Snapshot&&) noexcept = default;
+		Snapshot& operator=(const Snapshot&) = default;
+		Snapshot& operator=(Snapshot&&) noexcept = default;
+		~Snapshot() = default;
+
+	private:
+		friend class DBImpl;
+
+		explicit Snapshot(std::shared_ptr<const SnapshotState> state)
+		    : state_(std::move(state))
+		{
+		}
+
+		std::shared_ptr<const SnapshotState> state_;
 	};
 
 	// DB contents are stored in a set of blocks, each of which holds a
@@ -36,7 +55,7 @@ namespace prism
 		kZstdCompression = 0x2,
 	};
 
-	// Options to control the behavior of a database (passed to DB::Open)
+	// Options to control the behavior of a database (passed to Database::Open)
 	struct Options
 	{
 		// Create an Options object with default values for all fields.
@@ -165,11 +184,10 @@ namespace prism
 		// Callers may wish to set this field to false for bulk scans.
 		bool fill_cache = true;
 
-		// If "snapshot" is non-null, read as of the supplied snapshot
-		// (which must belong to the DB that is being read and which must
-		// not have been released).  If "snapshot" is null, use an implicit
-		// snapshot of the state at the beginning of this read operation.
-		const Snapshot* snapshot = nullptr;
+		// If set, read as of the supplied snapshot handle. The handle must
+		// belong to the DB being read. If unset, use an implicit snapshot
+		// of the state at the beginning of this read operation.
+		std::optional<Snapshot> snapshot_handle;
 	};
 
 	// Options that control write operations

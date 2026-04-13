@@ -1,5 +1,6 @@
 #include "asyncdb.h"
 
+#include "db.h"
 #include "result.h"
 #include "status.h"
 
@@ -7,50 +8,65 @@
 
 namespace prism
 {
-	AsyncDB::AsyncDB(ThreadPoolScheduler& scheduler, std::shared_ptr<DB> db)
-	    : scheduler_(&scheduler)
-	    , db_(std::move(db))
+	struct AsyncDB::SharedState
+	{
+		SharedState(ThreadPoolScheduler& scheduler, Database db)
+		    : scheduler_(&scheduler)
+		    , db_(std::move(db))
+		{
+		}
+
+		ThreadPoolScheduler* scheduler_;
+		Database db_;
+	};
+
+	AsyncDB::AsyncDB(std::shared_ptr<SharedState> state)
+	    : state_(std::move(state))
 	{
 	}
 
 	AsyncDB::~AsyncDB() = default;
 
-	AsyncOp<Result<AsyncDB>> AsyncDB::OpenAsync(ThreadPoolScheduler& scheduler, const Options& options, std::string dbname)
+	AsyncOp<Result<AsyncDB>> AsyncDB ::OpenAsync(ThreadPoolScheduler& scheduler, const Options& options, std::string dbname)
 	{
 		return AsyncOp<Result<AsyncDB>>(scheduler, [&scheduler, options, dbname = std::move(dbname)]() -> Result<AsyncDB> {
-			auto db = DB::Open(options, dbname);
+			auto db = Database::Open(options, dbname);
 			if (!db.has_value())
 			{
 				return std::unexpected(db.error());
 			}
-			return AsyncDB(scheduler, std::shared_ptr<DB>(std::move(db.value())));
+			return AsyncDB(std::make_shared<SharedState>(scheduler, std::move(db.value())));
 		});
 	}
 
 	AsyncOp<Status> AsyncDB::PutAsync(const WriteOptions& options, std::string key, std::string value)
 	{
-		auto db = db_;
-		return AsyncOp<Status>(*scheduler_,
-		    [db, opts = options, key = std::move(key), value = std::move(value)]() { return db->Put(opts, Slice(key), Slice(value)); });
+		auto state = state_;
+		return AsyncOp<Status>(*state->scheduler_, [state, opts = options, key = std::move(key), value = std::move(value)]() {
+			return state->db_.Put(opts, Slice(key), Slice(value));
+		});
 	}
 
 	AsyncOp<Result<std::string>> AsyncDB::GetAsync(const ReadOptions& options, std::string key)
 	{
-		auto db = db_;
+		auto state = state_;
 		return AsyncOp<Result<std::string>>(
-		    *scheduler_, [db, opts = options, key = std::move(key)]() { return db->Get(opts, Slice(key)); });
+		    *state->scheduler_, [state, opts = options, key = std::move(key)]() { return state->db_.Get(opts, Slice(key)); });
 	}
 
 	AsyncOp<Status> AsyncDB::DeleteAsync(const WriteOptions& options, std::string key)
 	{
-		auto db = db_;
-		return AsyncOp<Status>(*scheduler_, [db, opts = options, key = std::move(key)]() { return db->Delete(opts, Slice(key)); });
+		auto state = state_;
+		return AsyncOp<Status>(
+		    *state->scheduler_, [state, opts = options, key = std::move(key)]() { return state->db_.Delete(opts, Slice(key)); });
 	}
 
 	AsyncOp<Status> AsyncDB::WriteAsync(const WriteOptions& options, WriteBatch batch)
 	{
-		auto db = db_;
-		return AsyncOp<Status>(
-		    *scheduler_, [db, opts = options, batch = std::move(batch)]() mutable { return db->Write(opts, std::move(batch)); });
+		auto state = state_;
+		return AsyncOp<Status>(*state->scheduler_,
+		    [state, opts = options, batch = std::move(batch)]() mutable { return state->db_.Write(opts, std::move(batch)); });
 	}
+
+	Snapshot AsyncDB::CaptureSnapshot() { return state_->db_.CaptureSnapshot(); }
 }
