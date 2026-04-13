@@ -1,6 +1,6 @@
 # Prism Architecture Overview
 
-Prism is a high performance key-value store based on the Log-Structured Merge-Tree (LSM-Tree) architecture. It provides atomic batch updates, multi-version concurrency control (MVCC), and crash consistency through write-ahead logging. This document outlines the core components, data flow, and design principles of the system.
+Prism is a high performance key-value store based on the Log-Structured Merge-Tree (LSM-Tree) architecture. It provides atomic batch updates, multi-version concurrency control (MVCC), crash consistency through write-ahead logging, a move-only `Database` sync handle, a coroutine-friendly `AsyncDB` wrapper, and cheap-copy RAII `Snapshot` handles for point-in-time reads. This document outlines the core components, data flow, and design principles of the system.
 
 - **[Compaction Architecture](compaction.md)** - LSM-Tree compaction, background flushes, and metadata authority. Understanding compaction is critical for managing write amplification and read latency.
   - Metadata truth and recovery ordering.
@@ -11,11 +11,18 @@ Prism is a high performance key-value store based on the Log-Structured Merge-Tr
 
 The Prism architecture is divided into three primary layers: the User API, the Core Engine (DBImpl), and the Persistence Layer. The Core Engine coordinates between in-memory structures and on-disk storage to ensure consistency and performance.
 
+### Public API Surface
+
+- `Database::Open(...)` returns the move-only synchronous handle.
+- `AsyncDB::OpenAsync(...)` returns an awaitable that yields the async handle.
+- `Database::CaptureSnapshot()` and `AsyncDB::CaptureSnapshot()` return a cheap-copy `Snapshot` handle.
+- Snapshot reads pass that handle back through the `snapshot_handle` field on `ReadOptions` by value.
+
 ```mermaid
 flowchart TD
     subgraph API [User API Layer]
         direction LR
-        Open["DB::Open()"] --> Ops["Put() / Get() / Delete()"]
+	    Open["Database::Open()"] --> Ops["Put() / Get() / Delete()"]
     end
 
     API --> DBImpl
@@ -100,15 +107,15 @@ sequenceDiagram
 **Why this matters:**
 - **Newest first**: Searching MemTable → Immutable MemTable → SSTables ensures version consistency. New versions "shadow" older ones.
 - **Short-circuit**: The read returns immediately upon finding a match, minimizing unnecessary disk I/O.
-- **Snapshot isolation**: Every read uses the `last_sequence` at the time the call was made, providing a consistent view of the database.
+- **Snapshot isolation**: Every read uses either an implicit read sequence or an explicit `Snapshot` supplied through the `snapshot_handle` field on `ReadOptions`, providing a consistent view of the database.
 - **Performance Implications**: Frequent reads to keys that don't exist are optimized via Bloom Filters in the SSTables, preventing expensive disk seeks.
 
 ## Recovery Path
 
-The recovery process restores the database state by replaying the Write-Ahead Log (WAL) into a new MemTable. This process is triggered automatically during `DB::Open()`.
+The recovery process restores the database state by replaying the Write-Ahead Log (WAL) into a new MemTable. This process is triggered automatically during `Database::Open()`.
 ```mermaid
 flowchart TD
-    Start([DB::Open]) --> OpenWAL[Open WAL File]
+    Start([Database::Open]) --> OpenWAL[Open WAL File]
     OpenWAL --> ReadRecord[Read Next Log Record]
     ReadRecord -- EOF --> Finish([Resume Normal Operations])
     ReadRecord -- Record Found --> Decode[Decode WriteBatch]
@@ -123,6 +130,16 @@ flowchart TD
 - **No data loss**: As long as the WAL record was successfully flushed to disk (controlled by `Options::sync`), the write is guaranteed to be recovered.
 
 ## Data Structures
+
+### Snapshot Handle
+
+**Purpose:** Preserve a point-in-time read sequence without exposing internal engine ownership.
+
+**Design:**
+- `Snapshot` is a cheap-copy RAII handle.
+- Callers obtain it from `Database::CaptureSnapshot()` or `AsyncDB::CaptureSnapshot()`.
+- Reads use the `snapshot_handle` field on `ReadOptions` by value instead of a borrowed pointer.
+- The actual memtable/version pins are taken inside the read path, so the public handle stays lightweight.
 
 ### MemTable
 
@@ -311,12 +328,12 @@ Read operation:
   LookupKey lkey(user_key, last_sequence_);
   // Sees all committed writes
   
-Snapshot (future):
-  Snapshot* snap = db->GetSnapshot();
+Snapshot read:
+  auto snap = db.CaptureSnapshot();
   ReadOptions opts;
-  opts.snapshot = snap;
-  db->Get(opts, key, &value);
-  // Sees data at snapshot sequence
+  opts.snapshot_handle = snap;
+  db.Get(opts, key);
+  // Sees data at the captured snapshot sequence
 ```
 
 ---

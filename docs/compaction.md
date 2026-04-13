@@ -47,8 +47,8 @@ When a level exceeds its allowed size budget (e.g., 10MB for L1, 100MB for L2), 
 ### Conservative Tombstone Policy (v1)
 In the current implementation (v1), Prism uses a **conservative merge-only** policy:
 - **No dropping**: Deletion markers (tombstones) and older versions of keys are **not** dropped during compaction. 
-- **Reasoning**: Without robust Snapshot management and global sequence number tracking, dropping data prematurely could lead to data loss or "resurrecting" old values if a read happens at an old sequence number.
-- **Future**: Data dropping will be enabled once the Snapshot API and `find_obsolete_files` logic are fully integrated.
+- **Reasoning**: Snapshot-aware reclamation must respect readers holding a `Snapshot` through the `snapshot_handle` field on `ReadOptions`; dropping data prematurely could otherwise resurrect old values or hide still-visible history.
+- **Future**: Data dropping can become more aggressive once snapshot-aware obsolete-file reclamation is fully integrated.
 
 ### Differences from LevelDB
 While Prism strives for LevelDB compatibility, there are intentional divergences:
@@ -60,8 +60,8 @@ While Prism strives for LevelDB compatibility, there are intentional divergences
 
 The following features are identified as necessary follow-ups to the core compaction modernization:
 
-1. **Snapshots**: Full implementation of `GetSnapshot()` and `ReleaseSnapshot()` to allow point-in-time reads.
-2. **Manual Compaction**: Support for `DB::CompactRange(start, limit)` to allow users to force space reclamation.
+1. **Snapshots**: Continue refining point-in-time read behavior and snapshot-aware reclamation rules.
+2. **Manual Compaction**: Add a user-facing manual compaction entry point for forced space reclamation.
 3. **Seek-Triggered Compaction**: Recording "allowed_seeks" and triggering compaction when a file is repeatedly searched but doesn't contain the requested keys (optimizing for "holes" in the data).
 4. **Bloom Filter Wiring**: Completing the read-side integration of Bloom filters to skip SSTable reads during `Get()` and Compaction.
 5. **Group Commit**: Optimizing WAL syncs by grouping multiple concurrent `Write` calls into a single disk I/O.

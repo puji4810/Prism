@@ -2,6 +2,12 @@
 
 Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in modern C++.
 
+## Public API at a Glance
+
+- `Database` is the synchronous move-only handle returned by `Database::Open(...)`.
+- `AsyncDB` is the coroutine-friendly wrapper returned by `AsyncDB::OpenAsync(...)`.
+- `Snapshot` is a cheap-copy RAII handle captured with `CaptureSnapshot()` and stored by value in the `snapshot_handle` field on `ReadOptions`.
+
 ## 📚 Documentation Index
 
 ### Architecture & Design
@@ -69,12 +75,14 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
 - [X]  **InternalKey & LookupKey** - MVCC support
 - [X]  **MemTable** - In-memory write buffer
 - [X]  **Iterator** - Base iterator + TwoLevelIterator + MemTable/Table iterators
-- [X]  **MergingIterator + DBIter** - `DB::NewIterator()` over MemTable + SSTable
+- [X]  **MergingIterator + DBIter** - `Database::NewIterator()` over MemTable + SSTable
 - [X]  **Env (PosixEnv)** - Filesystem abstraction
 - [X]  **Cache (LRU)** - LRU block/metadata cache
 - [X]  **SSTable (core)** - Table/TableBuilder/TableCache (read/write)
 - [X]  **DBImpl (L0-only)** - WAL + MemTable + flush to SSTable + reads across MemTable/SSTable
-- [X]  **DB API (partial LevelDB-aligned)** - `DB::Open(options, dbname)`, Read/WriteOptions, LOCK file
+- [X]  **DB API (partial LevelDB-aligned)** - `Database::Open(options, dbname)`, Read/WriteOptions, LOCK file
+- [X]  **Snapshot API** - `CaptureSnapshot()` + the `snapshot_handle` field on `ReadOptions` for stable reads
+- [X]  **AsyncDB API** - `AsyncDB::OpenAsync(...)` + async CRUD wrappers over the same engine
 
 ### 🚧 In Progress
 
@@ -85,10 +93,6 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
 ### 📋 Planned
 
 - [ ]  **Sharded cache** - Concurrent cache implementation
-- [ ]  **Snapshot** - Point-in-time reads
-
-  - [ ]  Snapshot management
-  - [ ]  Garbage collection
 - [ ]  **Compression** - Snappy/Zstd (block compression)
 
 ## 🔑 Key Concepts
@@ -192,6 +196,41 @@ Run all tests:
 xmake test
 ```
 
+## 🔄 Breaking Change Migration Note
+
+Prism now documents only the final public handles: `Database`, `AsyncDB`, and RAII `Snapshot` values. Code written against older manual-lifetime patterns should move to by-value handles and `CaptureSnapshot()`.
+
+### Before
+
+```cpp
+// Legacy style: open through an old sync wrapper and manage a borrowed snapshot manually.
+auto legacy_db = OpenLegacyHandle(options, name);
+auto legacy_snapshot = AcquireLegacySnapshot(legacy_db);
+
+LegacyReadOptions ro;
+ro.snapshot_handle = legacy_snapshot;
+auto value = LegacyRead(legacy_db, ro, "k");
+ReleaseLegacySnapshot(legacy_db, legacy_snapshot);
+```
+
+### After
+
+```cpp
+auto db_result = prism::Database::Open(options, name);
+if (!db_result.has_value()) {
+    return db_result.error();
+}
+
+auto db = std::move(db_result.value());
+prism::Snapshot snapshot = db.CaptureSnapshot();
+
+prism::ReadOptions ro;
+ro.snapshot_handle = snapshot;
+auto value = db.Get(ro, "k");
+```
+
+Async callers follow the same snapshot model and open through `prism::AsyncDB::OpenAsync(...)`.
+
 ## 🎯 Design Goals
 
 1. **Correctness** - Comprehensive tests, clear invariants
@@ -259,7 +298,7 @@ When adding new components:
 
 ## 🗺️ Roadmap
 
-### Phase 1: Core Engine (Current)
+### Phase 1: Core Engine (Completed)
 
 - [X]  Basic infrastructure (Slice, Status, Coding)
 - [X]  Memory management (Arena, SkipList)
@@ -274,12 +313,6 @@ When adding new components:
 - [X]  Minor compaction (MemTable → L0) background
 - [X]  Major compaction (Ln → Ln+1)
 - [X]  Bloom filter (write-side) integration
-
-
-- [ ]  VersionEdit/VersionSet + MANIFEST
-- [ ]  Minor compaction (MemTable → L0) background
-- [ ]  Major compaction (Ln → Ln+1)
-- [ ]  Bloom filter (write-side) + read-side wiring
 
 ### Phase 3: Optimization
 
