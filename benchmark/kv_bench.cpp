@@ -7,7 +7,6 @@
 
 #include <cstdio>
 #include <filesystem>
-#include <memory>
 #include <optional>
 #include <semaphore>
 
@@ -38,7 +37,7 @@ namespace prism::bench
 			options.write_buffer_size = std::min<std::size_t>(options.write_buffer_size, 4 * 1024);
 		}
 
-		auto db_res = DB::Open(options, dir);
+		auto db_res = Database::Open(options, dir);
 		if (!db_res.has_value())
 		{
 			std::fprintf(stderr, "sync open failed: %s\n", db_res.error().ToString().c_str());
@@ -50,13 +49,12 @@ namespace prism::bench
 		    = (cfg.prefill == 1) || (cfg.prefill == -1 && (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0));
 		if (should_prefill_sync)
 		{
-			Prefill(*db, keys, cfg.ops_per_client, cfg.value_size);
+			Prefill(db, keys, cfg.ops_per_client, cfg.value_size);
 		}
 
 		if (cfg.mode == BenchMode::kDiskRead)
 		{
-			db.reset();
-			auto reopened = DB::Open(options, dir);
+			auto reopened = Database::Open(options, dir);
 			if (!reopened.has_value())
 			{
 				std::fprintf(stderr, "sync reopen failed: %s\n", reopened.error().ToString().c_str());
@@ -75,17 +73,17 @@ namespace prism::bench
 			Stats stats;
 			if (cfg.mode == BenchMode::kDiskRead)
 			{
-				stats = RunSyncDiskRead(*db, cfg, keys);
+				stats = RunSyncDiskRead(db, cfg, keys);
 				PrintLine("sync_disk", cfg, r, stats);
 			}
 			else if (cfg.mode == BenchMode::kDurabilityWrite)
 			{
-				stats = RunSyncDurabilityWrite(*db, cfg, keys);
+				stats = RunSyncDurabilityWrite(db, cfg, keys);
 				PrintLine("sync_durability_write", cfg, r, stats);
 			}
 			else
 			{
-				stats = RunSyncMixed(*db, cfg, keys);
+				stats = RunSyncMixed(db, cfg, keys);
 				PrintLine("sync", cfg, r, stats);
 			}
 
@@ -131,7 +129,7 @@ namespace prism::bench
 	{
 		try
 		{
-			auto result = co_await AsyncDB::OpenAsync(scheduler, options, dir);
+			auto result = co_await AsyncDB ::OpenAsync(scheduler, options, dir);
 			if (result.has_value())
 			{
 				out_db.emplace(std::move(result.value()));
@@ -174,14 +172,14 @@ namespace prism::bench
 		{
 			Options prefill_options = options;
 			prefill_options.env = env_to_use;
-			auto pre = DB::Open(prefill_options, dir);
+			auto pre = Database::Open(prefill_options, dir);
 			if (!pre.has_value())
 			{
 				std::fprintf(stderr, "async prefill open failed: %s\n", pre.error().ToString().c_str());
 				return;
 			}
 			auto pre_db = std::move(pre.value());
-			Prefill(*pre_db, keys, cfg.ops_per_client, cfg.value_size);
+			Prefill(pre_db, keys, cfg.ops_per_client, cfg.value_size);
 		}
 
 		auto open_sem = std::binary_semaphore(0);

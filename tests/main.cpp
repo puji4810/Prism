@@ -3,6 +3,8 @@
 
 int main()
 {
+	// Public API example: Database for sync usage, AsyncDB for coroutine usage,
+	// and cheap-copy Snapshot handles passed through the snapshot_handle field.
 	auto db_result = prism::Database::Open("my_database");
 	if (!db_result.has_value())
 	{
@@ -11,15 +13,18 @@ int main()
 	}
 
 	auto db = std::move(db_result.value());
+	prism::Snapshot snapshot = db.CaptureSnapshot();
+	prism::ReadOptions read_options;
+	read_options.snapshot_handle = snapshot;
 
 	// Example: Put a value
-	// prism::Status s = db->Put("key2", "value2");
+	// prism::Status s = db.Put("key2", "value2");
 	// if (!s.ok()) {
 	//     printf("Put failed: %s\n", s.ToString().c_str());
 	// }
 
 	// Example: Get a value
-	auto value_result = db.Get("key2");
+	auto value_result = db.Get(read_options, "key2");
 	if (value_result.has_value())
 	{
 		printf("Got value: %s\n", value_result.value().c_str());

@@ -76,10 +76,10 @@ namespace prism
 		void Open(Options options)
 		{
 			options.create_if_missing = true;
-			auto open = DB::Open(options, dbname_);
+			auto open = DBImpl::OpenInternal(options, dbname_);
 			ASSERT_TRUE(open.has_value()) << open.error().ToString();
 			db_ = std::move(open.value());
-			impl_ = static_cast<DBImpl*>(db_.get());
+			impl_ = db_.get();
 			ASSERT_NE(impl_, nullptr);
 		}
 
@@ -214,7 +214,7 @@ namespace prism
 		}
 
 		std::string dbname_ = "test_compaction_execution_db";
-		std::unique_ptr<DB> db_;
+		std::unique_ptr<DBImpl> db_;
 		DBImpl* impl_ = nullptr;
 	};
 

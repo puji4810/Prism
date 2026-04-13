@@ -471,39 +471,38 @@ TEST_F(FaultInjectionTest, WalAppendFailurePropagatesCleanly)
 	options.create_if_missing = true;
 
 	// Open DB and write some data successfully.
-	auto db_result = DB::Open(options, tmp_path_);
-	ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-	auto db = std::move(db_result.value());
+	{
+		auto db_result = Database::Open(options, tmp_path_);
+		ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
+		auto db = std::move(db_result.value());
 
-	Status s = db->Put(WriteOptions(), "key1", "value1");
-	ASSERT_TRUE(s.ok()) << s.ToString();
+		Status s = db.Put(WriteOptions(), "key1", "value1");
+		ASSERT_TRUE(s.ok()) << s.ToString();
 
-	// Inject append failure on the WAL file.
-	env_->SetFailAppend(true);
+		// Inject append failure on the WAL file.
+		env_->SetFailAppend(true);
 
-	// Attempt a write - should fail with IOError.
-	s = db->Put(WriteOptions(), "key2", "value2");
-	EXPECT_FALSE(s.ok()) << "Expected write to fail with injected append error";
-	EXPECT_TRUE(s.IsIOError()) << "Expected IOError, got: " << s.ToString();
+		// Attempt a write - should fail with IOError.
+		s = db.Put(WriteOptions(), "key2", "value2");
+		EXPECT_FALSE(s.ok()) << "Expected write to fail with injected append error";
+		EXPECT_TRUE(s.IsIOError()) << "Expected IOError, got: " << s.ToString();
 
-	// Clear fault injection.
-	env_->SetFailAppend(false);
-
-	// Close the DB.
-	db.reset();
+		// Clear fault injection before destruction.
+		env_->SetFailAppend(false);
+	}
 
 	// Reopen the DB - should succeed and recover the first write.
-	auto reopen_result = DB::Open(options, tmp_path_);
+	auto reopen_result = Database::Open(options, tmp_path_);
 	ASSERT_TRUE(reopen_result.has_value()) << reopen_result.error().ToString();
 	auto reopened_db = std::move(reopen_result.value());
 
 	// Verify the first write is present.
-	auto get_result = reopened_db->Get(ReadOptions(), "key1");
+	auto get_result = reopened_db.Get(ReadOptions(), "key1");
 	EXPECT_TRUE(get_result.has_value()) << get_result.error().ToString();
 	EXPECT_EQ(get_result.value(), "value1");
 
 	// Verify the failed write was not persisted.
-	auto get2_result = reopened_db->Get(ReadOptions(), "key2");
+	auto get2_result = reopened_db.Get(ReadOptions(), "key2");
 	EXPECT_FALSE(get2_result.has_value()) << "Expected key2 to not exist";
 }
 
@@ -518,30 +517,31 @@ TEST_F(FaultInjectionTest, WalCloseFailureDoesNotPoisonReopen)
 	options.create_if_missing = true;
 
 	// Open DB and write some data successfully.
-	auto db_result = DB::Open(options, tmp_path_);
-	ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
-	auto db = std::move(db_result.value());
+	{
+		auto db_result = Database::Open(options, tmp_path_);
+		ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
+		auto db = std::move(db_result.value());
 
-	Status s = db->Put(WriteOptions(), "key1", "value1");
-	ASSERT_TRUE(s.ok()) << s.ToString();
+		Status s = db.Put(WriteOptions(), "key1", "value1");
+		ASSERT_TRUE(s.ok()) << s.ToString();
 
-	// Inject close failure on the WAL file.
-	env_->SetFailClose(true);
+		// Inject close failure on the WAL file.
+		env_->SetFailClose(true);
 
-	// Close the DB - destructor calls CloseLogFile which should fail.
-	// The error is logged/recorded but the DB should still be destructible.
-	db.reset();
+		// Close the DB - destructor calls CloseLogFile which should fail.
+		// The error is logged/recorded but the DB should still be destructible.
+	}
 
 	// Clear fault injection for reopen.
 	env_->SetFailClose(false);
 
 	// Reopen the DB - should succeed and recover the write.
-	auto reopen_result = DB::Open(options, tmp_path_);
+	auto reopen_result = Database::Open(options, tmp_path_);
 	ASSERT_TRUE(reopen_result.has_value()) << reopen_result.error().ToString();
 	auto reopened_db = std::move(reopen_result.value());
 
 	// Verify the write is present.
-	auto get_result = reopened_db->Get(ReadOptions(), "key1");
+	auto get_result = reopened_db.Get(ReadOptions(), "key1");
 	EXPECT_TRUE(get_result.has_value()) << get_result.error().ToString();
 	EXPECT_EQ(get_result.value(), "value1");
 }

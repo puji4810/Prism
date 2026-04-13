@@ -15,7 +15,7 @@
 
 namespace prism
 {
-	class DB;
+	class Database;
 	class AsyncDB;
 	class ThreadPoolScheduler;
 	struct ReadOptions;
@@ -129,12 +129,12 @@ namespace prism::bench
 	uint64_t PercentileNs(std::vector<uint64_t> v, double p);
 
 	// Prefill helper
-	void Prefill(DB& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size);
+	void Prefill(Database& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size);
 
 	// Sync benchmark runners
-	Stats RunSyncMixed(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
-	Stats RunSyncDiskRead(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
-	Stats RunSyncDurabilityWrite(DB& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
+	Stats RunSyncMixed(Database& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
+	Stats RunSyncDiskRead(Database& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
+	Stats RunSyncDurabilityWrite(Database& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
 
 	// Async benchmark lane workers (per-client lane with inflight tracking)
 	Detached RunAsyncMixedLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,

@@ -148,10 +148,10 @@ TEST_F(FlushCompactionTest, WriteRotatesMemtableAndSchedulesBackgroundFlush)
 	options.create_if_missing = true;
 	options.write_buffer_size = 128;
 
-	auto open = DB::Open(options, "test_flush_compaction");
+	auto open = DBImpl::OpenInternal(options, "test_flush_compaction");
 	ASSERT_TRUE(open.has_value()) << open.error().ToString();
 	auto db = std::move(open.value());
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 
 	for (int i = 0; i < 32; ++i)
 	{
@@ -179,10 +179,10 @@ TEST_F(FlushCompactionTest, WriterWaitsWhenImmutableMemtableExists)
 	options.create_if_missing = true;
 	options.write_buffer_size = 128;
 
-	auto open = DB::Open(options, "test_flush_stall");
+	auto open = DBImpl::OpenInternal(options, "test_flush_stall");
 	ASSERT_TRUE(open.has_value()) << open.error().ToString();
 	auto db = std::move(open.value());
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 
 	for (int i = 0; i < 32; ++i)
 	{
@@ -220,7 +220,7 @@ TEST_F(FlushCompactionTest, LevelZeroPressureTriggersStallPolicy)
 		options.env = &env;
 		options.create_if_missing = true;
 
-		auto open = DB::Open(options, "test_l0_slowdown");
+		auto open = DBImpl::OpenInternal(options, "test_l0_slowdown");
 		ASSERT_TRUE(open.has_value()) << open.error().ToString();
 		auto db = std::move(open.value());
 
@@ -238,10 +238,10 @@ TEST_F(FlushCompactionTest, LevelZeroPressureTriggersStallPolicy)
 		options.env = &env;
 		options.create_if_missing = true;
 
-		auto open = DB::Open(options, "test_l0_stop");
+		auto open = DBImpl::OpenInternal(options, "test_l0_stop");
 		ASSERT_TRUE(open.has_value()) << open.error().ToString();
 		auto db = std::move(open.value());
-		auto* impl = static_cast<DBImpl*>(db.get());
+		auto* impl = db.get();
 
 		std::atomic<bool> writer_done{ false };
 		Status writer_status;
@@ -301,10 +301,10 @@ TEST_F(FlushCompactionTest, EmptyMemtableDoesNotAddManifestFileEntry)
 	Options options;
 	options.create_if_missing = true;
 
-	auto open = DB::Open(options, "test_flush_compaction");
+	auto open = DBImpl::OpenInternal(options, "test_flush_compaction");
 	ASSERT_TRUE(open.has_value()) << open.error().ToString();
 	auto db = std::move(open.value());
-	auto* impl = static_cast<DBImpl*>(db.get());
+	auto* impl = db.get();
 
 	EXPECT_FALSE(impl->TEST_HasImmutableMemTable());
 	const int l0_before = impl->TEST_NumLevelFiles(0);

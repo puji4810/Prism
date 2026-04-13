@@ -3,6 +3,7 @@
 // scenarios. Later tasks build on DbTestBase for compaction and recovery paths.
 
 #include "db.h"
+#include "db_impl.h"
 #include "env.h"
 #include "filename.h"
 #include "log_reader.h"
@@ -53,22 +54,24 @@ protected:
 
 	void TearDown() override
 	{
-		db_.reset();
+		db_res_.reset();
 		std::error_code ec;
 		fs::remove_all(db_path_, ec);
 	}
 
-	Result<std::unique_ptr<DB>> OpenDB(Options opts = { })
+	Result<Database> OpenDB(Options opts = { })
 	{
-		db_.reset();
+		db_res_.reset();
 		opts.create_if_missing = true;
-		auto res = DB::Open(opts, db_path_);
+		auto res = Database::Open(opts, db_path_);
 		if (res.has_value())
-			db_ = std::move(res.value());
+			db_res_ = std::make_unique<Database>(std::move(res.value()));
 		return res;
 	}
 
-	void CloseDB() { db_.reset(); }
+	void CloseDB() { db_res_.reset(); }
+
+	Database& db() { return *db_res_; }
 
 	[[nodiscard]] bool HasCurrentFile() const { return Env::Default()->FileExists(CurrentFileName(db_path_)); }
 
@@ -119,7 +122,7 @@ protected:
 	}
 
 	std::string db_path_;
-	std::unique_ptr<DB> db_;
+	std::unique_ptr<Database> db_res_;
 };
 
 // ===========================================================================
@@ -299,14 +302,14 @@ namespace
 	}
 }
 
-// ── Test 1: A fresh DB::Open must succeed and create the DB directory with
+// ── Test 1: A fresh Database::Open must succeed and create the DB directory with
 //    at least a LOCK file and a WAL log file. This tests the current
 //    implementation. When MANIFEST/VersionSet is added (later tasks), the
 //    CURRENT and MANIFEST checks become meaningful.
 TEST_F(ManifestRecoveryTest, FreshOpenCreatesCurrentAndManifest)
 {
 	auto res = OpenDB();
-	ASSERT_TRUE(res.has_value()) << "DB::Open failed: " << res.error().ToString();
+	ASSERT_TRUE(res.has_value()) << "Database::Open failed: " << res.error().ToString();
 
 	EXPECT_TRUE(HasLockFile()) << "LOCK file missing after fresh open";
 	EXPECT_TRUE(HasLogFile()) << "WAL log file missing after fresh open";
@@ -319,14 +322,14 @@ TEST_F(ManifestRecoveryTest, FreshOpenCreatesCurrentAndManifest)
 TEST_F(ManifestRecoveryTest, ReopenPreservesManifest)
 {
 	ASSERT_TRUE(OpenDB().has_value());
-	ASSERT_TRUE(db_->Put("reopen_key", "reopen_val").ok());
+	ASSERT_TRUE(db().Put("reopen_key", "reopen_val").ok());
 
 	CloseDB();
 	ASSERT_TRUE(OpenDB().has_value());
 
 	EXPECT_TRUE(HasLockFile());
 
-	auto get_res = db_->Get("reopen_key");
+	auto get_res = db().Get("reopen_key");
 	ASSERT_TRUE(get_res.has_value()) << "key missing after reopen";
 	EXPECT_EQ("reopen_val", get_res.value());
 }
@@ -382,7 +385,7 @@ TEST_F(ManifestRecoveryTest, WriteSnapshotContainsAllLiveFiles)
 
 // ── Test 3: A directory without CURRENT or MANIFEST ("legacy" directory)
 //    should be handled according to the chosen bootstrap policy:
-//      a) DB::Open with create_if_missing=true initializes such a directory, OR
+//      a) Database::Open with create_if_missing=true initializes such a directory, OR
 //      b) the DB returns a clear non-OK status rather than crashing/UB.
 //    When bootstrap is implemented, path (a) will also verify CURRENT+MANIFEST exist.
 TEST_F(ManifestRecoveryTest, LegacyDirectoryBootstrap)
@@ -462,13 +465,13 @@ TEST_F(ManifestRecoveryTest, LegacyBootstrapReadsKeysFromRecoveredSst)
 	ASSERT_TRUE(PlantLegacyDirectory(db_path_));
 
 	auto res = OpenDB();
-	ASSERT_TRUE(res.has_value()) << "DB::Open failed: " << res.error().ToString();
+	ASSERT_TRUE(res.has_value()) << "Database::Open failed: " << res.error().ToString();
 
-	auto alpha = db_->Get("alpha");
+	auto alpha = db().Get("alpha");
 	ASSERT_TRUE(alpha.has_value()) << "alpha missing after legacy SST bootstrap";
 	EXPECT_EQ("table_alpha", alpha.value());
 
-	auto omega = db_->Get("omega");
+	auto omega = db().Get("omega");
 	ASSERT_TRUE(omega.has_value()) << "omega missing after legacy SST bootstrap";
 	EXPECT_EQ("table_omega", omega.value());
 }
@@ -495,13 +498,13 @@ TEST_F(ManifestRecoveryTest, LegacyBootstrapReplaysAllLegacyLogs)
 	ASSERT_FALSE(HasCurrentFile());
 
 	auto res = OpenDB();
-	ASSERT_TRUE(res.has_value()) << "DB::Open failed: " << res.error().ToString();
+	ASSERT_TRUE(res.has_value()) << "Database::Open failed: " << res.error().ToString();
 
-	auto a = db_->Get("legacy_log_a");
+	auto a = db().Get("legacy_log_a");
 	ASSERT_TRUE(a.has_value()) << "legacy_log_a should be recovered from lower-numbered WAL";
 	EXPECT_EQ("value_a", a.value());
 
-	auto b = db_->Get("legacy_log_b");
+	auto b = db().Get("legacy_log_b");
 	ASSERT_TRUE(b.has_value()) << "legacy_log_b should be recovered from higher-numbered WAL";
 	EXPECT_EQ("value_b", b.value());
 }
@@ -615,20 +618,20 @@ TEST_F(ManifestRecoveryTest, ReuseLogsDisabledDuringManifestRollout)
 TEST_F(ManifestRecoveryTest, SequenceMappingSurvivesReopen)
 {
 	ASSERT_TRUE(OpenDB().has_value());
-	ASSERT_TRUE(db_->Put("off_by_one_key", "v1").ok());
+	ASSERT_TRUE(db().Put("off_by_one_key", "v1").ok());
 
 	CloseDB();
 	ASSERT_TRUE(OpenDB().has_value());
-	ASSERT_TRUE(db_->Delete("off_by_one_key").ok());
-	ASSERT_TRUE(db_->Put("survivor_key", "v2").ok());
+	ASSERT_TRUE(db().Delete("off_by_one_key").ok());
+	ASSERT_TRUE(db().Put("survivor_key", "v2").ok());
 
 	CloseDB();
 	ASSERT_TRUE(OpenDB().has_value());
 
-	auto deleted = db_->Get("off_by_one_key");
+	auto deleted = db().Get("off_by_one_key");
 	EXPECT_TRUE(deleted.error().IsNotFound()) << deleted.error().ToString();
 
-	auto survivor = db_->Get("survivor_key");
+	auto survivor = db().Get("survivor_key");
 	ASSERT_TRUE(survivor.has_value()) << survivor.error().ToString();
 	EXPECT_EQ("v2", survivor.value());
 }
@@ -640,13 +643,13 @@ TEST_F(ManifestRecoveryTest, StaleTableFilesOutsideManifestAreIgnored)
 	options.write_buffer_size = 1;
 
 	ASSERT_TRUE(OpenDB(options).has_value());
-	ASSERT_TRUE(db_->Put("stable_key", "stable_value").ok());
+	ASSERT_TRUE(db().Put("stable_key", "stable_value").ok());
 	CloseDB();
 
 	ASSERT_TRUE(CreatePlaceholderFile(TableFileName(db_path_, 999)).ok());
 
 	ASSERT_TRUE(OpenDB(options).has_value());
-	auto value = db_->Get("stable_key");
+	auto value = db().Get("stable_key");
 	ASSERT_TRUE(value.has_value()) << value.error().ToString();
 	EXPECT_EQ("stable_value", value.value());
 }
@@ -659,7 +662,7 @@ TEST_F(ManifestRecoveryTest, StaleTableFilesOutsideManifestAreIgnored)
 TEST_F(ManifestRecoveryTest, FreshBootstrapOpenCloseIsLsanClean)
 {
 	auto res = OpenDB();
-	ASSERT_TRUE(res.has_value()) << "DB::Open failed: " << res.error().ToString();
+	ASSERT_TRUE(res.has_value()) << "Database::Open failed: " << res.error().ToString();
 
 	// Verify basic state
 	EXPECT_TRUE(HasLockFile()) << "LOCK file missing after fresh open";
@@ -675,8 +678,8 @@ TEST_F(ManifestRecoveryTest, ReopenRecoveryOpenCloseIsLsanClean)
 {
 	// First open: create DB and write data
 	auto res1 = OpenDB();
-	ASSERT_TRUE(res1.has_value()) << "DB::Open failed: " << res1.error().ToString();
-	Status s = db_->Put("recovery_key", "recovery_value");
+	ASSERT_TRUE(res1.has_value()) << "Database::Open failed: " << res1.error().ToString();
+	Status s = db().Put("recovery_key", "recovery_value");
 	ASSERT_TRUE(s.ok()) << "Put failed: " << s.ToString();
 
 	// Close the DB
@@ -684,10 +687,10 @@ TEST_F(ManifestRecoveryTest, ReopenRecoveryOpenCloseIsLsanClean)
 
 	// Second open: recovery path reads manifest and recreates state
 	auto res2 = OpenDB();
-	ASSERT_TRUE(res2.has_value()) << "DB::Open (recovery) failed: " << res2.error().ToString();
+	ASSERT_TRUE(res2.has_value()) << "Database::Open (recovery) failed: " << res2.error().ToString();
 
 	// Verify recovery worked
-	auto get_res = db_->Get("recovery_key");
+	auto get_res = db().Get("recovery_key");
 	ASSERT_TRUE(get_res.has_value()) << "key missing after recovery";
 	EXPECT_EQ("recovery_value", get_res.value());
 
