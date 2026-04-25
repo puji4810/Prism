@@ -7,8 +7,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <optional>
+
+#include "snapshot.h"
 
 namespace prism
 {
@@ -19,28 +20,6 @@ namespace prism
 	class Env;
 	class FilterPolicy;
 	class Logger;
-	struct SnapshotState;
-
-	class Snapshot
-	{
-	public:
-		Snapshot() = default;
-		Snapshot(const Snapshot&) = default;
-		Snapshot(Snapshot&&) noexcept = default;
-		Snapshot& operator=(const Snapshot&) = default;
-		Snapshot& operator=(Snapshot&&) noexcept = default;
-		~Snapshot() = default;
-
-	private:
-		friend class DBImpl;
-
-		explicit Snapshot(std::shared_ptr<const SnapshotState> state)
-		    : state_(std::move(state))
-		{
-		}
-
-		std::shared_ptr<const SnapshotState> state_;
-	};
 
 	// DB contents are stored in a set of blocks, each of which holds a
 	// sequence of key,value pairs.  Each block may be compressed before

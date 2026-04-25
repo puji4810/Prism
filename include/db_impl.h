@@ -8,18 +8,19 @@
 #include "result.h"
 #include "version_set.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <string>
-#include <atomic>
 
 namespace prism
 {
 	class FileLock;
+	class SnapshotRegistry;
 	class TableCache;
 	class CompactionExecutionTest;
-	struct SnapshotOwnerToken;
 
 	class DBImpl
 	{
@@ -41,6 +42,7 @@ namespace prism
 		Status Write(WriteBatch batch) { return Write(WriteOptions(), std::move(batch)); }
 		std::unique_ptr<Iterator> NewIterator(const ReadOptions& options);
 		Snapshot CaptureSnapshot();
+		std::optional<SequenceNumber> GetOldestLiveSnapshotSequence() const;
 
 		// ── Test-only accessors ──────────────────────────────────────────────
 		// Returns the current Version pointer (no additional Ref).
@@ -120,7 +122,7 @@ namespace prism
 		Status bg_error_;
 		bool bg_compaction_scheduled_ = false;
 		std::atomic<bool> shutting_down_{ false };
-		std::shared_ptr<SnapshotOwnerToken> snapshot_owner_token_;
+		std::shared_ptr<SnapshotRegistry> snapshot_registry_;
 	};
 } // namespace prism
 

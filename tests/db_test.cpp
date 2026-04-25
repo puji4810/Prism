@@ -483,6 +483,100 @@ TEST_F(DBTest, SnapshotRejectsCrossDatabaseUse)
 	EXPECT_TRUE(iter->status().IsInvalidArgument()) << iter->status().ToString();
 }
 
+TEST_F(DBTest, SnapshotDuplicateSequenceHandlesReleaseIndependently)
+{
+	Options options;
+	options.create_if_missing = true;
+
+	auto open_result = DBImpl::OpenInternal(options, "test_db");
+	ASSERT_TRUE(open_result.has_value()) << open_result.error().ToString();
+	auto db = std::move(open_result.value());
+
+	ASSERT_TRUE(db->Put("dup_key", "v1").ok());
+
+	Snapshot first = db->CaptureSnapshot();
+	Snapshot second = db->CaptureSnapshot();
+	EXPECT_EQ(2U, db->TEST_ActiveSnapshotCount());
+
+	auto oldest_sequence = db->GetOldestLiveSnapshotSequence();
+	ASSERT_TRUE(oldest_sequence.has_value());
+
+	ASSERT_TRUE(db->Put("dup_key", "v2").ok());
+
+	ReadOptions first_options;
+	first_options.snapshot_handle = first;
+	auto first_result = db->Get(first_options, "dup_key");
+	ASSERT_TRUE(first_result.has_value()) << first_result.error().ToString();
+	EXPECT_EQ("v1", first_result.value());
+
+	ReadOptions second_options;
+	second_options.snapshot_handle = second;
+	auto second_result = db->Get(second_options, "dup_key");
+	ASSERT_TRUE(second_result.has_value()) << second_result.error().ToString();
+	EXPECT_EQ("v1", second_result.value());
+
+	first = Snapshot();
+	first_options.snapshot_handle.reset();
+	EXPECT_EQ(1U, db->TEST_ActiveSnapshotCount());
+	EXPECT_EQ(oldest_sequence, db->GetOldestLiveSnapshotSequence());
+
+	second_result = db->Get(second_options, "dup_key");
+	ASSERT_TRUE(second_result.has_value()) << second_result.error().ToString();
+	EXPECT_EQ("v1", second_result.value());
+
+	second = Snapshot();
+	second_options.snapshot_handle.reset();
+	EXPECT_EQ(0U, db->TEST_ActiveSnapshotCount());
+	EXPECT_FALSE(db->GetOldestLiveSnapshotSequence().has_value());
+}
+
+TEST_F(DBTest, SnapshotRejectsDefaultConstructedHandle)
+{
+	auto open_result = Database::Open("test_db");
+	ASSERT_TRUE(open_result.has_value()) << open_result.error().ToString();
+	auto db = std::move(open_result.value());
+
+	ASSERT_TRUE(db.Put("default_key", "value").ok());
+
+	ReadOptions read_options;
+	read_options.snapshot_handle = Snapshot();
+
+	auto get_result = db.Get(read_options, "default_key");
+	ASSERT_FALSE(get_result.has_value());
+	EXPECT_TRUE(get_result.error().IsInvalidArgument()) << get_result.error().ToString();
+
+	auto iter = db.NewIterator(read_options);
+	ASSERT_NE(iter, nullptr);
+	EXPECT_FALSE(iter->Valid());
+	EXPECT_TRUE(iter->status().IsInvalidArgument()) << iter->status().ToString();
+}
+
+TEST_F(DBTest, SnapshotRejectsMovedFromHandle)
+{
+	auto open_result = Database::Open("test_db");
+	ASSERT_TRUE(open_result.has_value()) << open_result.error().ToString();
+	auto db = std::move(open_result.value());
+
+	ASSERT_TRUE(db.Put("move_key", "before").ok());
+
+	Snapshot source = db.CaptureSnapshot();
+	Snapshot valid = std::move(source);
+
+	ASSERT_TRUE(db.Put("move_key", "after").ok());
+
+	ReadOptions moved_from_options;
+	moved_from_options.snapshot_handle = source;
+	auto moved_from_result = db.Get(moved_from_options, "move_key");
+	ASSERT_FALSE(moved_from_result.has_value());
+	EXPECT_TRUE(moved_from_result.error().IsInvalidArgument()) << moved_from_result.error().ToString();
+
+	ReadOptions valid_options;
+	valid_options.snapshot_handle = valid;
+	auto valid_result = db.Get(valid_options, "move_key");
+	ASSERT_TRUE(valid_result.has_value()) << valid_result.error().ToString();
+	EXPECT_EQ("before", valid_result.value());
+}
+
 TEST_F(DBTest, SnapshotLastOwnerReleaseUnpinsState)
 {
 	Options options;
@@ -506,6 +600,66 @@ TEST_F(DBTest, SnapshotLastOwnerReleaseUnpinsState)
 	EXPECT_EQ(1U, db->TEST_ActiveSnapshotCount());
 	snapshot = Snapshot();
 	EXPECT_EQ(0U, db->TEST_ActiveSnapshotCount());
+}
+
+TEST_F(DBTest, SnapshotDestructionAfterDBTeardownIsSafe)
+{
+	Options options;
+	options.create_if_missing = true;
+
+	Snapshot snapshot;
+	{
+		auto open_result = DBImpl::OpenInternal(options, "test_db");
+		ASSERT_TRUE(open_result.has_value()) << open_result.error().ToString();
+		auto db = std::move(open_result.value());
+
+		ASSERT_TRUE(db->Put("teardown_key", "value").ok());
+		snapshot = db->CaptureSnapshot();
+		EXPECT_EQ(1U, db->TEST_ActiveSnapshotCount());
+	}
+
+	snapshot = Snapshot();
+	SUCCEED();
+}
+
+TEST_F(DBTest, SnapshotRejectsReopenedInstanceHandle)
+{
+	const std::string test_path = "test_db_reopen_snapshot";
+	std::error_code ec;
+	std::filesystem::remove_all(test_path, ec);
+
+	Options options;
+	options.create_if_missing = true;
+
+	Snapshot snapshot;
+	{
+		auto open_result = DBImpl::OpenInternal(options, test_path);
+		ASSERT_TRUE(open_result.has_value()) << open_result.error().ToString();
+		auto db = std::move(open_result.value());
+
+		ASSERT_TRUE(db->Put("reopen_key", "value").ok());
+		snapshot = db->CaptureSnapshot();
+	}
+
+	{
+		auto reopen_result = DBImpl::OpenInternal(options, test_path);
+		ASSERT_TRUE(reopen_result.has_value()) << reopen_result.error().ToString();
+		auto db = std::move(reopen_result.value());
+
+		ReadOptions read_options;
+		read_options.snapshot_handle = snapshot;
+
+		auto get_result = db->Get(read_options, "reopen_key");
+		ASSERT_FALSE(get_result.has_value());
+		EXPECT_TRUE(get_result.error().IsInvalidArgument()) << get_result.error().ToString();
+
+		auto iter = db->NewIterator(read_options);
+		ASSERT_NE(iter, nullptr);
+		EXPECT_FALSE(iter->Valid());
+		EXPECT_TRUE(iter->status().IsInvalidArgument()) << iter->status().ToString();
+	}
+
+	std::filesystem::remove_all(test_path, ec);
 }
 
 TEST_F(DBTest, DatabaseHandleOpen)
@@ -645,4 +799,74 @@ TEST_F(DBTest, OpenHonorsErrorIfExistsTrue)
 
 	// Cleanup
 	std::filesystem::remove_all(test_path, ec);
+}
+
+TEST_F(DBTest, SnapshotSurvivesFlushAndCompactionUntilRelease)
+{
+	// Use a very small write buffer so that the ~200 filler writes force multiple memtable flushes.
+	Options options;
+	options.create_if_missing = true;
+	// Prism's Arena allocates a 4104-byte HEAD node for every fresh SkipList,
+	// which already exceeds the 4096-byte limit and causes every write — including
+	// the sync-barrier below — to overflow immediately.  Using 8192 (2 × block)
+	// keeps the HEAD-node footprint inside the limit while still triggering ~3
+	// automatic L0 flushes across 200 filler entries (one every ~62 entries when
+	// the second Arena block is allocated).  That keeps the compaction score below
+	// 1 so no SST-compaction BGWork is queued, which ensures the background thread
+	// is fully idle by the time TEST_RunBackgroundCompactionOnce is called.
+	options.write_buffer_size = 4096 * 2; // 8 KiB — must exceed the 4104-byte Arena HEAD-node footprint
+
+	auto open_result = DBImpl::OpenInternal(options, "test_db");
+	ASSERT_TRUE(open_result.has_value()) << open_result.error().ToString();
+	auto db = std::move(open_result.value());
+
+	// 1. Write the initial value and immediately capture a snapshot.
+	ASSERT_TRUE(db->Put("snap_key", "snap_value").ok());
+	Snapshot snap = db->CaptureSnapshot();
+
+	// 2. Overwrite the key after the snapshot has been taken.
+	ASSERT_TRUE(db->Put("snap_key", "new_value").ok());
+
+	// 3. Write ~200 filler entries to fill the write buffer and trigger automatic flushes.
+	const std::string filler_value(32, kValueChar);
+	for (int i = 0; i < 200; ++i)
+	{
+		ASSERT_TRUE(db->Put("fill_" + std::to_string(i), filler_value).ok());
+	}
+
+	// Sync barrier: a single small write blocks inside MakeRoomForWrite while
+	// imm_ != nullptr, so it cannot return until any in-flight automatic flush
+	// has fully finished (background thread signalled + imm_ cleared).
+	// Without this, the last filler write may have scheduled a background
+	// compaction that is still holding the mutex inside WriteLevel0Table when
+	// TEST_RunBackgroundCompactionOnce tries to compact the same imm_ — a race
+	// that leads to a null-deref in MemTable::Unref().
+	ASSERT_TRUE(db->Put("sync_barrier", "x").ok());
+
+	// 4. Drive background compaction up to 8 times to push data through levels.
+	for (int i = 0; i < 8; ++i)
+	{
+		Status s = db->TEST_RunBackgroundCompactionOnce();
+		if (!s.ok())
+			break;
+	}
+
+	// 5. Snapshot read must still return the value visible at snapshot time.
+	ReadOptions snap_opts;
+	snap_opts.snapshot_handle = snap;
+	auto snap_result = db->Get(snap_opts, "snap_key");
+	ASSERT_TRUE(snap_result.has_value()) << snap_result.error().ToString();
+	EXPECT_EQ("snap_value", snap_result.value())
+	    << "Snapshot read must survive flush and compaction";
+
+	// 6. Non-snapshot read must return the latest overwritten value.
+	auto current_result = db->Get("snap_key");
+	ASSERT_TRUE(current_result.has_value()) << current_result.error().ToString();
+	EXPECT_EQ("new_value", current_result.value())
+	    << "Current read must return latest value after compaction";
+
+	// 7. Release the snapshot; the snapshot list should now be empty.
+	snap = Snapshot();
+	snap_opts.snapshot_handle.reset();
+	EXPECT_EQ(0U, db->TEST_ActiveSnapshotCount());
 }

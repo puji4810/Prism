@@ -724,3 +724,59 @@ TEST_F(ManifestRecoveryTest, LegacyBootstrapRecoverOpenCloseIsLsanClean)
 
 	// VersionSet dtor will clean up resources – LSAN verifies no leaks
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot ephemerality regression – a Snapshot captured before a DB close
+// must be rejected (InvalidArgument) by the freshly-reopened instance because
+// snapshots are bound to the SnapshotRegistry of the originating DBImpl.
+// After reopen, the new DBImpl has a distinct registry; any attempt to use the
+// stale handle through Get() or NewIterator() must return InvalidArgument.
+// ---------------------------------------------------------------------------
+TEST_F(ManifestRecoveryTest, SnapshotIsEphemeralAndRejectedAfterReopen)
+{
+	// Open and write a known value so we have something to read back later.
+	ASSERT_TRUE(OpenDB().has_value());
+	ASSERT_TRUE(db().Put("snap_key", "snap_val").ok());
+
+	// Capture a snapshot from the current (about-to-be-closed) DB instance.
+	// The snapshot is bound to that instance's SnapshotRegistry.
+	Snapshot stale = db().CaptureSnapshot();
+
+	// Close the DB – destroys the old DBImpl (and its SnapshotRegistry reference).
+	// The stale Snapshot still holds a shared_ptr to the old registry, keeping it
+	// alive, but the new open will produce a *different* registry pointer.
+	CloseDB();
+	ASSERT_TRUE(OpenDB().has_value());
+
+	// ── Rejection via Get ─────────────────────────────────────────────────────
+	// ResolveSnapshotSequence compares stale.state_->registry with the new
+	// snapshot_registry_; they differ → InvalidSnapshotOwnerStatus (InvalidArgument).
+	ReadOptions ro;
+	ro.snapshot_handle = stale;
+
+	auto get_res = db().Get(ro, "snap_key");
+	EXPECT_FALSE(get_res.has_value())
+	    << "Get with stale snapshot should fail, but returned: " << get_res.value();
+	EXPECT_TRUE(get_res.error().IsInvalidArgument())
+	    << "expected InvalidArgument from Get, got: " << get_res.error().ToString();
+
+	// ── Rejection via NewIterator ─────────────────────────────────────────────
+	// NewIterator wraps the error in a NewErrorIterator; Valid() is false and
+	// status() carries the same InvalidArgument.
+	auto iter = db().NewIterator(ro);
+	EXPECT_FALSE(iter->Valid())
+	    << "iterator with stale snapshot should not be valid";
+	EXPECT_TRUE(iter->status().IsInvalidArgument())
+	    << "expected InvalidArgument on iterator status, got: " << iter->status().ToString();
+
+	// ── Normal read without snapshot succeeds ─────────────────────────────────
+	// The key was persisted before the close; reopening recovers it via WAL/SST.
+	auto plain_res = db().Get("snap_key");
+	ASSERT_TRUE(plain_res.has_value())
+	    << "plain Get (no snapshot) should find snap_key after reopen";
+	EXPECT_EQ("snap_val", plain_res.value());
+
+	// stale goes out of scope here; SnapshotState::~SnapshotState calls
+	// registry->Release(node), cleanly unlinking the node from the old registry.
+	// LSAN verifies no leaks on exit.
+}

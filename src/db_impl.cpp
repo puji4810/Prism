@@ -28,25 +28,6 @@
 
 namespace prism
 {
-	struct SnapshotOwnerToken
-	{
-		std::atomic<size_t> active_snapshots{ 0 };
-	};
-
-	struct SnapshotState
-	{
-		SnapshotState(SequenceNumber sequence_number, std::shared_ptr<SnapshotOwnerToken> owner_token_value)
-		    : sequence(sequence_number)
-		    , owner_token(std::move(owner_token_value))
-		{
-		}
-
-		~SnapshotState() { owner_token->active_snapshots.fetch_sub(1, std::memory_order_acq_rel); }
-
-		const SequenceNumber sequence;
-		const std::shared_ptr<SnapshotOwnerToken> owner_token;
-	};
-
 	namespace
 	{
 		constexpr int kNumNonTableCacheFiles = 10;
@@ -54,41 +35,6 @@ namespace prism
 		Status InvalidSnapshotOwnerStatus() { return Status::InvalidArgument("snapshot does not belong to this database"); }
 
 		Status EmptySnapshotHandleStatus() { return Status::InvalidArgument("snapshot handle is empty"); }
-
-		// ─────────────────────────────────────────────────────────────────────────
-		// ReadView – a pinned snapshot of the DB read state.
-		//
-		// Captured while holding mutex_; refs on mem, imm, and current version are
-		// bumped atomically so that all three survive independently of background
-		// compaction and obsolete-file cleanup for the lifetime of an iterator or
-		// point-read.
-		// ─────────────────────────────────────────────────────────────────────────
-		struct ReadView
-		{
-			MemTable* mem = nullptr; // Ref()-ed on capture, Unref()-ed on release.
-			MemTable* imm = nullptr; // May be nullptr; Ref()-ed if non-null.
-			Version* current = nullptr; // Ref()-ed on capture.
-			SequenceNumber snapshot = 0; // Visible sequence number for this read.
-		};
-
-		// Release all resources captured in a ReadView and delete it.
-		void ReleaseReadView(void* /*arg1*/, void* arg2)
-		{
-			auto* rv = reinterpret_cast<ReadView*>(arg2);
-			if (rv->current != nullptr)
-			{
-				rv->current->Unref();
-			}
-			if (rv->imm != nullptr)
-			{
-				rv->imm->Unref();
-			}
-			if (rv->mem != nullptr)
-			{
-				rv->mem->Unref();
-			}
-			delete rv;
-		}
 
 		int TableCacheEntries(const Options& options)
 		{
@@ -758,7 +704,7 @@ namespace prism
 	    , mem_(nullptr)
 	    , internal_comparator_(options.comparator)
 	    , versions_(nullptr)
-	    , snapshot_owner_token_(std::make_shared<SnapshotOwnerToken>())
+	    , snapshot_registry_(std::make_shared<SnapshotRegistry>())
 	{
 		options_.comparator = &internal_comparator_;
 
@@ -1095,6 +1041,19 @@ namespace prism
 			return status;
 		}
 
+		// Freeze the oldest-live-snapshot watermark before releasing the mutex so the
+		// registry state and sequence counter are observed atomically with one another.
+		const SequenceNumber oldest_snapshot = [&]() -> SequenceNumber {
+			auto opt_seq = snapshot_registry_->OldestSequence();
+			if (opt_seq.has_value())
+			{
+				return opt_seq.value();
+			}
+			// No live snapshots: use the last assigned sequence as the watermark so all
+			// superseded values and obsolete tombstones become eligible for reclamation.
+			return sequence_ > 0 ? sequence_ - 1 : 0;
+		}();
+
 		mutex_.unlock();
 
 		CompactionOutput output;
@@ -1163,6 +1122,7 @@ namespace prism
 			}
 			else
 			{
+			    // just use Abandon, and skip later sync/close
 				output.builder->Abandon();
 			}
 
@@ -1215,6 +1175,12 @@ namespace prism
 			return Status::OK();
 		};
 
+		// Per-key tracking state for oldest-live-snapshot-aware drop decisions.
+		std::string current_user_key;
+		// ::std::string_view current_user_key;
+		bool has_current_user_key = false;
+		SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
+
 		input->SeekToFirst();
 		while (input->Valid() && !shutting_down_.load(std::memory_order_acquire))
 		{
@@ -1227,28 +1193,72 @@ namespace prism
 				}
 			}
 
-			if (!output.IsOpen())
+			// Determine whether this entry can be reclaimed rather than written to the
+			// output.  Two rules mirror LevelDB's compaction visibility model:
+			bool drop = false;
+			ParsedInternalKey ikey;
+			if (!ParseInternalKey(input->key(), &ikey))
 			{
-				status = open_output();
-				if (!status.ok())
+				// Unparseable key: reset per-key tracking and pass the entry through so
+				// the error is visible to higher layers rather than silently dropped.
+				current_user_key.clear();
+				has_current_user_key = false;
+				last_sequence_for_key = kMaxSequenceNumber;
+			}
+			else
+			{
+				const Comparator* const ucmp = internal_comparator_.user_comparator();
+				if (!has_current_user_key || ucmp->Compare(ikey.user_key, current_user_key) != 0)
 				{
-					break;
+					// First occurrence of this user key during this compaction pass.
+					current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
+					has_current_user_key = true;
+					last_sequence_for_key = kMaxSequenceNumber;
 				}
-			}
 
-			if (output.builder->NumEntries() == 0)
-			{
-				output.meta.smallest.DecodeFrom(input->key());
-			}
-			output.meta.largest.DecodeFrom(input->key());
-			output.builder->Add(input->key(), input->value());
-
-			if (output.builder->FileSize() >= compaction->max_output_file_size())
-			{
-				status = finish_output();
-				if (!status.ok())
+				// Rule A: a newer entry for the same user key was already emitted to the
+				// output at or below the oldest live snapshot, so this earlier entry is
+				// invisible to all current and future readers and can be dropped.
+				if (last_sequence_for_key <= oldest_snapshot)
 				{
-					break;
+					drop = true;
+				}
+				// Rule B: a deletion marker whose sequence is at or below the oldest live
+				// snapshot and which has no surviving data in deeper levels is obsolete —
+				// no snapshot could ever observe a difference with or without it.
+				else if (ikey.type == kTypeDeletion && ikey.sequence <= oldest_snapshot && compaction->IsBaseLevelForKey(ikey.user_key))
+				{
+					drop = true;
+				}
+
+				last_sequence_for_key = ikey.sequence;
+			}
+
+			if (!drop)
+			{
+				if (!output.IsOpen())
+				{
+					status = open_output();
+					if (!status.ok())
+					{
+						break;
+					}
+				}
+
+				if (output.builder->NumEntries() == 0)
+				{
+					output.meta.smallest.DecodeFrom(input->key());
+				}
+				output.meta.largest.DecodeFrom(input->key());
+				output.builder->Add(input->key(), input->value());
+
+				if (output.builder->FileSize() >= compaction->max_output_file_size())
+				{
+					status = finish_output();
+					if (!status.ok())
+					{
+						break;
+					}
 				}
 			}
 
@@ -1860,7 +1870,6 @@ namespace prism
 		//
 		// TODO(phase-b): Replace this with a real Version/VersionSet + SuperVersion.
 		// - Needed for compaction and safe table file deletion (iterators must pin versions/files).
-		// TODO(snapshot): Implement Snapshot objects that pin the view (not just sequence).
 		// TODO(async-scan): Provide AsyncIterator / NextAsync() to avoid blocking scans.
 		struct SuperVersionLite
 		{
@@ -1953,8 +1962,9 @@ namespace prism
 	Snapshot DBImpl::CaptureSnapshot()
 	{
 		std::lock_guard<std::shared_mutex> lock(mutex_);
-		snapshot_owner_token_->active_snapshots.fetch_add(1, std::memory_order_acq_rel);
-		return Snapshot(std::make_shared<SnapshotState>(sequence_ - 1, snapshot_owner_token_));
+		const SequenceNumber snapshot_sequence = sequence_ - 1;
+		auto node = snapshot_registry_->Register(snapshot_sequence);
+		return Snapshot(std::make_shared<SnapshotState>(snapshot_sequence, snapshot_registry_, std::move(node)));
 	}
 
 	Result<SequenceNumber> DBImpl::ResolveSnapshotSequence(const std::optional<Snapshot>& snapshot_handle) const
@@ -1969,7 +1979,7 @@ namespace prism
 			return std::unexpected(EmptySnapshotHandleStatus());
 		}
 
-		if (snapshot_handle->state_->owner_token.get() != snapshot_owner_token_.get())
+		if (snapshot_handle->state_->registry.get() != snapshot_registry_.get())
 		{
 			return std::unexpected(InvalidSnapshotOwnerStatus());
 		}
@@ -2075,7 +2085,9 @@ namespace prism
 		return pending_outputs_.empty();
 	}
 
-	size_t DBImpl::TEST_ActiveSnapshotCount() const { return snapshot_owner_token_->active_snapshots.load(std::memory_order_acquire); }
+	size_t DBImpl::TEST_ActiveSnapshotCount() const { return snapshot_registry_->Size(); }
+
+	std::optional<SequenceNumber> DBImpl::GetOldestLiveSnapshotSequence() const { return snapshot_registry_->OldestSequence(); }
 
 	Status DestroyDB(const std::string& dbname, const Options& options)
 	{

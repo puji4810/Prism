@@ -26,46 +26,70 @@ namespace prism
 	// ─────────────────────────────────────────────────────────────────────────────
 	struct FileMetaData
 	{
-	FileMetaData()
-	    : refs(0)
-	    , allowed_seeks(1 << 30)
-	    , number(0)
-	    , file_size(0)
-	{
-	}
-
-	// Copy constructor: new copy starts unowned (refs = 0)
-	FileMetaData(const FileMetaData& other)
-	    : refs(0)
-	    , allowed_seeks(other.allowed_seeks)
-	    , number(other.number)
-	    , file_size(other.file_size)
-	    , smallest(other.smallest)
-	    , largest(other.largest)
-	{
-	}
-
-	// Copy assignment: new copy starts unowned (refs = 0)
-	FileMetaData& operator=(const FileMetaData& other)
-	{
-		if (this != &other)
+		FileMetaData()
+		    : refs(0)
+		    , allowed_seeks(1 << 30)
+		    , number(0)
+		    , file_size(0)
 		{
-			refs.store(0, std::memory_order_relaxed);
-			allowed_seeks = other.allowed_seeks;
-			number = other.number;
-			file_size = other.file_size;
-			smallest = other.smallest;
-			largest = other.largest;
 		}
-		return *this;
-	}
 
-	std::atomic<int> refs;
-	int allowed_seeks; // seeks allowed until next compaction
-	uint64_t number; // file number
-	uint64_t file_size; // file size in bytes
-	InternalKey smallest; // smallest internal key in the file
-	InternalKey largest; // largest internal key in the file
+		FileMetaData(FileMetaData&& other)
+		    : refs(0)
+		    , allowed_seeks(other.allowed_seeks)
+		    , number(other.number)
+		    , file_size(other.file_size)
+		    , smallest(std::move(other.smallest))
+		    , largest(std::move(other.largest))
+		{
+		}
+
+		FileMetaData& operator=(FileMetaData&& other)
+		{
+			if (this != &other)
+			{
+				refs.store(0, std::memory_order_relaxed);
+				allowed_seeks = other.allowed_seeks;
+				number = other.number;
+				file_size = other.file_size;
+				smallest = std::move(other.smallest);
+				largest = std::move(other.largest);
+			}
+			return *this;
+		}
+
+		// Copy constructor: new copy starts unowned (refs = 0)
+		FileMetaData(const FileMetaData& other)
+		    : refs(0)
+		    , allowed_seeks(other.allowed_seeks)
+		    , number(other.number)
+		    , file_size(other.file_size)
+		    , smallest(other.smallest)
+		    , largest(other.largest)
+		{
+		}
+
+		// Copy assignment: new copy starts unowned (refs = 0)
+		FileMetaData& operator=(const FileMetaData& other)
+		{
+			if (this != &other)
+			{
+				refs.store(0, std::memory_order_relaxed);
+				allowed_seeks = other.allowed_seeks;
+				number = other.number;
+				file_size = other.file_size;
+				smallest = other.smallest;
+				largest = other.largest;
+			}
+			return *this;
+		}
+
+		std::atomic<int> refs;
+		int allowed_seeks; // seeks allowed until next compaction
+		uint64_t number; // file number
+		uint64_t file_size; // file size in bytes
+		InternalKey smallest; // smallest internal key in the file
+		InternalKey largest; // largest internal key in the file
 	};
 
 	// ─────────────────────────────────────────────────────────────────────────────

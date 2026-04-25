@@ -44,11 +44,25 @@ When a level exceeds its allowed size budget (e.g., 10MB for L1, 100MB for L2), 
 
 ## Design Policies
 
-### Conservative Tombstone Policy (v1)
-In the current implementation (v1), Prism uses a **conservative merge-only** policy:
-- **No dropping**: Deletion markers (tombstones) and older versions of keys are **not** dropped during compaction. 
-- **Reasoning**: Snapshot-aware reclamation must respect readers holding a `Snapshot` through the `snapshot_handle` field on `ReadOptions`; dropping data prematurely could otherwise resurrect old values or hide still-visible history.
-- **Future**: Data dropping can become more aggressive once snapshot-aware obsolete-file reclamation is fully integrated.
+### Snapshot-Aware Reclamation Policy
+
+Prism implements full snapshot-aware data reclamation inside `DoCompactionWork`. At the **start** of each compaction job — while the mutex is still held — the oldest live snapshot sequence is frozen into a local `oldest_snapshot` watermark:
+
+- If at least one snapshot is live: `oldest_snapshot` = `snapshot_registry_->OldestSequence()`.
+- If no snapshots are live: `oldest_snapshot` = `sequence_ - 1` (the entire write history is eligible for reclamation).
+
+The watermark is constant for the lifetime of the compaction pass; it does not shift mid-run even if snapshots are captured or released concurrently.
+
+**Rule A — superseded values**: an entry is dropped when a newer entry for the same user key has already been written to the output at a sequence ≤ `oldest_snapshot`. The older entry is invisible to every live reader and can be safely discarded.
+
+**Rule B — obsolete tombstones**: a deletion marker is dropped when its own sequence ≤ `oldest_snapshot` **and** it sits at the base level for that user key (`IsBaseLevelForKey` returns `true`). No surviving data exists below it that a snapshot could compare against, so the tombstone itself is redundant and may be elided.
+
+**Correctness guarantee**: any read or iterator issued at a sequence number carried by a live `Snapshot` handle sees the same logical dataset before and after a compaction. Data only becomes eligible for reclamation after the snapshot that would observe it is released **and** a subsequent compaction pass covers that key range.
+
+**Public API surface**:
+- `Database::CaptureSnapshot()` — registers a new snapshot in `SnapshotRegistry` and returns a RAII `Snapshot` value handle pinned to the current write sequence.
+- `ReadOptions::snapshot_handle` — pins a read or scan to the sequence recorded in the snapshot handle.
+- Snapshots are **ephemeral in-memory markers** and are not persisted across a database reopen; they are released automatically when the last `Snapshot` value handle is destroyed.
 
 ### Differences from LevelDB
 While Prism strives for LevelDB compatibility, there are intentional divergences:
@@ -60,9 +74,8 @@ While Prism strives for LevelDB compatibility, there are intentional divergences
 
 The following features are identified as necessary follow-ups to the core compaction modernization:
 
-1. **Snapshots**: Continue refining point-in-time read behavior and snapshot-aware reclamation rules.
-2. **Manual Compaction**: Add a user-facing manual compaction entry point for forced space reclamation.
-3. **Seek-Triggered Compaction**: Recording "allowed_seeks" and triggering compaction when a file is repeatedly searched but doesn't contain the requested keys (optimizing for "holes" in the data).
-4. **Bloom Filter Wiring**: Completing the read-side integration of Bloom filters to skip SSTable reads during `Get()` and Compaction.
-5. **Group Commit**: Optimizing WAL syncs by grouping multiple concurrent `Write` calls into a single disk I/O.
-6. **Async Scan/Prefetch**: Utilizing the coroutine engine to prefetch data blocks during compaction to improve throughput.
+1. **Manual Compaction**: Add a user-facing manual compaction entry point for forced space reclamation.
+2. **Seek-Triggered Compaction**: Recording "allowed_seeks" and triggering compaction when a file is repeatedly searched but doesn't contain the requested keys (optimizing for "holes" in the data).
+3. **Bloom Filter Wiring**: Completing the read-side integration of Bloom filters to skip SSTable reads during `Get()` and Compaction.
+4. **Group Commit**: Optimizing WAL syncs by grouping multiple concurrent `Write` calls into a single disk I/O.
+5. **Async Scan/Prefetch**: Utilizing the coroutine engine to prefetch data blocks during compaction to improve throughput.

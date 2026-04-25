@@ -249,3 +249,157 @@ TEST_F(AsyncDBTest, SnapshotReadSurvivesCallerTeardown)
 	}(scheduler, options);
 	task.SyncWait();
 }
+
+TEST_F(AsyncDBTest, SnapshotCopyAcrossCoroutineBoundaryKeepsViewAlive)
+{
+	ThreadPoolScheduler scheduler(4);
+	Options options;
+	options.create_if_missing = true;
+
+	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
+		auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+		if (!adb_res.has_value())
+		{
+			ADD_FAILURE() << "Open failed";
+			co_return;
+		}
+		auto adb = std::move(adb_res.value());
+
+		co_await adb.PutAsync(WriteOptions(), "bound_key", "original");
+
+		Snapshot snap = adb.CaptureSnapshot();
+		ReadOptions ro;
+		ro.snapshot_handle = snap; // copy snap by value into ro
+
+		co_await adb.PutAsync(WriteOptions(), "bound_key", "updated");
+
+		// Pass ro (which holds a copy of snap) into GetAsync; the internal lambda
+		// captures opts = options, so the Snapshot shared_ptr survives the co_await.
+		auto result = co_await adb.GetAsync(std::move(ro), "bound_key");
+		if (!result.has_value())
+		{
+			ADD_FAILURE() << "Get failed: " << result.error().ToString();
+			co_return;
+		}
+		EXPECT_EQ(result.value(), "original");
+		co_return;
+	}(scheduler, options);
+	task.SyncWait();
+}
+
+TEST_F(AsyncDBTest, SnapshotRejectsMovedFromHandle)
+{
+	ThreadPoolScheduler scheduler(4);
+	Options options;
+	options.create_if_missing = true;
+
+	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
+		auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+		if (!adb_res.has_value())
+		{
+			ADD_FAILURE() << "Open failed";
+			co_return;
+		}
+		auto adb = std::move(adb_res.value());
+
+		co_await adb.PutAsync(WriteOptions(), "mf_key", "val");
+
+		Snapshot src = adb.CaptureSnapshot();
+		Snapshot moved = std::move(src); // src.state_ is now nullptr (moved-from)
+
+		// Using the moved-from src: ResolveSnapshotSequence sees state_ == nullptr
+		// and returns EmptySnapshotHandleStatus() → InvalidArgument.
+		ReadOptions ro_src;
+		ro_src.snapshot_handle = src;
+		auto err_result = co_await adb.GetAsync(ro_src, "mf_key");
+		EXPECT_FALSE(err_result.has_value());
+		if (!err_result.has_value())
+		{
+			EXPECT_TRUE(err_result.error().IsInvalidArgument()) << err_result.error().ToString();
+		}
+
+		// Using the valid moved-to snapshot: should succeed and return the written value.
+		ReadOptions ro_moved;
+		ro_moved.snapshot_handle = moved;
+		auto ok_result = co_await adb.GetAsync(ro_moved, "mf_key");
+		if (!ok_result.has_value())
+		{
+			ADD_FAILURE() << "Get with valid snapshot failed: " << ok_result.error().ToString();
+			co_return;
+		}
+		EXPECT_EQ(ok_result.value(), "val");
+		co_return;
+	}(scheduler, options);
+	task.SyncWait();
+}
+
+TEST_F(AsyncDBTest, SnapshotRejectsForeignHandle)
+{
+	ThreadPoolScheduler scheduler(4);
+	Options options;
+	options.create_if_missing = true;
+
+	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
+		auto left_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db_left");
+		if (!left_res.has_value())
+		{
+			ADD_FAILURE() << "Left DB open failed";
+			co_return;
+		}
+		auto left_db = std::move(left_res.value());
+
+		auto right_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db_right");
+		if (!right_res.has_value())
+		{
+			ADD_FAILURE() << "Right DB open failed";
+			co_return;
+		}
+		auto right_db = std::move(right_res.value());
+
+		co_await left_db.PutAsync(WriteOptions(), "fk", "lv");
+		Snapshot left_snap = left_db.CaptureSnapshot();
+
+		// left_snap.state_->registry points to left DB's SnapshotRegistry.
+		// right DB's ResolveSnapshotSequence checks registry identity and rejects it.
+		ReadOptions ro;
+		ro.snapshot_handle = left_snap;
+		auto result = co_await right_db.GetAsync(ro, "fk");
+		EXPECT_FALSE(result.has_value());
+		if (!result.has_value())
+		{
+			EXPECT_TRUE(result.error().IsInvalidArgument()) << result.error().ToString();
+		}
+		co_return;
+	}(scheduler, options);
+	task.SyncWait();
+}
+
+TEST_F(AsyncDBTest, SnapshotDestructionAfterDBWrapperTeardownIsSafe)
+{
+	ThreadPoolScheduler scheduler(4);
+	Options options;
+	options.create_if_missing = true;
+
+	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
+		Snapshot snap;
+		{
+			auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+			if (!adb_res.has_value())
+			{
+				ADD_FAILURE() << "Open failed";
+				co_return;
+			}
+			auto adb = std::move(adb_res.value());
+			snap = adb.CaptureSnapshot();
+		} // adb goes out of scope here; the AsyncDB wrapper and underlying Database are torn down.
+		  // snap.state_ still holds a shared_ptr<SnapshotRegistry>, keeping the registry alive.
+
+		// Overwriting snap calls SnapshotState::~SnapshotState() → registry->Release().
+		// This must not crash or trigger sanitizer errors even though the DB is gone.
+		snap = Snapshot{};
+
+		SUCCEED();
+		co_return;
+	}(scheduler, options);
+	task.SyncWait();
+}
