@@ -429,3 +429,44 @@ TEST_F(FlushCompactionTest, ObsoleteFileLifecycleGuard)
 	ASSERT_TRUE(get.has_value()) << get.error().ToString();
 	EXPECT_EQ(get.value(), std::string(64, 'v'));
 }
+
+TEST_F(FlushCompactionTest, ReopenAfterPublishedStateRemainsClean)
+{
+	Options options;
+	options.create_if_missing = true;
+	options.write_buffer_size = 128;
+
+	auto open = DBImpl::OpenInternal(options, "test_flush_compaction");
+	ASSERT_TRUE(open.has_value()) << open.error().ToString();
+	auto db = std::move(open.value());
+	auto* impl = db.get();
+
+	ASSERT_TRUE(db->Put("reopen_hot", "persisted").ok());
+	for (int i = 0; i < 32; ++i)
+	{
+		ASSERT_TRUE(db->Put("reopen_fill_" + std::to_string(i), std::string(64, 'v')).ok());
+	}
+	ASSERT_TRUE(WaitUntil([impl] { return !impl->TEST_HasImmutableMemTable(); }, std::chrono::milliseconds(5000)));
+	ASSERT_NE(impl->TEST_CurrentSuperVersion(), nullptr);
+	EXPECT_TRUE(impl->TEST_PendingOutputsEmpty());
+
+	db.reset();
+
+	auto reopen = DBImpl::OpenInternal(options, "test_flush_compaction");
+	ASSERT_TRUE(reopen.has_value()) << reopen.error().ToString();
+	auto reopened = std::move(reopen.value());
+	auto* reopened_impl = reopened.get();
+	ASSERT_NE(reopened_impl->TEST_CurrentSuperVersion(), nullptr);
+	EXPECT_TRUE(reopened_impl->TEST_PendingOutputsEmpty());
+
+	auto hot = reopened->Get("reopen_hot");
+	ASSERT_TRUE(hot.has_value()) << hot.error().ToString();
+	EXPECT_EQ("persisted", hot.value());
+
+	for (int i = 0; i < 32; ++i)
+	{
+		auto result = reopened->Get("reopen_fill_" + std::to_string(i));
+		ASSERT_TRUE(result.has_value()) << result.error().ToString();
+		EXPECT_EQ(std::string(64, 'v'), result.value());
+	}
+}

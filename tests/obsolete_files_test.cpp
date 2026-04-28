@@ -15,9 +15,11 @@
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <thread>
+#include <functional>
 
 using namespace prism;
 
@@ -78,6 +80,20 @@ protected:
 		ASSERT_TRUE(out.is_open());
 		out << "dummy";
 		out.close();
+	}
+
+	bool WaitUntil(const std::function<bool()>& condition, std::chrono::milliseconds timeout)
+	{
+		const auto deadline = std::chrono::steady_clock::now() + timeout;
+		while (std::chrono::steady_clock::now() < deadline)
+		{
+			if (condition())
+			{
+				return true;
+			}
+			std::this_thread::yield();
+		}
+		return condition();
 	}
 };
 
@@ -461,4 +477,47 @@ TEST_F(ObsoleteFilesTest, ConcurrentGetAndIteratorRefBalanceAfterTurnover)
 	// All iterators destroyed – refs must be back to baseline.
 	int refs_final = impl->TEST_CurrentVersionRefs();
 	EXPECT_EQ(refs_final, baseline) << "After all iterators destroyed and Gets completed, refs must return to baseline";
+}
+
+TEST_F(ObsoleteFilesTest, ShutdownDuringActiveGetsIsSafe)
+{
+	auto db = OpenDB();
+	ASSERT_NE(db, nullptr);
+	ASSERT_TRUE(db->Put("shutdown_hot", "shutdown_value").ok());
+	for (int i = 0; i < 32; ++i)
+	{
+		ASSERT_TRUE(db->Put("shutdown_seed_" + std::to_string(i), std::string(64, 'q')).ok());
+	}
+	ASSERT_NE(db->TEST_CurrentSuperVersion(), nullptr);
+
+	DBImpl* raw = db.get();
+	constexpr int kReaders = 4;
+	std::atomic<int> started{ 0 };
+	std::atomic<int> in_flight{ 0 };
+	std::atomic<bool> stop{ false };
+	std::vector<std::thread> threads;
+
+	for (int i = 0; i < kReaders; ++i)
+	{
+		threads.emplace_back([&, raw] {
+			started.fetch_add(1, std::memory_order_release);
+			while (!stop.load(std::memory_order_acquire))
+			{
+				in_flight.fetch_add(1, std::memory_order_acq_rel);
+				(void)raw->Get("shutdown_hot");
+				in_flight.fetch_sub(1, std::memory_order_acq_rel);
+			}
+		});
+	}
+
+	ASSERT_TRUE(WaitUntil([&] { return started.load(std::memory_order_acquire) == kReaders; }, std::chrono::milliseconds(500)));
+	ASSERT_TRUE(WaitUntil([&] { return in_flight.load(std::memory_order_acquire) > 0; }, std::chrono::milliseconds(500)));
+
+	stop.store(true, std::memory_order_release);
+	db.reset();
+
+	for (auto& thread : threads)
+	{
+		thread.join();
+	}
 }
