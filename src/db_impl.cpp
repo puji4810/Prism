@@ -1840,28 +1840,25 @@ namespace prism
 
 	Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
 	{
-		// Phase 1: Capture a pinned read view under the lock.
-		MemTable* mem = nullptr;
-		MemTable* imm = nullptr;
-		Version* current = nullptr;
-		SequenceNumber snapshot = 0;
+		// Phase 1: Acquire a pinned read view lock-free via the published SuperVersion.
+		SuperVersion* sv = super_version_.load(std::memory_order_acquire);
+		if (sv == nullptr)
 		{
-			std::shared_lock<std::shared_mutex> lock(mutex_);
-			auto snapshot_result = ResolveSnapshotSequence(read_options.snapshot_handle);
-			if (!snapshot_result.has_value())
-			{
-				return std::unexpected(snapshot_result.error());
-			}
-			snapshot = snapshot_result.value();
-			mem = mem_;
-			if (mem != nullptr)
-				mem->Ref();
-			imm = imm_;
-			if (imm != nullptr)
-				imm->Ref();
-			current = versions_->current();
-			current->Ref();
+			return std::unexpected(Status::Corruption("database not initialized"));
 		}
+		sv->Ref();
+
+		auto snapshot_result = ResolveSnapshotSequence(read_options.snapshot_handle);
+		if (!snapshot_result.has_value())
+		{
+			sv->Unref();
+			return std::unexpected(snapshot_result.error());
+		}
+		SequenceNumber snapshot = snapshot_result.value();
+
+		MemTable* mem = sv->mem;
+		MemTable* imm = sv->imm;
+		Version* current = sv->current;
 
 		// Phase 2: Look up key without holding the lock.
 		std::string value;
@@ -1941,11 +1938,8 @@ namespace prism
 			}
 		}
 
-		// Phase 3: Release all pinned resources.
-		current->Unref();
-		if (imm != nullptr)
-			imm->Unref();
-		mem->Unref();
+		// Phase 3: Release the read view (pinned via SuperVersion).
+		sv->Unref();
 
 		if (!s.ok())
 		{
