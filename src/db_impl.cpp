@@ -824,7 +824,7 @@ namespace prism
 		{
 			sv->current->Ref();
 		}
-		sv->sequence = sequence_;
+		sv->sequence = visible_sequence_.load(std::memory_order_acquire);
 		sv->Ref();
 
 		const int to_clean = 1 - retired_index_;
@@ -865,6 +865,7 @@ namespace prism
 		}
 		log_file_guard_ = std::make_unique<LogFileGuard>(std::move(result.value()));
 		logfile_number_ = new_log_number;
+		visible_sequence_.store(sequence_ - 1, std::memory_order_release);
 		return Status::OK();
 	}
 
@@ -1819,6 +1820,7 @@ namespace prism
 			env_->RemoveFile(fname);
 		}
 
+		visible_sequence_.store(sequence_ - 1, std::memory_order_release);
 		return Status::OK();
 	}
 
@@ -2003,6 +2005,7 @@ namespace prism
 		{
 			return s;
 		}
+		visible_sequence_.store(sequence_ - 1, std::memory_order_release);
 		return Status::OK();
 	}
 
@@ -2104,7 +2107,7 @@ namespace prism
 	Snapshot DBImpl::CaptureSnapshot()
 	{
 		std::lock_guard<std::shared_mutex> lock(mutex_);
-		const SequenceNumber snapshot_sequence = sequence_ - 1;
+		const SequenceNumber snapshot_sequence = visible_sequence_.load(std::memory_order_acquire);
 		auto node = snapshot_registry_->Register(snapshot_sequence);
 		return Snapshot(std::make_shared<SnapshotState>(snapshot_sequence, snapshot_registry_, std::move(node)));
 	}
@@ -2113,7 +2116,7 @@ namespace prism
 	{
 		if (!snapshot_handle.has_value())
 		{
-			return (sequence_ == 0 ? 0 : sequence_ - 1);
+			return visible_sequence_.load(std::memory_order_acquire);
 		}
 
 		if (!snapshot_handle->state_)

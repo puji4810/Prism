@@ -195,6 +195,11 @@ namespace prism
 		// VersionSet persists last_sequence (last assigned), so:
 		//   sequence_ == versions_->LastSequence() + 1
 		SequenceNumber sequence_ = 1;
+		// visible_sequence_ tracks the last sequence whose write has been fully
+		// committed and published. It advances only after ApplyBatch completes
+		// (under mutex_), never when a sequence is merely reserved. Readers
+		// use this value for unsnapshotted visibility.
+		std::atomic<SequenceNumber> visible_sequence_{ 0 };
 		InternalKeyComparator internal_comparator_;
 
 		std::unique_ptr<VersionSet> versions_;
