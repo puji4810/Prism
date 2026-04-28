@@ -790,6 +790,20 @@ namespace prism
 		return batch.Iterate(&handler);
 	}
 
+	SequenceNumber DBImpl::FreezeCompactionWatermark() const
+	{
+		// Precondition: caller holds mutex_ (unique_lock or lock_guard).
+		// assert(mutex_.try_lock() == false) would be ideal but is unavailable under shared_mutex.
+		auto opt_seq = snapshot_registry_->OldestSequence();
+		if (opt_seq.has_value())
+		{
+			return opt_seq.value();
+		}
+		// No live snapshots: use the last assigned sequence as the watermark so all
+		// superseded values and obsolete tombstones become eligible for reclamation.
+		return sequence_ > 0 ? sequence_ - 1 : 0;
+	}
+
 	void DBImpl::InstallSuperVersion()
 	{
 		// Precondition: caller holds unique_lock(mutex_). Publication and retirement are serialized by
@@ -1128,18 +1142,7 @@ namespace prism
 			return status;
 		}
 
-		// Freeze the oldest-live-snapshot watermark before releasing the mutex so the
-		// registry state and sequence counter are observed atomically with one another.
-		const SequenceNumber oldest_snapshot = [&]() -> SequenceNumber {
-			auto opt_seq = snapshot_registry_->OldestSequence();
-			if (opt_seq.has_value())
-			{
-				return opt_seq.value();
-			}
-			// No live snapshots: use the last assigned sequence as the watermark so all
-			// superseded values and obsolete tombstones become eligible for reclamation.
-			return sequence_ > 0 ? sequence_ - 1 : 0;
-		}();
+		const SequenceNumber oldest_snapshot = FreezeCompactionWatermark();
 
 		mutex_.unlock();
 
@@ -2241,6 +2244,12 @@ namespace prism
 		StopSource stop_source;
 		BackgroundCompaction(stop_source.Token());
 		return bg_error_;
+	}
+
+	SuperVersion* DBImpl::TEST_CurrentSuperVersion() const
+	{
+		std::lock_guard<std::shared_mutex> lock(mutex_);
+		return super_version_.load(std::memory_order_acquire);
 	}
 
 	void DBImpl::TEST_RequestCompactionStop()

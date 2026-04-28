@@ -58,6 +58,7 @@ namespace prism
 
 		void Unref()
 		{
+			assert(refs_.load(std::memory_order_acquire) > 0);
 			if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1)
 			{
 				if (current != nullptr)
@@ -91,6 +92,10 @@ namespace prism
 		Status Write(WriteBatch batch) { return Write(WriteOptions(), std::move(batch)); }
 		std::unique_ptr<Iterator> NewIterator(const ReadOptions& options);
 		Snapshot CaptureSnapshot();
+		// ADVISORY ONLY — reads snapshot_registry_ without holding mutex_. Snapshot
+		// count/liveness may change between the query and any action taken based on it.
+		// Use FreezeCompactionWatermark() inside the compaction path or any context
+		// that derives reclaim/drop decisions.
 		std::optional<SequenceNumber> GetOldestLiveSnapshotSequence() const;
 
 		// ── Test-only accessors ──────────────────────────────────────────────
@@ -114,6 +119,7 @@ namespace prism
 		    int level, uint64_t number, uint64_t file_size, const InternalKey& smallest, const InternalKey& largest);
 		Status TEST_RunPickedCompaction();
 		Status TEST_RunBackgroundCompactionOnce();
+		SuperVersion* TEST_CurrentSuperVersion() const;
 		std::vector<FileMetaData> TEST_LevelFilesCopy(int level) const;
 		TableCache* TEST_TableCache() const { return table_cache_; }
 		Env* TEST_Env() const { return env_; }
@@ -155,6 +161,10 @@ namespace prism
 		void RemoveObsoleteFiles();
 		Status NewLogFile();
 		Status CloseLogFile();
+		// Freeze the oldest-live-snapshot watermark while mutex_ is held.
+		// The returned value must NOT be used outside the compaction path
+		// and must never drive reclaim/drop decisions from an unlocked context.
+		SequenceNumber FreezeCompactionWatermark() const;
 		void InstallSuperVersion();
 		Result<SequenceNumber> ResolveSnapshotSequence(const std::optional<Snapshot>& snapshot_handle) const;
 
