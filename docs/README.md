@@ -61,6 +61,16 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
   - Two-level iteration
   - CRC32C checksums
 
+### Benchmarking & Profiling
+
+- **[Benchmark Tools](benchmark.md)** - Complete guide to Prism's benchmark suite
+  - `kv_bench` binary — all CLI flags and benchmark modes
+  - `run_benchmark_matrix.sh` — canonical 5+4 variant throughput matrix
+  - `acceptance_harness.sh` — before/after regression test suite
+  - `compare_perf.py` — results comparison with regression gates
+  - `profile_workflow.sh` — FlameGraph profiling workflow
+  - Common workflows (pre-commit check, full characterization, CI)
+
 ## 🏗️ Implementation Status
 
 ### ✅ Completed
@@ -156,6 +166,7 @@ Reads:   App → MemTable → Imm → L0 → L1 → ... → L6
 3. Study [MemTable Format](memtable_format.md) for in-memory structure
 4. Review [WriteBatch Format](writebatch_format.md) and [Log Format](log_format.md)
 5. Explore [Coroutine API Design](coroutine_api_design.md) and [Thread Pool Scheduler](thread_pool.md) for async operations
+6. See [Benchmark Tools](benchmark.md) for performance measurement and regression testing
 
 ### For Implementation
 
@@ -165,21 +176,14 @@ Reads:   App → MemTable → Imm → L0 → L1 → ... → L6
    - `util/coding.h` - Encoding utilities
    - `util/arena.h` - Memory allocator
    - `include/skiplist.h` - Ordered index
-2. Implement InternalKey:
+2. Understand the key abstractions:
 
-   - `include/dbformat.h`
-   - Tag encoding (sequence + type)
-   - InternalKeyComparator
-3. Implement MemTable:
-
-   - `include/memtable.h`
-   - Add/Get operations
-   - KeyComparator
-4. Integrate with DBImpl:
-
-   - Replace `std::unordered_map` with MemTable
-   - Add immutable MemTable (imm_)
-   - Trigger compaction on size limit
+   - `Database` (sync) and `AsyncDB` (coroutine) are the public entry points
+   - `DBImpl` is the internal engine — see `include/db_impl.h`
+   - `Snapshot` is a cheap-copy RAII handle for point-in-time reads
+   - The `RuntimeBundle` manages lane-isolated executors for async I/O
+   - Compaction is snapshot-aware and runs on a dedicated background lane
+3. See `docs/architecture.md` for the full system design.
 
 ## 🧪 Testing
 
@@ -325,5 +329,5 @@ See [LICENSE](../LICENSE) file in the project root.
 
 ---
 
-**Last Updated:** 2025-12-16
-**Version:** 0.1.0-dev
+**Last Updated:** 2026-04-28
+**Version:** 0.2.0-dev
