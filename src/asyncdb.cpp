@@ -1,6 +1,7 @@
 #include "asyncdb.h"
 
 #include "db.h"
+#include "db_impl.h"
 #include "result.h"
 #include "runtime_executor.h"
 #include "runtime_metrics.h"
@@ -92,4 +93,6 @@ namespace prism
 	}
 
 	Snapshot AsyncDB::CaptureSnapshot() { return state_->db_.CaptureSnapshot(); }
+
+	Database& CompactionStateAccess::GetDatabase(AsyncDB& db) { return db.state_->db_; }
 }

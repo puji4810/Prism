@@ -2185,6 +2185,36 @@ namespace prism
 		return compaction_controller_ != nullptr && compaction_controller_->HasInFlightWork();
 	}
 
+	DBImpl* CompactionStateAccess::GetDBImpl(Database& db)
+	{
+		return db.impl_.get();
+	}
+
+	auto DBImpl::GetCompactionState() const -> CompactionStateSnapshot
+	{
+		CompactionStateSnapshot snapshot;
+
+		// Snapshot atomics first (lock-free).
+		snapshot.compaction_finish_count = background_compaction_finish_count_.load(std::memory_order_acquire);
+
+		// Acquire shared lock for mutex-protected state.
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+
+		snapshot.compaction_start_count = static_cast<uint64_t>(background_compaction_start_count_);
+		snapshot.compaction_in_flight = compaction_controller_ != nullptr && compaction_controller_->HasInFlightWork();
+		snapshot.flush_in_flight = imm_ != nullptr;
+
+		// Write-stall is active when L0 file count >= kL0_SlowdownWritesTrigger.
+		// This matches the condition checked in MakeRoomForWrite().
+		if (versions_ != nullptr)
+		{
+			const int l0_files = static_cast<int>(versions_->current()->files(0).size());
+			snapshot.write_stalled = l0_files >= config::kL0_SlowdownWritesTrigger;
+		}
+
+		return snapshot;
+	}
+
 	std::vector<FileMetaData> DBImpl::TEST_LevelFilesCopy(int level) const
 	{
 		std::vector<FileMetaData> files_copy;

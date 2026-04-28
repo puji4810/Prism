@@ -290,6 +290,13 @@ target("runtime_lane_test")
 	add_includedirs("$(projectdir)/tests")
 	add_tests("default")
 
+target("executor_microbench")
+	set_kind("binary")
+	add_files("$(projectdir)/benchmark/executor_microbench.cpp")
+	add_files("$(projectdir)/util/scheduler.cpp", "$(projectdir)/src/runtime_executor.cpp", "$(projectdir)/src/runtime_metrics.cpp")
+	add_includedirs("$(builddir)/generated", "$(projectdir)/include", "$(projectdir)/src", "$(projectdir)/util")
+	add_tests("default")
+
 target("kv_bench_async_matrix_test")
 	set_kind("binary")
 	add_files(common_files)
@@ -298,6 +305,14 @@ target("kv_bench_async_matrix_test")
 	add_files("$(projectdir)/tests/test_main.cpp")
 	add_includedirs(common_includedirs)
 	add_includedirs(bench_includedirs)
+	add_tests("default")
+
+target("compaction_state_test")
+	set_kind("binary")
+	add_files(common_files)
+	add_files("$(projectdir)/tests/compaction_state_test.cpp")
+	add_files("$(projectdir)/tests/test_main.cpp")
+	add_includedirs(common_includedirs)
 	add_tests("default")
 
 

@@ -82,6 +82,7 @@ namespace prism
 		lane_active_ = false;
 		RuntimeMetrics::Instance().active_compaction_lane.store(0, std::memory_order_relaxed);
 		RuntimeMetrics::Instance().compaction_jobs_completed.fetch_add(1, std::memory_order_relaxed);
+		db_->background_compaction_finish_count_.fetch_add(1, std::memory_order_release);
 		if (!stop_source_.StopRequested() && !db_->shutting_down_.load(std::memory_order_acquire) && db_->bg_error_.ok() &&
 		    NeedsBackgroundWork())
 		{

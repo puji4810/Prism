@@ -57,7 +57,9 @@ namespace prism
 		// Store it in the snapshot_handle field on ReadOptions when issuing snapshot reads.
 		Snapshot CaptureSnapshot();
 
-	private:
+		private:
+		friend struct CompactionStateAccess;
+
 		explicit Database(std::unique_ptr<DBImpl> impl);
 
 		std::unique_ptr<DBImpl> impl_;

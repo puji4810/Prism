@@ -49,6 +49,8 @@ namespace prism
 		Snapshot CaptureSnapshot();
 
 	private:
+		friend struct CompactionStateAccess;
+
 		struct SharedState;
 
 		AsyncDB(std::shared_ptr<SharedState> state);
