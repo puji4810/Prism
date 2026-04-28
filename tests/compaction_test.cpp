@@ -307,3 +307,98 @@ TEST_F(CompactionTest, TrivialMoveInstallsViaManifestOnly)
 	    }));
 	EXPECT_EQ(table_files_after, table_files_before);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invariant guard: iterator + Get survive version turnover
+//
+// Creates an iterator AND performs Gets, then triggers version turnover via
+// TEST_RunBackgroundCompactionOnce.  Both the iterator (which pins the old
+// version) and subsequent Gets (which must see the new version) must remain
+// correct.  This guards against a regression where version turnover corrupts
+// the read path or leaks refs.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(CompactionTest, IteratorAndGetBothSurviveVersionTurnover)
+{
+	auto db = OpenDB();
+	ASSERT_NE(db, nullptr);
+
+	auto* impl = db.get();
+
+	// Seed data.
+	for (int i = 0; i < 50; ++i)
+	{
+		ASSERT_TRUE(db->Put("turnover_" + std::to_string(i), "old_" + std::to_string(i)).ok());
+	}
+
+	int baseline_refs = impl->TEST_CurrentVersionRefs();
+
+	// Create an iterator that pins the current version.
+	std::unique_ptr<Iterator> iter = db->NewIterator(ReadOptions());
+	ASSERT_NE(iter, nullptr);
+
+	int refs_with_iter = impl->TEST_CurrentVersionRefs();
+	EXPECT_GE(refs_with_iter, baseline_refs + 1) << "Iterator must pin the version";
+
+	// Perform Gets while the iterator is alive.
+	for (int i = 0; i < 50; ++i)
+	{
+		auto r = db->Get("turnover_" + std::to_string(i));
+		ASSERT_TRUE(r.has_value()) << "turnover_" << i << " missing";
+		EXPECT_EQ(r.value(), "old_" + std::to_string(i));
+	}
+
+	// Write more data and trigger version turnover.
+	for (int i = 0; i < 200; ++i)
+	{
+		ASSERT_TRUE(db->Put("new_" + std::to_string(i), std::string(128, 'n')).ok());
+	}
+
+	// Sync barrier to ensure flush completes before compaction.
+	ASSERT_TRUE(db->Put("sync_barrier", "x").ok());
+
+	for (int i = 0; i < 8; ++i)
+	{
+		Status s = impl->TEST_RunBackgroundCompactionOnce();
+		if (!s.ok()) break;
+	}
+
+	// Iterator must still see its original view.
+	iter->SeekToFirst();
+	int count = 0;
+	while (iter->Valid())
+	{
+		std::string key = iter->key().ToString();
+		if (key.substr(0, 9) == "turnover_")
+		{
+			int idx = std::stoi(key.substr(9));
+			EXPECT_EQ(iter->value().ToString(), "old_" + std::to_string(idx))
+			    << "Iterator must see original value after version turnover";
+		}
+		++count;
+		iter->Next();
+	}
+	EXPECT_GT(count, 0) << "Iterator should visit at least some keys";
+	EXPECT_TRUE(iter->status().ok()) << iter->status().ToString();
+
+	// Refs must still be elevated by the iterator.
+	int refs_mid = impl->TEST_CurrentVersionRefs();
+	EXPECT_GE(refs_mid, baseline_refs + 1) << "Iterator still alive – refs must be elevated";
+
+	// Destroy iterator – refs must return to baseline.
+	iter.reset();
+	int refs_final = impl->TEST_CurrentVersionRefs();
+	EXPECT_EQ(refs_final, baseline_refs) << "After iterator destruction, refs must return to baseline";
+
+	// New Gets must see the latest data.
+	for (int i = 0; i < 50; ++i)
+	{
+		auto r = db->Get("turnover_" + std::to_string(i));
+		ASSERT_TRUE(r.has_value());
+		EXPECT_EQ(r.value(), "old_" + std::to_string(i)) << "Original data must still be readable";
+	}
+	for (int i = 0; i < 200; ++i)
+	{
+		auto r = db->Get("new_" + std::to_string(i));
+		ASSERT_TRUE(r.has_value()) << "new_" << i << " missing after turnover";
+	}
+}
