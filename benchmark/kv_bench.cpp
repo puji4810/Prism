@@ -3,6 +3,7 @@
 #include "asyncdb.h"
 #include "bench_env_wrapper.h"
 #include "db.h"
+#include "db_impl.h"
 #include "runtime_metrics.h"
 #include "scheduler.h"
 
@@ -241,6 +242,33 @@ namespace prism::bench
 				(void)std::filesystem::remove_all(dir);
 			}
 			return;
+		}
+
+		// ── Phase-aware compaction/quiescence annotation ──────────────────
+		// Query compaction state before steady-state measurement to detect
+		// whether background work overlaps the profiling window.
+		DBImpl* dbi = CompactionStateAccess::GetDBImpl(CompactionStateAccess::GetDatabase(*adb));
+		if (cfg.phase == PhaseMode::kSteadyState)
+		{
+			const auto cs = dbi->GetCompactionState();
+			std::printf(
+			    "phase=steady-state compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
+			    " compaction_start_count=%lu compaction_finish_count=%lu\n",
+			    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight),
+			    static_cast<int>(cs.write_stalled),
+			    static_cast<unsigned long>(cs.compaction_start_count),
+			    static_cast<unsigned long>(cs.compaction_finish_count));
+		}
+		else if (cfg.phase == PhaseMode::kCompactionOverlapOnly)
+		{
+			const auto cs = dbi->GetCompactionState();
+			std::printf(
+			    "phase=compaction-overlap-only compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
+			    " compaction_start_count=%lu compaction_finish_count=%lu\n",
+			    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight),
+			    static_cast<int>(cs.write_stalled),
+			    static_cast<unsigned long>(cs.compaction_start_count),
+			    static_cast<unsigned long>(cs.compaction_finish_count));
 		}
 
 		std::vector<uint64_t> all_lat;

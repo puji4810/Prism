@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <optional>
 #include <set>
 #include <shared_mutex>
@@ -24,6 +25,25 @@ namespace prism
 	class SnapshotRegistry;
 	class TableCache;
 	class CompactionExecutionTest;
+
+	// Lightweight snapshot of DB background activity for benchmark/observability.
+	// All fields are read without blocking the write path.
+	struct CompactionStateSnapshot
+	{
+		bool compaction_in_flight = false;
+		bool flush_in_flight = false;
+		bool write_stalled = false;
+		uint64_t compaction_start_count = 0;
+		uint64_t compaction_finish_count = 0;
+	};
+
+	// Helper for benchmark code to access DBImpl from a Database handle.
+	// Requires friend declaration in db.h.
+	struct CompactionStateAccess
+	{
+		static DBImpl* GetDBImpl(Database& db);
+		static Database& GetDatabase(AsyncDB& db);
+	};
 
 	class DBImpl
 	{
@@ -75,6 +95,10 @@ namespace prism
 		const std::string& TEST_DBName() const { return dbname_; }
 		bool TEST_PendingOutputsEmpty() const;
 		size_t TEST_ActiveSnapshotCount() const;
+
+		// Returns a lightweight snapshot of compaction/flush/stall state
+		// without blocking the write path for more than a shared_lock.
+		CompactionStateSnapshot GetCompactionState() const;
 
 	private:
 		friend class CompactionExecutionTest;
@@ -137,6 +161,7 @@ namespace prism
 		std::set<uint64_t> pending_outputs_;
 		std::shared_ptr<RuntimeBundle> runtime_bundle_;
 		std::unique_ptr<CompactionController> compaction_controller_;
+		std::atomic<uint64_t> background_compaction_finish_count_{ 0 };
 		Status bg_error_;
 		std::atomic<bool> shutting_down_{ false };
 		std::shared_ptr<SnapshotRegistry> snapshot_registry_;
