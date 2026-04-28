@@ -1214,19 +1214,19 @@ namespace prism::bench
 			{
 				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f "
 				            "scenario=%s inflight_cfg=%d max_inflight=%zu max_client_inflight=%zu write_sync=%d "
-				            "bg_scheduled=%d bg_sleeps=%d\n",
+				            "bg_sleeps=%d\n",
 				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
 				    stats.seconds, ops_per_sec, scenario.c_str(), cfg.inflight_per_client, max_inflight, stats.max_client_inflight,
-				    stats.write_sync, stats.bg_scheduled, stats.bg_sleeps);
+				    stats.write_sync, stats.bg_sleeps);
 			}
 			else
 			{
 				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=ignored time=%.3fs ops/s=%.0f "
 				            "scenario=%s inflight_cfg=%d max_inflight=%zu max_client_inflight=%zu write_sync=%d "
-				            "bg_scheduled=%d bg_sleeps=%d\n",
+				            "bg_sleeps=%d\n",
 				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, stats.seconds,
 				    ops_per_sec, scenario.c_str(), cfg.inflight_per_client, max_inflight, stats.max_client_inflight, stats.write_sync,
-				    stats.bg_scheduled, stats.bg_sleeps);
+				    stats.bg_sleeps);
 			}
 		}
 		else
@@ -1237,20 +1237,20 @@ namespace prism::bench
 			{
 				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f max_inflight=%zu "
 				            "p50_us=%.2f p95_us=%.2f scenario=%s inflight_cfg=%d max_client_inflight=%zu write_sync=%d "
-				            "bg_scheduled=%d bg_sleeps=%d\n",
+				            "bg_sleeps=%d\n",
 				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
 				    stats.seconds, ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0,
-				    scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync, stats.bg_scheduled,
+				    scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync,
 				    stats.bg_sleeps);
 			}
 			else
 			{
 				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=ignored time=%.3fs ops/s=%.0f max_inflight=%zu "
 				            "p50_us=%.2f p95_us=%.2f scenario=%s inflight_cfg=%d max_client_inflight=%zu write_sync=%d "
-				            "bg_scheduled=%d bg_sleeps=%d\n",
+				            "bg_sleeps=%d\n",
 				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, stats.seconds,
 				    ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0, scenario.c_str(),
-				    cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync, stats.bg_scheduled, stats.bg_sleeps);
+				    cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync, stats.bg_sleeps);
 			}
 		}
 	}

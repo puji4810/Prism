@@ -164,7 +164,6 @@ namespace
 		prism::bench::Stats stats;
 		EXPECT_EQ(stats.max_client_inflight, 0);
 		EXPECT_EQ(stats.write_sync, 0);
-		EXPECT_EQ(stats.bg_scheduled, 0);
 		EXPECT_EQ(stats.bg_sleeps, 0);
 	}
 
@@ -360,7 +359,6 @@ namespace
 			auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
 			auto stats = prism::bench::RunAsyncCompactionOverlap(async_db, scheduler, cfg, keys);
 
-			EXPECT_GE(stats.bg_scheduled, 0);
 			EXPECT_GE(stats.bg_sleeps, 0);
 		}
 

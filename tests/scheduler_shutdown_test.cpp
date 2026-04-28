@@ -217,3 +217,127 @@ TEST(SchedulerShutdownTest, LateSubmissionsDuringShutdown)
 	EXPECT_EQ(outer_counter->load(), kOuter) << "Outer tasks were dropped";
 	EXPECT_EQ(inner_counter->load(), kOuter) << "Inner (late-submitted) tasks were dropped on shutdown";
 }
+
+// ---------------------------------------------------------------------------
+// RetiredCloseWorkDrainedDuringShutdown
+// Models the retired-WAL/background-close shutdown path through delayed tasks
+// (future deadline, must be promoted on shutdown) + affinity tasks submitted
+// from worker context (simulating the coordination path for WAL close).
+// Fills the TODO gap at lines 30-35 about shutdown drain of retired-close work.
+// ---------------------------------------------------------------------------
+TEST(SchedulerShutdownTest, RetiredCloseWorkDrainedDuringShutdown)
+{
+	auto close_counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumCloseTasks = 100;
+
+	{
+		ThreadPoolScheduler scheduler(4);
+
+		// Model retired-WAL close as delayed tasks with future deadlines.
+		// These simulate scheduled background-close work that must be promoted
+		// to immediate execution during shutdown drain.
+		auto future = std::chrono::steady_clock::now() + 30s;
+		for (int i = 0; i < kNumCloseTasks; ++i)
+		{
+			scheduler.SubmitAfter(future, [close_counter]() { close_counter->fetch_add(1, std::memory_order_relaxed); });
+		}
+
+		// Model the worker-coordination path: a dispatched job captures its
+		// context and submits an affinity "close" continuation.
+		scheduler.Submit([&scheduler, close_counter]() {
+			auto ctx = scheduler.CaptureContext();
+			ASSERT_TRUE(ctx.IsValid());
+			scheduler.SubmitIn(ctx, [close_counter]() { close_counter->fetch_add(1, std::memory_order_relaxed); });
+		});
+	}
+
+	// All tasks must be drained: kNumCloseTasks delayed + 1 affinity continuation.
+	EXPECT_EQ(close_counter->load(), kNumCloseTasks + 1)
+	    << "Retired-close modeled tasks were not fully drained on shutdown";
+}
+
+// ---------------------------------------------------------------------------
+// AllSubmissionPathsDrainedOnShutdown
+// Submit tasks through ALL submission paths (priority, lazy with future
+// deadline, affinity, and worker-chained) and verify the scheduler destructor
+// drains every queue completely.
+// ---------------------------------------------------------------------------
+TEST(SchedulerShutdownTest, AllSubmissionPathsDrainedOnShutdown)
+{
+	auto priority_counter = std::make_shared<std::atomic<int>>(0);
+	auto lazy_counter = std::make_shared<std::atomic<int>>(0);
+	auto affinity_counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumEach = 100;
+
+	{
+		ThreadPoolScheduler scheduler(4);
+
+		// 1. Priority queue (immediate tasks with varying priority)
+		for (int i = 0; i < kNumEach; ++i)
+		{
+			scheduler.Submit(
+			    [priority_counter]() { priority_counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 5));
+		}
+
+		// 2. Lazy queue (future deadline — must be promoted on drain)
+		auto future = std::chrono::steady_clock::now() + 30s;
+		for (int i = 0; i < kNumEach; ++i)
+		{
+			scheduler.SubmitAfter(future, [lazy_counter]() { lazy_counter->fetch_add(1, std::memory_order_relaxed); });
+		}
+
+		// 3. Affinity path: from a dispatched worker, submit tasks via SubmitIn
+		//    into the same worker's queue. These are NOT dispatcher-tracked and
+		//    must be drained from the worker's local queue.
+		scheduler.Submit([&scheduler, affinity_counter]() {
+			auto ctx = scheduler.CaptureContext();
+			ASSERT_TRUE(ctx.IsValid());
+			for (int i = 0; i < kNumEach; ++i)
+			{
+				scheduler.SubmitIn(ctx,
+				    [affinity_counter]() { affinity_counter->fetch_add(1, std::memory_order_relaxed); });
+			}
+		});
+	}
+
+	EXPECT_EQ(priority_counter->load(), kNumEach) << "Priority tasks were dropped on shutdown";
+	EXPECT_EQ(lazy_counter->load(), kNumEach) << "Lazy tasks were not promoted/drained on shutdown";
+	EXPECT_EQ(affinity_counter->load(), kNumEach) << "Affinity tasks were dropped on shutdown";
+}
+
+// ---------------------------------------------------------------------------
+// NoDoubleExecutionDuringDrain
+// Verify that tasks drained during shutdown execute exactly once — not zero
+// and not twice. Uses a counter that must equal exactly kNumTasks (not >=).
+// Catches double-execution bugs where a task runs during normal operation
+// AND again during the sequential drain phase.
+// ---------------------------------------------------------------------------
+TEST(SchedulerShutdownTest, NoDoubleExecutionDuringDrain)
+{
+	auto counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumTasks = 500;
+
+	{
+		ThreadPoolScheduler scheduler(2);
+
+		// Mixed workload:
+		// - Immediate tasks that may or may not run before shutdown starts
+		// - Delayed tasks with future deadline that will be promoted on drain
+		for (int i = 0; i < kNumTasks; ++i)
+		{
+			scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
+		}
+
+		auto future = std::chrono::steady_clock::now() + 30s;
+		for (int i = 0; i < kNumTasks; ++i)
+		{
+			scheduler.SubmitAfter(future, [counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
+		}
+	}
+
+	// The counter must equal exactly kNumTasks * 2 — no more (double-execution)
+	// and no less (dropped tasks).
+	const int actual = counter->load();
+	EXPECT_EQ(actual, kNumTasks * 2) << "Expected exactly " << (kNumTasks * 2) << " task executions, got " << actual
+	                                 << " (tasks were either dropped or double-executed during drain)";
+}

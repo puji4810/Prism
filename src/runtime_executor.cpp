@@ -10,7 +10,7 @@ namespace prism
 	namespace
 	{
 		constexpr std::size_t kCpuContinuationPriority = 0;
-		constexpr std::size_t kReadExecutorThreadCount = 8;
+		constexpr std::size_t kReadExecutorThreadCount = 4;
 
 		// For Singleton, here:
 		// https://puji4810.github.io/2025/12/26/Singleton/
@@ -26,6 +26,65 @@ namespace prism
 		{
 			static auto* registry = new std::unordered_map<ThreadPoolScheduler*, std::weak_ptr<RuntimeBundle>>();
 			return *registry;
+		}
+
+		class DeferredRuntimeDeletionQueue
+		{
+		public:
+			DeferredRuntimeDeletionQueue()
+			    : worker_([this] { WorkerLoop(); })
+			{
+			}
+
+			~DeferredRuntimeDeletionQueue()
+			{
+				{
+					std::lock_guard lock(mutex_);
+					stopping_ = true;
+				}
+				cv_.notify_all();
+			}
+
+			void Enqueue(RuntimeBundle* runtime)
+			{
+				{
+					std::lock_guard lock(mutex_);
+					queue_.push_back(runtime);
+				}
+				cv_.notify_one();
+			}
+
+		private:
+			void WorkerLoop()
+			{
+				while (true)
+				{
+					RuntimeBundle* runtime = nullptr;
+					{
+						std::unique_lock lock(mutex_);
+						cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+						if (stopping_ && queue_.empty())
+						{
+							return;
+						}
+						runtime = queue_.front();
+						queue_.pop_front();
+					}
+					delete runtime;
+				}
+			}
+
+			std::mutex mutex_;
+			std::condition_variable cv_;
+			std::deque<RuntimeBundle*> queue_;
+			bool stopping_{ false };
+			std::jthread worker_;
+		};
+
+		DeferredRuntimeDeletionQueue& RuntimeDeletionQueue()
+		{
+			static DeferredRuntimeDeletionQueue queue;
+			return queue;
 		}
 
 #ifndef PRISM_RUNTIME_METRICS
@@ -99,11 +158,28 @@ namespace prism
 
 	BlockingExecutor::~BlockingExecutor()
 	{
+		if (IsCurrentWorker())
+		{
+			std::terminate();
+		}
+
 		{
 			std::lock_guard lock(mutex_);
 			stopping_ = true;
 		}
 		cv_.notify_all();
+
+		for (auto& worker: workers_)
+		{
+			if (!worker.joinable())
+			{
+				continue;
+			}
+
+			worker.request_stop();
+			worker.join();
+		}
+		workers_.clear();
 	}
 
 	void BlockingExecutor::Submit(std::function<void()> work)
@@ -139,6 +215,14 @@ namespace prism
 	{
 		std::lock_guard lock(mutex_);
 		return queue_.empty();
+	}
+
+	bool BlockingExecutor::IsCurrentWorker() const noexcept
+	{
+		const auto current_thread_id = std::this_thread::get_id();
+		return std::any_of(workers_.begin(), workers_.end(), [current_thread_id](const std::jthread& worker) {
+			return worker.joinable() && worker.get_id() == current_thread_id;
+		});
 	}
 
 	void BlockingExecutor::WorkerLoop()
@@ -203,6 +287,8 @@ namespace prism
 		return queue_.empty() && !running_;
 	}
 
+	bool SerialLane::IsCurrentWorker() const noexcept { return worker_.joinable() && worker_.get_id() == std::this_thread::get_id(); }
+
 	void SerialLane::WorkerLoop()
 	{
 		while (true)
@@ -261,8 +347,13 @@ namespace prism
 	    , read_scheduler(read_executor)
 	    , compaction_scheduler(compaction_executor)
 	    , serial_scheduler(serial_lane)
-	    , runtime_scheduler(cpu_executor_impl, &read_scheduler, &cpu_scheduler)
+	    , runtime_scheduler(cpu_executor_impl, &read_scheduler, &read_scheduler)
 	{
+	}
+
+	bool RuntimeBundle::IsCurrentWorker() const noexcept
+	{
+		return read_executor.IsCurrentWorker() || compaction_executor.IsCurrentWorker() || serial_lane.IsCurrentWorker();
 	}
 
 	std::shared_ptr<RuntimeBundle> AcquireRuntimeBundle(ThreadPoolScheduler& scheduler)
@@ -278,7 +369,14 @@ namespace prism
 			}
 		}
 
-		auto runtime = std::make_shared<RuntimeBundle>(scheduler);
+		auto runtime = std::shared_ptr<RuntimeBundle>(new RuntimeBundle(scheduler), [](RuntimeBundle* runtime) {
+			if (runtime->IsCurrentWorker())
+			{
+				RuntimeDeletionQueue().Enqueue(runtime);
+				return;
+			}
+			delete runtime;
+		});
 		registry[&scheduler] = runtime;
 		return runtime;
 	}

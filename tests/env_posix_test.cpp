@@ -189,20 +189,6 @@ TEST(PosixEnvTest, LoggerWrites)
 	EXPECT_NE(contents.find("hello 123"), std::string::npos);
 }
 
-TEST(PosixEnvTest, ScheduleRuns)
-{
-	Env* env = Env::Default();
-	ScheduleState state;
-
-	env->Schedule(&ScheduleCallback, &state);
-	env->Schedule(&ScheduleCallback, &state);
-	env->Schedule(&ScheduleCallback, &state);
-
-	std::unique_lock<std::mutex> lock(state.mu);
-	const bool finished = state.cv.wait_for(lock, std::chrono::seconds(2), [&]() { return state.done.load() == 3; });
-	EXPECT_TRUE(finished);
-}
-
 TEST(PosixEnvTest, NowMicrosAndSleep)
 {
 	Env* env = Env::Default();

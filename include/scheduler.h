@@ -27,6 +27,12 @@ namespace prism
 		// Submit a job with the given priority (higher = sooner).
 		// Thread-safe. Must be callable from any thread.
 		virtual void Submit(Job job, std::size_t priority = 0) = 0;
+
+		// Optional execution routing hooks used by AsyncOp.
+		// Default schedulers route both blocking work and coroutine continuations
+		// back through the same scheduler instance.
+		virtual IScheduler* BlockingScheduler() noexcept { return this; }
+		virtual IScheduler* ContinuationScheduler() noexcept { return this; }
 	};
 
 	// ThreadPoolScheduler: Multi-queue dispatch thread pool with priority and delayed task support.

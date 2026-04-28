@@ -9,6 +9,8 @@
 #include "iterator.h"
 #include "log_reader.h"
 #include "options.h"
+#include "runtime_executor.h"
+#include "runtime_metrics.h"
 #include "slice.h"
 #include "status.h"
 #include "table_cache.h"
@@ -19,8 +21,11 @@
 #include "write_batch.h"
 #include "write_batch_internal.h"
 
+#include "compaction_controller.h"
+
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -54,6 +59,13 @@ namespace prism
 				opts.comparator = BytewiseComparator();
 			}
 			return opts;
+		}
+
+		std::shared_ptr<RuntimeBundle> DefaultRuntimeBundle()
+		{
+			static ThreadPoolScheduler scheduler(1);
+			static std::shared_ptr<RuntimeBundle> runtime = AcquireRuntimeBundle(scheduler);
+			return runtime;
 		}
 
 		Status BuildTable(const std::string& dbname, Env* env, const Options& options, TableCache* table_cache, uint64_t file_number,
@@ -704,12 +716,14 @@ namespace prism
 	    , mem_(nullptr)
 	    , internal_comparator_(options.comparator)
 	    , versions_(nullptr)
+	    , runtime_bundle_(DefaultRuntimeBundle())
 	    , snapshot_registry_(std::make_shared<SnapshotRegistry>())
 	{
 		options_.comparator = &internal_comparator_;
 
 		table_cache_ = new TableCache(dbname_, options_, TableCacheEntries(options_));
 		versions_ = std::make_unique<VersionSet>(dbname_, &options_, table_cache_, &internal_comparator_);
+		compaction_controller_ = std::make_unique<CompactionController>(runtime_bundle_->compaction_executor, *this);
 
 		mem_ = new MemTable(internal_comparator_);
 		mem_->Ref();
@@ -717,15 +731,26 @@ namespace prism
 
 	DBImpl::~DBImpl()
 	{
+		if (compaction_controller_ != nullptr)
+		{
+			compaction_controller_->RequestStop();
+		}
 		{
 			std::unique_lock<std::shared_mutex> lock(mutex_);
 			shutting_down_.store(true, std::memory_order_release);
-			while (bg_compaction_scheduled_)
+			background_work_finished_signal_.notify_all();
+			while (compaction_controller_ != nullptr && compaction_controller_->HasInFlightWork())
 			{
+				auto wait_start = std::chrono::steady_clock::now();
 				background_work_finished_signal_.wait(lock);
+				auto waited_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start);
+				RuntimeMetrics::Instance().shutdown_wait_count.fetch_add(1, std::memory_order_relaxed);
+				RuntimeMetrics::Instance().shutdown_wait_duration_us.fetch_add(
+				    static_cast<uint64_t>(waited_us.count()), std::memory_order_relaxed);
 			}
 			background_work_finished_signal_.notify_all();
 		}
+		compaction_controller_.reset();
 		if (imm_)
 		{
 			imm_->Unref();
@@ -1030,9 +1055,13 @@ namespace prism
 		return merged;
 	}
 
-	Status DBImpl::DoCompactionWork(Compaction* compaction)
+	Status DBImpl::DoCompactionWork(Compaction* compaction, StopToken stop_token, CompactionWorkResult* result)
 	{
 		assert(compaction != nullptr);
+		assert(result != nullptr);
+		result->outputs.clear();
+		result->total_bytes = 0;
+		result->completed = false;
 
 		std::unique_ptr<Iterator> input(MakeInputIterator(compaction));
 		Status status = input->status();
@@ -1057,8 +1086,9 @@ namespace prism
 		mutex_.unlock();
 
 		CompactionOutput output;
-		std::vector<FileMetaData> outputs;
-		uint64_t total_output_bytes = 0;
+		std::vector<FileMetaData>& outputs = result->outputs;
+		uint64_t& total_output_bytes = result->total_bytes;
+		bool stopped = false;
 
 		auto cleanup_failed_output = [&](CompactionOutput* state) {
 			if (state->builder != nullptr)
@@ -1122,7 +1152,7 @@ namespace prism
 			}
 			else
 			{
-			    // just use Abandon, and skip later sync/close
+				// just use Abandon, and skip later sync/close
 				output.builder->Abandon();
 			}
 
@@ -1175,6 +1205,19 @@ namespace prism
 			return Status::OK();
 		};
 
+		auto cancel_outputs = [&]() {
+			if (output.number != 0)
+			{
+				cleanup_failed_output(&output);
+			}
+			for (const FileMetaData& out : outputs)
+			{
+				env_->RemoveFile(TableFileName(dbname_, out.number));
+			}
+			outputs.clear();
+			total_output_bytes = 0;
+		};
+
 		// Per-key tracking state for oldest-live-snapshot-aware drop decisions.
 		std::string current_user_key;
 		// ::std::string_view current_user_key;
@@ -1184,8 +1227,21 @@ namespace prism
 		input->SeekToFirst();
 		while (input->Valid() && !shutting_down_.load(std::memory_order_acquire))
 		{
+			if (stop_token.CheckStop())
+			{
+				stopped = true;
+				break;
+			}
+
 			if (compaction->ShouldStopBefore(input->key()) && output.IsOpen())
 			{
+				if (stop_token.CheckStop())
+				{
+					stopped = true;
+					cancel_outputs();
+					mutex_.lock();
+					return Status::OK();
+				}
 				status = finish_output();
 				if (!status.ok())
 				{
@@ -1263,15 +1319,33 @@ namespace prism
 			}
 
 			input->Next();
+			if (stop_token.CheckStop())
+			{
+				stopped = true;
+				break;
+			}
 		}
 
 		if (status.ok() && shutting_down_.load(std::memory_order_acquire))
 		{
 			status = Status::IOError("Deleting DB during compaction");
 		}
+		if (status.ok() && stop_token.CheckStop())
+		{
+			stopped = true;
+			cancel_outputs();
+			mutex_.lock();
+			return Status::OK();
+		}
 		if (status.ok() && output.IsOpen())
 		{
 			status = finish_output();
+		}
+		if (status.ok() && stopped)
+		{
+			cancel_outputs();
+			mutex_.lock();
+			return Status::OK();
 		}
 		if (status.ok())
 		{
@@ -1293,20 +1367,14 @@ namespace prism
 		}
 
 		mutex_.lock();
-		status = InstallCompactionResults(compaction, outputs, total_output_bytes);
-		if (status.ok())
+		if (stop_token.CheckStop())
 		{
-			RemoveObsoleteFiles();
+			mutex_.unlock();
+			cancel_outputs();
+			mutex_.lock();
+			return Status::OK();
 		}
-
-		if (!status.ok())
-		{
-			for (const FileMetaData& out : outputs)
-			{
-				env_->RemoveFile(TableFileName(dbname_, out.number));
-			}
-		}
-
+		result->completed = true;
 		return status;
 	}
 
@@ -1370,10 +1438,18 @@ namespace prism
 		return versions_->LogAndApply(edit, &mutex_);
 	}
 
-	void DBImpl::BackgroundCompaction()
+	void DBImpl::BackgroundCompaction(StopToken stop_token)
 	{
+		if (stop_token.StopRequested())
+		{
+			return;
+		}
 		if (imm_ != nullptr)
 		{
+			if (stop_token.StopRequested())
+			{
+				return;
+			}
 			CompactMemTable();
 			return;
 		}
@@ -1387,6 +1463,11 @@ namespace prism
 		Status s;
 		if (compaction->IsTrivialMove())
 		{
+			if (stop_token.StopRequested())
+			{
+				compaction->ReleaseInputs();
+				return;
+			}
 			FileMetaData* file = compaction->input(0, 0);
 			VersionEdit* edit = compaction->edit();
 			edit->RemoveFile(compaction->level(), file->number);
@@ -1399,7 +1480,29 @@ namespace prism
 		}
 		else
 		{
-			s = DoCompactionWork(compaction.get());
+			if (stop_token.StopRequested())
+			{
+				compaction->ReleaseInputs();
+				return;
+			}
+
+			CompactionWorkResult result;
+			s = DoCompactionWork(compaction.get(), stop_token, &result);
+			if (s.ok() && result.completed)
+			{
+				s = InstallCompactionResults(compaction.get(), result.outputs, result.total_bytes);
+				if (s.ok())
+				{
+					RemoveObsoleteFiles();
+				}
+				else
+				{
+					for (const FileMetaData& out : result.outputs)
+					{
+						env_->RemoveFile(TableFileName(dbname_, out.number));
+					}
+				}
+			}
 		}
 
 		compaction->ReleaseInputs();
@@ -1409,50 +1512,7 @@ namespace prism
 		}
 	}
 
-	void DBImpl::MaybeScheduleCompaction()
-	{
-		if (bg_compaction_scheduled_)
-		{
-			return;
-		}
-		if (shutting_down_.load(std::memory_order_acquire))
-		{
-			return;
-		}
-		if (!bg_error_.ok())
-		{
-			return;
-		}
-		if (imm_ == nullptr && versions_->current()->compaction_score() < 1)
-		{
-			return;
-		}
-
-		bg_compaction_scheduled_ = true;
-		env_->Schedule(&DBImpl::BGWork, this);
-	}
-
-	void DBImpl::BGWork(void* db) { reinterpret_cast<DBImpl*>(db)->BackgroundCall(); }
-
-	void DBImpl::BackgroundCall()
-	{
-		std::unique_lock<std::shared_mutex> lock(mutex_);
-		assert(bg_compaction_scheduled_);
-		if (shutting_down_.load(std::memory_order_acquire))
-		{
-		}
-		else if (!bg_error_.ok())
-		{
-		}
-		else
-		{
-			BackgroundCompaction();
-		}
-
-		bg_compaction_scheduled_ = false;
-		MaybeScheduleCompaction();
-		background_work_finished_signal_.notify_all();
-	}
+	void DBImpl::MaybeScheduleCompaction() { compaction_controller_->ScheduleIfNeeded(); }
 
 	// TODO(wal-rotation): MakeRoomForWrite will be refactored into explicit epoch helpers:
 	//   (a) writer grouping/selection seam, (b) WAL epoch freeze, (c) room accounting
@@ -1463,6 +1523,11 @@ namespace prism
 		bool allow_delay = !force;
 		while (true)
 		{
+			if (compaction_controller_ != nullptr && compaction_controller_->StopRequested())
+			{
+				s = Status::IOError("background compaction stopped");
+				break;
+			}
 			if (!bg_error_.ok())
 			{
 				s = bg_error_;
@@ -2021,10 +2086,32 @@ namespace prism
 		bg_error_ = status;
 	}
 
+	void DBImpl::TEST_HoldBackgroundCompaction(bool hold)
+	{
+		std::lock_guard<std::shared_mutex> lock(mutex_);
+		hold_background_compaction_ = hold;
+		if (!hold)
+		{
+			background_work_finished_signal_.notify_all();
+		}
+	}
+
+	int DBImpl::TEST_BackgroundCompactionStartCount() const
+	{
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+		return background_compaction_start_count_;
+	}
+
 	void DBImpl::TEST_SignalBackgroundWorkFinished()
 	{
 		std::lock_guard<std::shared_mutex> lock(mutex_);
 		background_work_finished_signal_.notify_all();
+	}
+
+	void DBImpl::TEST_ScheduleCompaction()
+	{
+		std::lock_guard<std::shared_mutex> lock(mutex_);
+		MaybeScheduleCompaction();
 	}
 
 	uint64_t DBImpl::TEST_NewFileNumber()
@@ -2051,7 +2138,24 @@ namespace prism
 			return Status::InvalidArgument("no compaction candidate");
 		}
 
-		Status s = DoCompactionWork(compaction);
+		StopSource stop_source;
+		CompactionWorkResult result;
+		Status s = DoCompactionWork(compaction, stop_source.Token(), &result);
+		if (s.ok() && result.completed)
+		{
+			s = InstallCompactionResults(compaction, result.outputs, result.total_bytes);
+			if (s.ok())
+			{
+				RemoveObsoleteFiles();
+			}
+			else
+			{
+				for (const FileMetaData& out : result.outputs)
+				{
+					env_->RemoveFile(TableFileName(dbname_, out.number));
+				}
+			}
+		}
 		compaction->ReleaseInputs();
 		delete compaction;
 		return s;
@@ -2060,8 +2164,25 @@ namespace prism
 	Status DBImpl::TEST_RunBackgroundCompactionOnce()
 	{
 		std::unique_lock<std::shared_mutex> lock(mutex_);
-		BackgroundCompaction();
+		StopSource stop_source;
+		BackgroundCompaction(stop_source.Token());
 		return bg_error_;
+	}
+
+	void DBImpl::TEST_RequestCompactionStop()
+	{
+		std::lock_guard<std::shared_mutex> lock(mutex_);
+		if (compaction_controller_ != nullptr)
+		{
+			compaction_controller_->RequestStop();
+		}
+		background_work_finished_signal_.notify_all();
+	}
+
+	bool DBImpl::TEST_HasInFlightCompaction() const
+	{
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+		return compaction_controller_ != nullptr && compaction_controller_->HasInFlightWork();
 	}
 
 	std::vector<FileMetaData> DBImpl::TEST_LevelFilesCopy(int level) const

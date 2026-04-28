@@ -8,10 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <gtest/gtest.h>
-#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -28,31 +26,7 @@ namespace
 		{
 		}
 
-		void HoldScheduledWork(bool hold)
-		{
-			std::lock_guard<std::mutex> lock(mu_);
-			hold_scheduled_work_ = hold;
-			if (!hold_scheduled_work_)
-			{
-				cv_.notify_all();
-			}
-		}
-
-		void ReleaseScheduledWork() { HoldScheduledWork(false); }
-
-		int ScheduledCalls() const { return scheduled_calls_.load(std::memory_order_acquire); }
 		int SleepCalls() const { return sleep_calls_.load(std::memory_order_acquire); }
-
-		void Schedule(void (*function)(void*), void* arg) override
-		{
-			scheduled_calls_.fetch_add(1, std::memory_order_release);
-			std::thread([this, function, arg] {
-				std::unique_lock<std::mutex> lock(mu_);
-				cv_.wait(lock, [this] { return !hold_scheduled_work_; });
-				lock.unlock();
-				function(arg);
-			}).detach();
-		}
 
 		void SleepForMicroseconds(int micros) override
 		{
@@ -64,10 +38,6 @@ namespace
 		}
 
 	private:
-		std::mutex mu_;
-		std::condition_variable cv_;
-		bool hold_scheduled_work_ = true;
-		std::atomic<int> scheduled_calls_{ 0 };
 		std::atomic<int> sleep_calls_{ 0 };
 	};
 
@@ -135,13 +105,15 @@ protected:
 		std::filesystem::remove_all("test_flush_stall", ec);
 		std::filesystem::remove_all("test_l0_slowdown", ec);
 		std::filesystem::remove_all("test_l0_stop", ec);
+		std::filesystem::remove_all("test_bg_error_stall", ec);
+		std::filesystem::remove_all("test_single_flight", ec);
+		std::filesystem::remove_all("test_obsolete_files", ec);
 	}
 };
 
 TEST_F(FlushCompactionTest, WriteRotatesMemtableAndSchedulesBackgroundFlush)
 {
 	ControlledEnv env(Env::Default());
-	env.HoldScheduledWork(true);
 
 	Options options;
 	options.env = &env;
@@ -152,6 +124,7 @@ TEST_F(FlushCompactionTest, WriteRotatesMemtableAndSchedulesBackgroundFlush)
 	ASSERT_TRUE(open.has_value()) << open.error().ToString();
 	auto db = std::move(open.value());
 	auto* impl = db.get();
+	impl->TEST_HoldBackgroundCompaction(true);
 
 	for (int i = 0; i < 32; ++i)
 	{
@@ -163,16 +136,15 @@ TEST_F(FlushCompactionTest, WriteRotatesMemtableAndSchedulesBackgroundFlush)
 	}
 
 	EXPECT_TRUE(impl->TEST_HasImmutableMemTable());
-	EXPECT_GE(env.ScheduledCalls(), 1);
+	EXPECT_TRUE(WaitUntil([impl] { return impl->TEST_BackgroundCompactionStartCount() >= 1; }, std::chrono::milliseconds(2000)));
 
-	env.ReleaseScheduledWork();
+	impl->TEST_HoldBackgroundCompaction(false);
 	EXPECT_TRUE(WaitUntil([impl] { return !impl->TEST_HasImmutableMemTable(); }, std::chrono::milliseconds(2000)));
 }
 
 TEST_F(FlushCompactionTest, WriterWaitsWhenImmutableMemtableExists)
 {
 	ControlledEnv env(Env::Default());
-	env.HoldScheduledWork(true);
 
 	Options options;
 	options.env = &env;
@@ -183,6 +155,7 @@ TEST_F(FlushCompactionTest, WriterWaitsWhenImmutableMemtableExists)
 	ASSERT_TRUE(open.has_value()) << open.error().ToString();
 	auto db = std::move(open.value());
 	auto* impl = db.get();
+	impl->TEST_HoldBackgroundCompaction(true);
 
 	for (int i = 0; i < 32; ++i)
 	{
@@ -193,6 +166,7 @@ TEST_F(FlushCompactionTest, WriterWaitsWhenImmutableMemtableExists)
 		}
 	}
 	ASSERT_TRUE(impl->TEST_HasImmutableMemTable());
+	ASSERT_TRUE(WaitUntil([impl] { return impl->TEST_BackgroundCompactionStartCount() >= 1; }, std::chrono::milliseconds(2000)));
 
 	std::atomic<bool> writer_done{ false };
 	Status writer_status;
@@ -204,7 +178,7 @@ TEST_F(FlushCompactionTest, WriterWaitsWhenImmutableMemtableExists)
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	EXPECT_FALSE(writer_done.load(std::memory_order_acquire));
 
-	env.ReleaseScheduledWork();
+	impl->TEST_HoldBackgroundCompaction(false);
 	writer.join();
 	EXPECT_TRUE(writer_status.ok()) << writer_status.ToString();
 }
@@ -213,7 +187,6 @@ TEST_F(FlushCompactionTest, LevelZeroPressureTriggersStallPolicy)
 {
 	{
 		ControlledEnv env(Env::Default());
-		env.HoldScheduledWork(false);
 		CreateLegacyL0Files("test_l0_slowdown", 8, 1000);
 
 		Options options;
@@ -231,7 +204,6 @@ TEST_F(FlushCompactionTest, LevelZeroPressureTriggersStallPolicy)
 
 	{
 		ControlledEnv env(Env::Default());
-		env.HoldScheduledWork(false);
 		CreateLegacyL0Files("test_l0_stop", 12, 2000);
 
 		Options options;
@@ -323,4 +295,137 @@ TEST_F(FlushCompactionTest, EmptyMemtableDoesNotAddManifestFileEntry)
 		}
 	}
 	EXPECT_EQ(table_files, 0);
+}
+
+TEST_F(FlushCompactionTest, BackgroundErrorPreventsCompactionScheduling)
+{
+	ControlledEnv env(Env::Default());
+
+	Options options;
+	options.env = &env;
+	options.create_if_missing = true;
+	options.write_buffer_size = 128;
+
+	auto open = DBImpl::OpenInternal(options, "test_bg_error_stall");
+	ASSERT_TRUE(open.has_value()) << open.error().ToString();
+	auto db = std::move(open.value());
+	auto* impl = db.get();
+
+	// Inject background error before any writes.
+	// MaybeScheduleCompaction checks bg_error_ before scheduling.
+	impl->TEST_SetBackgroundError(Status::IOError("injected compaction stall"));
+
+	for (int i = 0; i < 32; ++i)
+	{
+		Status s = db->Put("k" + std::to_string(i), std::string(64, 'v'));
+		// Writes will fail once the memtable fills and bg_error_ blocks rotation.
+		if (!s.ok())
+		{
+			EXPECT_TRUE(s.IsIOError()) << s.ToString();
+			break;
+		}
+	}
+
+	// bg_error_ gates MaybeScheduleCompaction — no background lane should have started.
+	EXPECT_EQ(impl->TEST_BackgroundCompactionStartCount(), 0);
+}
+
+TEST_F(FlushCompactionTest, CompactionSingleFlightPreservedWithStructController)
+{
+	ControlledEnv env(Env::Default());
+
+	Options options;
+	options.env = &env;
+	options.create_if_missing = true;
+	options.write_buffer_size = 128;
+
+	auto open = DBImpl::OpenInternal(options, "test_single_flight");
+	ASSERT_TRUE(open.has_value()) << open.error().ToString();
+	auto db = std::move(open.value());
+	auto* impl = db.get();
+	impl->TEST_HoldBackgroundCompaction(true);
+
+	// Write until the memtable fills and an imm_ is created.
+	// The controller should launch exactly one background flush lane.
+	for (int i = 0; i < 32; ++i)
+	{
+		ASSERT_TRUE(db->Put("k" + std::to_string(i), std::string(64, 'v')).ok());
+		if (impl->TEST_HasImmutableMemTable())
+		{
+			break;
+		}
+	}
+	ASSERT_TRUE(impl->TEST_HasImmutableMemTable());
+	ASSERT_TRUE(WaitUntil([impl] { return impl->TEST_HasInFlightCompaction(); }, std::chrono::milliseconds(2000)));
+	ASSERT_TRUE(WaitUntil([impl] { return impl->TEST_BackgroundCompactionStartCount() >= 1; }, std::chrono::milliseconds(2000)));
+	const int scheduled_first = impl->TEST_BackgroundCompactionStartCount();
+	EXPECT_TRUE(impl->TEST_HasInFlightCompaction());
+
+	impl->TEST_ScheduleCompaction();
+	impl->TEST_ScheduleCompaction();
+	impl->TEST_ScheduleCompaction();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	EXPECT_EQ(impl->TEST_BackgroundCompactionStartCount(), scheduled_first);
+	EXPECT_TRUE(impl->TEST_HasInFlightCompaction());
+
+	// A second writer will block on the CV in MakeRoomForWrite (imm_ is set).
+	// The controller lane is still active, so MaybeScheduleCompaction should
+	// bail without a second background flush attempt.
+	std::atomic<bool> writer_done{ false };
+	Status writer_status;
+	std::thread writer([&] {
+		writer_status = db->Put("blocked", std::string(64, 'v'));
+		writer_done.store(true, std::memory_order_release);
+	});
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	EXPECT_FALSE(writer_done.load(std::memory_order_acquire));
+
+	// Single-flight invariant: no additional background flush attempt.
+	EXPECT_EQ(impl->TEST_BackgroundCompactionStartCount(), scheduled_first);
+
+	impl->TEST_HoldBackgroundCompaction(false);
+	EXPECT_TRUE(WaitUntil([impl] { return !impl->TEST_HasInFlightCompaction(); }, std::chrono::milliseconds(2000)));
+	EXPECT_FALSE(impl->TEST_HasImmutableMemTable());
+	writer.join();
+	EXPECT_TRUE(writer_status.ok()) << writer_status.ToString();
+}
+
+TEST_F(FlushCompactionTest, ObsoleteFileLifecycleGuard)
+{
+	ControlledEnv env(Env::Default());
+
+	Options options;
+	options.env = &env;
+	options.create_if_missing = true;
+	options.write_buffer_size = 128;
+
+	auto open = DBImpl::OpenInternal(options, "test_obsolete_files");
+	ASSERT_TRUE(open.has_value()) << open.error().ToString();
+	auto db = std::move(open.value());
+	auto* impl = db.get();
+
+	// Write enough entries to fill the memtable, trigger a WAL rotation,
+	// and flush the imm_ to an L0 SST file.  Small write_buffer_size ensures
+	// the rotation happens within a few writes.  Wait for the background
+	// flush to drain before proceeding.
+	for (int i = 0; i < 32; ++i)
+	{
+		ASSERT_TRUE(db->Put("k" + std::to_string(i), std::string(64, 'v')).ok());
+	}
+	ASSERT_TRUE(WaitUntil([impl] { return !impl->TEST_HasImmutableMemTable(); }, std::chrono::milliseconds(5000)));
+
+	// After the flush completes, the version set should reference at least
+	// one file in level 0 — proving the flush output was correctly installed.
+	EXPECT_GE(impl->TEST_NumLevelFiles(0), 1);
+
+	// Reopen the DB to verify the flushed data survives and the
+	// version-set metadata is consistent with on-disk state.
+	db.reset();
+	auto reopen = DBImpl::OpenInternal(options, "test_obsolete_files");
+	ASSERT_TRUE(reopen.has_value()) << reopen.error().ToString();
+	db = std::move(reopen.value());
+	const auto get = db->Get("k0");
+	ASSERT_TRUE(get.has_value()) << get.error().ToString();
+	EXPECT_EQ(get.value(), std::string(64, 'v'));
 }

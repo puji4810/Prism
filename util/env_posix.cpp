@@ -209,6 +209,8 @@ namespace prism
 			}
 			return status;
 		}
+
+		int FileDescriptor() const noexcept override { return has_permanent_fd_ ? fd_ : -1; }
 	};
 
 	// A class to manage the mmap region
@@ -717,14 +719,6 @@ namespace prism
 			return std::make_unique<PosixFileLock>(fd, fname, &locks_);
 		}
 
-		void Schedule(void (*background_work_function)(void* background_work_arg), void* background_work_arg) override;
-
-		void StartThread(void (*thread_main)(void* thread_main_arg), void* thread_main_arg) override
-		{
-			std::thread new_thread(thread_main, thread_main_arg);
-			new_thread.detach();
-		}
-
 		Result<std::string> GetTestDirectory() override
 		{
 			std::string result;
@@ -775,26 +769,6 @@ namespace prism
 		void SleepForMicroseconds(int micros) override { std::this_thread::sleep_for(std::chrono::microseconds(micros)); }
 
 	private:
-		void BackgroundThreadMain();
-
-		static void BackgroundThreadEntryPoint(PosixEnv* env) { env->BackgroundThreadMain(); }
-
-		struct BackgroundWorkItem
-		{
-			explicit BackgroundWorkItem(void (*function)(void* arg), void* arg)
-			    : function(function)
-			    , arg(arg)
-			{
-			}
-
-			void (*function)(void*);
-			void* arg;
-		};
-
-		std::mutex background_work_mutex_;
-		std::condition_variable background_work_cv_;
-		bool started_background_thread_ GUARDED_BY(background_work_mutex_) = false;
-		std::queue<BackgroundWorkItem> background_work_queue_ GUARDED_BY(background_work_mutex_);
 
 		Limiter fd_limiter_;
 		Limiter mmap_limiter_;
@@ -827,45 +801,6 @@ namespace prism
 	    : fd_limiter_(MaxOpenFiles())
 	    , mmap_limiter_(MaxMmaps())
 	{
-	}
-
-	void PosixEnv::Schedule(void (*background_work_function)(void* background_work_arg), void* background_work_arg)
-	{
-		std::unique_lock<std::mutex> lock(background_work_mutex_);
-
-		if (!started_background_thread_)
-		{
-			started_background_thread_ = true;
-			std::thread background_thread(BackgroundThreadEntryPoint, this);
-			background_thread.detach();
-		}
-
-		const bool was_empty = background_work_queue_.empty();
-		background_work_queue_.emplace(background_work_function, background_work_arg);
-		if (was_empty)
-		{
-			background_work_cv_.notify_one();
-		}
-	}
-
-	void PosixEnv::BackgroundThreadMain()
-	{
-		while (true)
-		{
-			std::unique_lock<std::mutex> lock(background_work_mutex_);
-			while (background_work_queue_.empty())
-			{
-				background_work_cv_.wait(lock);
-			}
-
-			assert(!background_work_queue_.empty());
-			auto background_work_function = background_work_queue_.front().function;
-			void* background_work_arg = background_work_queue_.front().arg;
-			background_work_queue_.pop();
-
-			lock.unlock();
-			background_work_function(background_work_arg);
-		}
 	}
 
 	Env* Env::Default()

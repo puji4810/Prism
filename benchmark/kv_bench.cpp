@@ -3,6 +3,7 @@
 #include "asyncdb.h"
 #include "bench_env_wrapper.h"
 #include "db.h"
+#include "runtime_metrics.h"
 #include "scheduler.h"
 
 #include <cstdio>
@@ -224,7 +225,6 @@ namespace prism::bench
 		std::size_t total_max_inflight_observed = 0;
 		std::size_t total_max_client_inflight = 0;
 		int total_write_sync = 0;
-		int total_bg_scheduled = 0;
 		int total_bg_sleeps = 0;
 
 		for (int r = 1; r <= cfg.rounds; ++r)
@@ -253,7 +253,6 @@ namespace prism::bench
 			else if (cfg.mode == BenchMode::kCompactionOverlap)
 			{
 				stats = RunAsyncCompactionOverlap(*adb, scheduler, cfg, keys);
-				stats.bg_scheduled = env_wrapper.ScheduledCalls();
 				stats.bg_sleeps = env_wrapper.SleepCalls();
 				PrintLine("async_compaction_overlap", cfg, r, stats, stats.max_inflight_observed);
 			}
@@ -273,7 +272,6 @@ namespace prism::bench
 				total_max_client_inflight = stats.max_client_inflight;
 			}
 			total_write_sync = stats.write_sync;
-			total_bg_scheduled += stats.bg_scheduled;
 			total_bg_sleeps += stats.bg_sleeps;
 			if (!cfg.no_latency)
 			{
@@ -291,7 +289,6 @@ namespace prism::bench
 		total.max_inflight_observed = total_max_inflight_observed;
 		total.max_client_inflight = total_max_client_inflight;
 		total.write_sync = total_write_sync;
-		total.bg_scheduled = total_bg_scheduled;
 		total.bg_sleeps = total_bg_sleeps;
 		if (cfg.mode == BenchMode::kDiskRead)
 		{
@@ -342,6 +339,10 @@ int main(int argc, char** argv)
 	{
 		RunAsyncBenchmark(cfg, keys);
 	}
+
+#ifdef PRISM_RUNTIME_METRICS
+	prism::RuntimeMetrics::Instance().PrintMetrics();
+#endif
 
 	return 0;
 }

@@ -6,6 +6,7 @@
 #include "options.h"
 #include "memtable.h"
 #include "result.h"
+#include "task_scope.h"
 #include "version_set.h"
 
 #include <atomic>
@@ -17,7 +18,9 @@
 
 namespace prism
 {
+	class CompactionController;
 	class FileLock;
+	struct RuntimeBundle;
 	class SnapshotRegistry;
 	class TableCache;
 	class CompactionExecutionTest;
@@ -54,7 +57,12 @@ namespace prism
 		bool TEST_HasImmutableMemTable() const;
 		int TEST_NumLevelFiles(int level) const;
 		void TEST_SetBackgroundError(const Status& status);
+		void TEST_HoldBackgroundCompaction(bool hold);
+		int TEST_BackgroundCompactionStartCount() const;
 		void TEST_SignalBackgroundWorkFinished();
+		void TEST_ScheduleCompaction();
+		void TEST_RequestCompactionStop();
+		bool TEST_HasInFlightCompaction() const;
 		uint64_t TEST_NewFileNumber();
 		Status TEST_AddFileToVersion(
 		    int level, uint64_t number, uint64_t file_size, const InternalKey& smallest, const InternalKey& largest);
@@ -70,6 +78,14 @@ namespace prism
 
 	private:
 		friend class CompactionExecutionTest;
+		friend class CompactionController;
+
+		struct CompactionWorkResult
+		{
+			std::vector<FileMetaData> outputs;
+			uint64_t total_bytes = 0;
+			bool completed = false;
+		};
 
 		class RecoveryHandler;
 		class LogFileGuard;
@@ -79,13 +95,11 @@ namespace prism
 		Status MakeRoomForWrite(bool force, std::unique_lock<std::shared_mutex>& lock);
 		void MaybeScheduleCompaction();
 		void RecordBackgroundError(const Status& status);
-		void BackgroundCall();
-		static void BGWork(void* db);
-		void BackgroundCompaction();
+		void BackgroundCompaction(StopToken stop_token);
 		Status InstallCompactionResults(Compaction* compaction, const std::vector<FileMetaData>& outputs, uint64_t total_bytes);
 		void CompactMemTable();
 		Iterator* MakeInputIterator(Compaction* compaction);
-		Status DoCompactionWork(Compaction* compaction);
+		Status DoCompactionWork(Compaction* compaction, StopToken stop_token, CompactionWorkResult* result);
 		Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base);
 		Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers);
 		void RemoveObsoleteFiles();
@@ -95,6 +109,8 @@ namespace prism
 
 		mutable std::shared_mutex mutex_;
 		std::condition_variable_any background_work_finished_signal_;
+		bool hold_background_compaction_ = false;
+		int background_compaction_start_count_ = 0;
 
 		Env* env_;
 		Options options_;
@@ -119,8 +135,9 @@ namespace prism
 
 		std::unique_ptr<VersionSet> versions_;
 		std::set<uint64_t> pending_outputs_;
+		std::shared_ptr<RuntimeBundle> runtime_bundle_;
+		std::unique_ptr<CompactionController> compaction_controller_;
 		Status bg_error_;
-		bool bg_compaction_scheduled_ = false;
 		std::atomic<bool> shutting_down_{ false };
 		std::shared_ptr<SnapshotRegistry> snapshot_registry_;
 	};

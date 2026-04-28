@@ -1,8 +1,8 @@
 # Thread Pool Scheduler Architecture
 
-This document describes the design and implementation of the `ThreadPoolScheduler`, Prism's primary execution engine for asynchronous operations and coroutine continuations.
+This document describes the design and implementation of the `ThreadPoolScheduler`, Prism's CPU continuation executor for short async operations and coroutine resumes.
 
-The scheduler offloads blocking synchronous operations (such as filesystem I/O in `PosixEnv`) to a pool of background threads, allowing the calling coroutine to suspend and later resume without blocking the main execution flow.
+The `ThreadPoolScheduler` handles **CPU continuations and non-IO work only**. Blocking synchronous operations (such as filesystem I/O, compaction, and long-running sync work) are routed to the `BlockingExecutor` or `SerialLane`. This split prevents blocking work from starving lightweight coroutine continuations.
 
 ## 1. Core Abstractions
 
@@ -133,7 +133,41 @@ The scheduler enforces a **fail-fast** exception policy:
 
 ---
 
-## 7. Implementation Details
+## 7. BlockingExecutor and SerialLane
+
+While `ThreadPoolScheduler` owns the CPU continuation pool, Prism's runtime includes two additional specialized executors managed through `RuntimeBundle`:
+
+### BlockingExecutor
+
+The `BlockingExecutor` runs long-running synchronous operations on a dedicated thread. Its primary consumers are:
+
+- **Compaction** — `CompactionController` submits `BackgroundCompaction` work to the `BlockingExecutor` via `BlockingScheduler()`.
+- **Blocking file I/O** — reads and writes that cannot use the async `IoReactor` backend.
+
+By isolating these operations from the CPU thread pool, the `BlockingExecutor` ensures that a multi-second compaction never delays a sub-microsecond coroutine resume.
+
+### SerialLane
+
+The `SerialLane` provides strict FIFO ordering on a single dedicated thread. It is used for:
+
+- **Ordered file writes** — `AsyncWritableFile` serializes append/sync operations through `SerialLane`, guaranteeing that writes complete in submission order without ticket-based condition variable overhead.
+
+Unlike the `ThreadPoolScheduler`, `SerialLane` does not support priority dispatch or work-stealing. It is a simple single-threaded queue designed for correctness (ordering) rather than throughput parallelism.
+
+---
+
+## 8. Structured Shutdown with TaskScope
+
+The `ThreadPoolScheduler` participates in Prism's structured concurrency model through `TaskScope`:
+
+- On database destruction, `DBImpl::~DBImpl()` requests compaction stop via `CompactionController::RequestStop()`, waits for the active lane to drain through `background_work_finished_signal_`, and calls `ControllerWaitQuiescent()` to confirm the lane is idle before joining threads.
+- `TaskScope` governs short-lived async operations, not database-level background compaction. The compaction controller owns its own stop token and quiescence contract.
+
+This replaces the legacy `Env::Schedule()` / `StartThread()` model, where background work had no structured lifetime guarantees, preventing orphaned compaction from outliving the database.
+
+---
+
+## 9. Implementation Details
 
 - **Memory Management**: The scheduler does not own the data captured in a `Job` lambda. Callers must ensure that any captured pointers or references (e.g., buffers for `ReadAtAsync`) remain valid until the job completes.
 - **Worker Count**: By default, the pool size is `max(hardware_concurrency, 2)`.
