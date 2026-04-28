@@ -45,6 +45,32 @@ namespace prism
 		static Database& GetDatabase(AsyncDB& db);
 	};
 
+	struct SuperVersion
+	{
+		MemTable* mem = nullptr;
+		MemTable* imm = nullptr;
+		Version* current = nullptr;
+		SequenceNumber sequence = 0;
+
+		std::atomic<int> refs_{ 0 };
+
+		void Ref() { refs_.fetch_add(1, std::memory_order_relaxed); }
+
+		void Unref()
+		{
+			if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+			{
+				if (current != nullptr)
+					current->Unref();
+				if (imm != nullptr)
+					imm->Unref();
+				if (mem != nullptr)
+					mem->Unref();
+				delete this;
+			}
+		}
+	};
+
 	class DBImpl
 	{
 	public:
@@ -129,6 +155,7 @@ namespace prism
 		void RemoveObsoleteFiles();
 		Status NewLogFile();
 		Status CloseLogFile();
+		void InstallSuperVersion();
 		Result<SequenceNumber> ResolveSnapshotSequence(const std::optional<Snapshot>& snapshot_handle) const;
 
 		mutable std::shared_mutex mutex_;
@@ -151,6 +178,9 @@ namespace prism
 
 		MemTable* mem_;
 		MemTable* imm_ = nullptr;
+		std::atomic<SuperVersion*> super_version_{ nullptr };
+		std::vector<SuperVersion*> retired_super_versions_[2];
+		int retired_index_ = 0;
 		// sequence_ is the next sequence number to assign to a new write.
 		// VersionSet persists last_sequence (last assigned), so:
 		//   sequence_ == versions_->LastSequence() + 1

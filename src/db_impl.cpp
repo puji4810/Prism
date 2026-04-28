@@ -698,6 +698,10 @@ namespace prism
 		{
 			return std::unexpected(s);
 		}
+		{
+			std::unique_lock<std::shared_mutex> lock(impl->mutex_);
+			impl->InstallSuperVersion();
+		}
 		return impl;
 	}
 
@@ -748,6 +752,22 @@ namespace prism
 				RuntimeMetrics::Instance().shutdown_wait_duration_us.fetch_add(
 				    static_cast<uint64_t>(waited_us.count()), std::memory_order_relaxed);
 			}
+			// Teardown rule: once shutdown begins, no new SuperVersion acquisitions are allowed.
+			// Existing holders complete normally through the refcount, and two-generation retirement
+			// keeps swapped-out read views alive until at least one more publication cycle passes.
+			SuperVersion* sv = super_version_.exchange(nullptr, std::memory_order_acq_rel);
+			if (sv != nullptr)
+			{
+				sv->Unref();
+			}
+			for (int i = 0; i < 2; ++i)
+			{
+				for (SuperVersion* retired : retired_super_versions_[i])
+				{
+					retired->Unref();
+				}
+				retired_super_versions_[i].clear();
+			}
 			background_work_finished_signal_.notify_all();
 		}
 		compaction_controller_.reset();
@@ -768,6 +788,44 @@ namespace prism
 	{
 		RecoveryHandler handler(mem_, WriteBatchInternal::Sequence(&batch));
 		return batch.Iterate(&handler);
+	}
+
+	void DBImpl::InstallSuperVersion()
+	{
+		// Precondition: caller holds unique_lock(mutex_). Publication and retirement are serialized by
+		// the DB mutex so readers never observe partially constructed state.
+		SuperVersion* sv = new SuperVersion;
+		sv->mem = mem_;
+		if (sv->mem != nullptr)
+		{
+			sv->mem->Ref();
+		}
+		sv->imm = imm_;
+		if (sv->imm != nullptr)
+		{
+			sv->imm->Ref();
+		}
+		sv->current = versions_->current();
+		if (sv->current != nullptr)
+		{
+			sv->current->Ref();
+		}
+		sv->sequence = sequence_;
+		sv->Ref();
+
+		const int to_clean = 1 - retired_index_;
+		for (SuperVersion* retired : retired_super_versions_[to_clean])
+		{
+			retired->Unref();
+		}
+		retired_super_versions_[to_clean].clear();
+
+		SuperVersion* old = super_version_.exchange(sv, std::memory_order_acq_rel);
+		if (old != nullptr)
+		{
+			retired_super_versions_[retired_index_].push_back(old);
+		}
+		retired_index_ = to_clean;
 	}
 
 	Status DBImpl::CloseLogFile()
@@ -1404,6 +1462,7 @@ namespace prism
 		{
 			imm_->Unref();
 			imm_ = nullptr;
+			InstallSuperVersion();
 			RemoveObsoleteFiles();
 		}
 		else
@@ -1435,7 +1494,12 @@ namespace prism
 		{
 			edit->AddFile(compaction->level_out(), output.number, output.file_size, output.smallest, output.largest);
 		}
-		return versions_->LogAndApply(edit, &mutex_);
+		Status s = versions_->LogAndApply(edit, &mutex_);
+		if (s.ok())
+		{
+			InstallSuperVersion();
+		}
+		return s;
 	}
 
 	void DBImpl::BackgroundCompaction(StopToken stop_token)
@@ -1475,6 +1539,7 @@ namespace prism
 			s = versions_->LogAndApply(edit, &mutex_);
 			if (s.ok())
 			{
+				InstallSuperVersion();
 				RemoveObsoleteFiles();
 			}
 		}
@@ -1591,6 +1656,7 @@ namespace prism
 				imm_ = mem_;
 				mem_ = new MemTable(internal_comparator_);
 				mem_->Ref();
+				InstallSuperVersion();
 				force = false;
 				MaybeScheduleCompaction();
 				break;
@@ -1686,6 +1752,10 @@ namespace prism
 						versions_->SetLastSequence(sequence_ - 1);
 						std::unique_lock<std::shared_mutex> lock(mutex_);
 						s = versions_->LogAndApply(&edit, &mutex_);
+						if (s.ok())
+						{
+							InstallSuperVersion();
+						}
 					}
 					mem_->Unref();
 					mem_ = new MemTable(internal_comparator_);
@@ -1729,6 +1799,10 @@ namespace prism
 					versions_->SetLastSequence(sequence_ - 1);
 					std::unique_lock<std::shared_mutex> lock(mutex_);
 					s = versions_->LogAndApply(&edit, &mutex_);
+					if (s.ok())
+					{
+						InstallSuperVersion();
+					}
 				}
 				mem_->Unref();
 				mem_ = new MemTable(internal_comparator_);
