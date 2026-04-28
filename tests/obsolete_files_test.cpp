@@ -374,3 +374,91 @@ TEST_F(ObsoleteFilesTest, ConcurrentGetsAfterRecoveryDoNotAccumulateVersionRefs)
 	int refs_after = impl->TEST_CurrentVersionRefs();
 	EXPECT_EQ(refs_after, baseline) << "Version refs must not accumulate after concurrent Get() calls on recovered DB";
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invariant guard: concurrent Get + Iterator ref balance after turnover
+//
+// Runs concurrent Gets AND iterators, then triggers memtable rotation by
+// writing enough data.  All version refs must return to baseline once every
+// Get completes and every iterator is destroyed.  This is a more aggressive
+// version of the existing ref-leak tests: it exercises the interleaving of
+// short-lived (Get) and long-lived (iterator) ref holders during a version
+// turnover event.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(ObsoleteFilesTest, ConcurrentGetAndIteratorRefBalanceAfterTurnover)
+{
+	auto db = OpenDB();
+	ASSERT_NE(db, nullptr);
+
+	auto* impl = db.get();
+	int baseline = impl->TEST_CurrentVersionRefs();
+
+	// Phase 1: seed data.
+	for (int i = 0; i < 30; ++i)
+	{
+		ASSERT_TRUE(db->Put("seed_" + std::to_string(i), std::string(64, 's')).ok());
+	}
+
+	// Phase 2: create long-lived iterators and concurrent Gets while writing
+	// enough data to trigger memtable rotation.
+	std::atomic<bool> stop{ false };
+	std::vector<std::thread> threads;
+
+	// Iterator holders: create iterators that live across the turnover.
+	const int kIterators = 3;
+	std::vector<std::unique_ptr<Iterator>> iters(kIterators);
+	for (int i = 0; i < kIterators; ++i)
+	{
+		iters[i] = db->NewIterator(ReadOptions());
+		ASSERT_NE(iters[i], nullptr);
+	}
+
+	int refs_with_iters = impl->TEST_CurrentVersionRefs();
+	EXPECT_GE(refs_with_iters, baseline + kIterators) << "Each iterator must hold a version ref";
+
+	// Concurrent Get() threads.
+	const int kGetThreads = 4;
+	for (int t = 0; t < kGetThreads; ++t)
+	{
+		threads.emplace_back([&, t] {
+			while (!stop.load(std::memory_order_acquire))
+			{
+				for (int i = 0; i < 30; ++i)
+				{
+					auto r = db->Get("seed_" + std::to_string(i));
+					(void)r;
+				}
+			}
+		});
+	}
+
+	// Writer thread: write enough to trigger memtable rotation.
+	threads.emplace_back([&] {
+		for (int i = 0; i < 200; ++i)
+		{
+			Status s = db->Put("turnover_" + std::to_string(i), std::string(128, 't'));
+			if (!s.ok()) break;
+		}
+	});
+
+	// Wait for writer to finish, then stop readers.
+	threads.back().join();
+	stop.store(true, std::memory_order_release);
+	for (int i = 0; i < kGetThreads; ++i) threads[i].join();
+
+	// Refs must still be elevated by the iterators.
+	int refs_mid = impl->TEST_CurrentVersionRefs();
+	EXPECT_GE(refs_mid, baseline + kIterators) << "Iterators still alive – refs must not have leaked below iterator count";
+
+	// Destroy iterators one by one and verify ref decrement.
+	for (int i = 0; i < kIterators; ++i)
+	{
+		iters[i].reset();
+		int refs_now = impl->TEST_CurrentVersionRefs();
+		EXPECT_GE(refs_now, baseline) << "Refs must never drop below baseline after destroying iterator " << i;
+	}
+
+	// All iterators destroyed – refs must be back to baseline.
+	int refs_final = impl->TEST_CurrentVersionRefs();
+	EXPECT_EQ(refs_final, baseline) << "After all iterators destroyed and Gets completed, refs must return to baseline";
+}

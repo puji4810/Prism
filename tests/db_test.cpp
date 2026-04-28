@@ -870,3 +870,210 @@ TEST_F(DBTest, SnapshotSurvivesFlushAndCompactionUntilRelease)
 	snap_opts.snapshot_handle.reset();
 	EXPECT_EQ(0U, db->TEST_ActiveSnapshotCount());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invariant guard: unsnapshotted visibility
+//
+// An unsnapshotted read must only observe writes whose sequence has been fully
+// committed (published), never a sequence that was reserved by a concurrent
+// write but not yet applied.
+//
+// Currently this invariant is upheld because Get() acquires shared_lock and
+// ResolveSnapshotSequence() returns sequence_ - 1, while writes increment
+// sequence_ under unique_lock.  After the SuperVersion migration removes the
+// read-path lock, sequence_ - 1 becomes unsafe because writes reserve sequence
+// numbers BEFORE WAL/apply.  This test documents the expected behavior so that
+// the migration must provide an equivalent visible-sequence mechanism.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(DBTest, UnsnapshottedReadObservesCommittedStateNotReservedSequence)
+{
+	auto res = Database::Open("test_db");
+	ASSERT_TRUE(res.has_value());
+	auto db = std::move(res.value());
+
+	// Baseline: write an initial value.
+	ASSERT_TRUE(db.Put("vis_key", "v1").ok());
+
+	// Verify basic read-your-writes: after Put returns, Get sees the value.
+	auto r1 = db.Get("vis_key");
+	ASSERT_TRUE(r1.has_value());
+	EXPECT_EQ("v1", r1.value()) << "Get() after Put() must see the committed value";
+
+	// Overwrite and verify the new value is visible.
+	ASSERT_TRUE(db.Put("vis_key", "v2").ok());
+	auto r2 = db.Get("vis_key");
+	ASSERT_TRUE(r2.has_value());
+	EXPECT_EQ("v2", r2.value()) << "Get() must see the latest committed overwrite";
+
+	// Concurrent stress: multiple writers and readers.  Every read must return
+	// a value that was actually written (never garbage from a reserved-but-
+	// unapplied sequence).  With the current lock-based implementation this
+	// is trivially true; after the SuperVersion migration the visible_sequence
+	// mechanism must preserve it.
+	constexpr int kWriters = 4;
+	constexpr int kReaders = 4;
+	constexpr int kKeysPerWriter = 100;
+
+	std::atomic<bool> go{ false };
+	std::atomic<bool> writers_done{ false };
+	std::vector<std::thread> threads;
+
+	auto key_for = [](int w, int i) { return "cvis_" + std::to_string(w) + "_" + std::to_string(i); };
+	auto val_for = [](int w, int i) { return "cv_" + std::to_string(w) + "_" + std::to_string(i); };
+
+	for (int w = 0; w < kWriters; ++w)
+	{
+		threads.emplace_back([&, w] {
+			while (!go.load(std::memory_order_acquire)) {}
+			for (int i = 0; i < kKeysPerWriter; ++i)
+			{
+				ASSERT_TRUE(db.Put(key_for(w, i), val_for(w, i)).ok());
+			}
+		});
+	}
+
+	for (int r = 0; r < kReaders; ++r)
+	{
+		threads.emplace_back([&] {
+			while (!go.load(std::memory_order_acquire)) {}
+			while (!writers_done.load(std::memory_order_acquire))
+			{
+				for (int w = 0; w < kWriters; ++w)
+				{
+					for (int i = 0; i < kKeysPerWriter; i += 11)
+					{
+						auto result = db.Get(key_for(w, i));
+						if (result.has_value())
+						{
+							EXPECT_EQ(result.value(), val_for(w, i))
+							    << "Read returned a value that was never written – "
+							    << "possible reserved-sequence leak";
+						}
+						else
+						{
+							EXPECT_TRUE(result.error().IsNotFound());
+						}
+					}
+				}
+			}
+		});
+	}
+
+	go.store(true, std::memory_order_release);
+	for (int i = 0; i < kWriters; ++i) threads[i].join();
+	writers_done.store(true, std::memory_order_release);
+	for (int i = kWriters; i < kWriters + kReaders; ++i) threads[i].join();
+
+	// Final verification: all keys readable.
+	for (int w = 0; w < kWriters; ++w)
+	{
+		for (int i = 0; i < kKeysPerWriter; ++i)
+		{
+			auto result = db.Get(key_for(w, i));
+			ASSERT_TRUE(result.has_value()) << key_for(w, i) << " missing after all writes complete";
+			EXPECT_EQ(result.value(), val_for(w, i));
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invariant guard: Get/Iterator visibility alignment
+//
+// When Get() and NewIterator() both use no-snapshot ReadOptions, they must
+// observe the same point-in-time state (same visible sequence).  This guards
+// against a future regression where the two paths resolve their read snapshot
+// differently.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(DBTest, GetIteratorVisibilityAlignmentNoSnapshot)
+{
+	auto res = Database::Open("test_db");
+	ASSERT_TRUE(res.has_value());
+	auto db = std::move(res.value());
+
+	// Write a known dataset.
+	for (int i = 0; i < 50; ++i)
+	{
+		ASSERT_TRUE(db.Put("align_" + std::to_string(i), "val_" + std::to_string(i)).ok());
+	}
+
+	// Capture the state via Get() for every key.
+	std::vector<std::string> get_values;
+	for (int i = 0; i < 50; ++i)
+	{
+		auto r = db.Get("align_" + std::to_string(i));
+		ASSERT_TRUE(r.has_value());
+		get_values.push_back(r.value());
+	}
+
+	// Capture the state via a no-snapshot iterator.
+	std::unique_ptr<Iterator> it = db.NewIterator(ReadOptions());
+	ASSERT_NE(it, nullptr);
+	it->SeekToFirst();
+
+	int idx = 0;
+	while (it->Valid())
+	{
+		// The iterator may see keys from other tests if the DB is shared,
+		// but for our align_* keys the values must match.
+		std::string key = it->key().ToString();
+		if (key.substr(0, 6) == "align_")
+		{
+			int kidx = std::stoi(key.substr(6));
+			ASSERT_LT(kidx, 50);
+			EXPECT_EQ(it->value().ToString(), get_values[kidx])
+			    << "Iterator and Get() disagree on value for " << key;
+			++idx;
+		}
+		it->Next();
+	}
+	EXPECT_EQ(idx, 50) << "Iterator should visit all 50 align_* keys";
+	EXPECT_TRUE(it->status().ok()) << it->status().ToString();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invariant guard: shutdown/reopen rejects stale snapshot handles
+//
+// Opens a DB via DBImpl::OpenInternal, captures a snapshot, closes the DB,
+// reopens a fresh instance, and verifies that the stale snapshot (kept alive
+// outside the close scope) is deterministically rejected for both Get() and
+// NewIterator().  Uses DBImpl::OpenInternal so the Snapshot handle survives
+// across the close/reopen boundary.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(DBTest, ShutdownRejectsStaleSnapshotDeterministically)
+{
+	Options opts;
+	opts.create_if_missing = true;
+
+	std::unique_ptr<DBImpl> db1;
+	{
+		auto open = DBImpl::OpenInternal(opts, "test_db");
+		ASSERT_TRUE(open.has_value());
+		db1 = std::move(open.value());
+		ASSERT_TRUE(db1->Put("stale_key", "original").ok());
+	}
+
+	Snapshot stale = db1->CaptureSnapshot();
+	ASSERT_TRUE(db1->Put("stale_key", "after").ok());
+
+	db1.reset();
+
+	auto open2 = DBImpl::OpenInternal(opts, "test_db");
+	ASSERT_TRUE(open2.has_value());
+	auto db2 = std::move(open2.value());
+
+	ReadOptions ro;
+	ro.snapshot_handle = stale;
+
+	auto get_res = db2->Get(ro, "stale_key");
+	ASSERT_FALSE(get_res.has_value());
+	EXPECT_TRUE(get_res.error().IsInvalidArgument()) << get_res.error().ToString();
+
+	auto iter = db2->NewIterator(ro);
+	ASSERT_NE(iter, nullptr);
+	EXPECT_FALSE(iter->Valid()) << "Iterator from stale snapshot should not be valid";
+	EXPECT_TRUE(iter->status().IsInvalidArgument()) << iter->status().ToString();
+
+	auto plain = db2->Get("stale_key");
+	ASSERT_TRUE(plain.has_value()) << plain.error().ToString();
+	EXPECT_EQ("after", plain.value());
+}

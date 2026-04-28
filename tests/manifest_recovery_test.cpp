@@ -780,3 +780,61 @@ TEST_F(ManifestRecoveryTest, SnapshotIsEphemeralAndRejectedAfterReopen)
 	// registry->Release(node), cleanly unlinking the node from the old registry.
 	// LSAN verifies no leaks on exit.
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invariant guard: reopen rejects ALL stale handles deterministically
+//
+// Opens a DB, writes data, captures a snapshot, closes the DB, reopens a new
+// instance, and verifies that the stale snapshot is rejected for both Get()
+// and NewIterator() with the correct error code (InvalidArgument).  Also
+// verifies that a plain read (no snapshot) succeeds after reopen, confirming
+// data persistence.  This is a stronger version of the existing test because
+// it exercises multiple stale-handle paths in a single test and verifies
+// determinism (same error code every time, not undefined behavior).
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(ManifestRecoveryTest, ReopenRejectsAllStaleHandlesDeterministically)
+{
+	// Phase 1: open, write, capture snapshot, close.
+	ASSERT_TRUE(OpenDB().has_value());
+	ASSERT_TRUE(db().Put("stale_key", "original").ok());
+	ASSERT_TRUE(db().Put("stale_key2", "original2").ok());
+
+	Snapshot stale = db().CaptureSnapshot();
+
+	ASSERT_TRUE(db().Put("stale_key", "overwritten").ok());
+
+	CloseDB();
+
+	// Phase 2: reopen and verify stale snapshot rejection.
+	ASSERT_TRUE(OpenDB().has_value());
+
+	ReadOptions ro;
+	ro.snapshot_handle = stale;
+
+	// Get with stale snapshot → InvalidArgument.
+	auto get_res = db().Get(ro, "stale_key");
+	EXPECT_FALSE(get_res.has_value()) << "Get with stale snapshot should fail";
+	EXPECT_TRUE(get_res.error().IsInvalidArgument())
+	    << "expected InvalidArgument, got: " << get_res.error().ToString();
+
+	// Second Get with same stale snapshot → same error (deterministic).
+	auto get_res2 = db().Get(ro, "stale_key2");
+	EXPECT_FALSE(get_res2.has_value());
+	EXPECT_TRUE(get_res2.error().IsInvalidArgument())
+	    << "repeated stale-snapshot Get must return same error code";
+
+	// NewIterator with stale snapshot → error iterator.
+	auto iter = db().NewIterator(ro);
+	EXPECT_FALSE(iter->Valid()) << "iterator with stale snapshot should not be valid";
+	EXPECT_TRUE(iter->status().IsInvalidArgument())
+	    << "expected InvalidArgument on iterator, got: " << iter->status().ToString();
+
+	// Plain read (no snapshot) must succeed – data persisted before close.
+	auto plain = db().Get("stale_key");
+	ASSERT_TRUE(plain.has_value()) << "plain Get should find stale_key after reopen";
+	EXPECT_EQ("overwritten", plain.value()) << "plain Get should see the latest value";
+
+	auto plain2 = db().Get("stale_key2");
+	ASSERT_TRUE(plain2.has_value()) << "plain Get should find stale_key2 after reopen";
+	EXPECT_EQ("original2", plain2.value());
+}
