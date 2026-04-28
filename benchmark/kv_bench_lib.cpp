@@ -1328,6 +1328,7 @@ namespace prism::bench
 				std::printf("  --warmup_rounds=<n>          Warmup rounds before measurement (default: 0)\n");
 				std::printf("  --no_latency                 Skip p50/p95 latency collection (default: off)\n");
 				std::printf("  --prefill=<-1|0|1>           Prefill: -1=auto, 0=off, 1=force (default: -1)\n");
+				std::printf("  --profile-pause-prefill      Pause VTune/ITT profiling during prefill (default: off)\n");
 				std::printf("  --phase=<mode>               Profiling phase (default: full)\n");
 				std::printf("                               Modes: full, prefill-only, warmup-only,\n");
 				std::printf("                                      steady-state, compaction-overlap-only\n");
@@ -1363,6 +1364,11 @@ namespace prism::bench
 			parse_int("--inflight_per_client=", cfg.inflight_per_client);
 			parse_int("--warmup_rounds=", cfg.warmup_rounds);
 			parse_int("--prefill=", cfg.prefill);
+
+			if (arg == "--profile-pause-prefill")
+			{
+				cfg.profile_pause_prefill = true;
+			}
 
 			if (arg == "--no_latency")
 			{

@@ -119,6 +119,7 @@ namespace prism::bench
 		int warmup_rounds = 0;
 		bool no_latency = false;
 		int prefill = -1; // -1=auto, 0=off, 1=force
+		bool profile_pause_prefill = false; // pause VTune/ITT during prefill
 		std::string db_dir = "";
 		bool keep_db = false;
 		int max_client_inflight = 0; // populated by runners
