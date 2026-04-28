@@ -10,7 +10,7 @@
 #   --bench-args "..."   Arguments passed to kv_bench (e.g. "--run=async --bench=mixed ...")
 #
 # Options:
-#   --output-dir DIR     Output root (default: .sisyphus/evidence)
+#   --output-dir DIR     Output root (default: root/evidence)
 #   --kv-bench PATH      Path to kv_bench binary (default: build/linux/x86_64/release/kv_bench)
 #   --help               Print this help message
 #
@@ -47,7 +47,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # ------------------------------------------------------------------
 # Defaults
 # ------------------------------------------------------------------
-DEFAULT_OUTPUT_DIR="${PROJECT_ROOT}/.sisyphus/evidence"
+DEFAULT_OUTPUT_DIR="${PROJECT_ROOT}/evidence"
 DEFAULT_KV_BENCH="${PROJECT_ROOT}/build/linux/x86_64/release/kv_bench"
 FLAMEGRAPH_DIR="${PROJECT_ROOT}/third-party/FlameGraph"
 
@@ -69,7 +69,7 @@ Required:
   --bench-args "..."   Arguments passed to kv_bench (e.g. "--run=async --bench=mixed ...")
 
 Options:
-  --output-dir DIR     Output root (default: .sisyphus/evidence)
+  --output-dir DIR     Output root (default: root/evidence)
   --kv-bench PATH      Path to kv_bench binary (default: build/linux/x86_64/release/kv_bench)
   --help               Print this help message
 
