@@ -3,9 +3,14 @@
 
 #include "scheduler.h"
 
+#ifdef PRISM_RUNTIME_METRICS
+#include "runtime_metrics.h"
+#endif
+
 #include <atomic>
 #include <coroutine>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -73,7 +78,8 @@ namespace prism
 	// Thread Safety:
 	// - State is shared via std::shared_ptr to ensure lifetime across thread boundaries
 	// - Work execution and result storage happen on thread pool threads
-	// - Coroutine resumption happens on the same thread that completes the work
+	// - Coroutine resumption happens inline on the worker that completed the operation.
+	//   This avoids bouncing hot-path continuations through the same executor queue.
 	template <typename T>
 	class AsyncOp
 	{
@@ -82,10 +88,10 @@ namespace prism
 
 	public:
 		using ValueType = T;
-		using Work = std::function<T()>;
+		using Work = std::move_only_function<T()>;
 
 		AsyncOp(IScheduler& scheduler, Work work)
-			    : state_(std::make_shared<State>(&scheduler, std::move(work)))
+		    : state_(std::make_shared<State>(&scheduler, std::move(work)))
 		{
 		}
 
@@ -99,10 +105,14 @@ namespace prism
 			// See class-level protocol comment for the full CAS handshake.
 			bool await_suspend(std::coroutine_handle<> handle) const
 			{
-				auto st = state;
-				st->handle = handle;
+				state->handle = handle;
+#ifdef PRISM_RUNTIME_METRICS
+				state->suspend_time = std::chrono::steady_clock::now();
+#endif
 
-				st->scheduler->Submit([st] {
+				IScheduler* blocking_scheduler = state->scheduler->BlockingScheduler();
+
+				blocking_scheduler->Submit([st = state] {
 					try
 					{
 						st->value = st->work();
@@ -111,16 +121,23 @@ namespace prism
 					{
 						st->exception = std::current_exception();
 					}
-
-					// Worker tries to win the handshake: kSuspending → kCompleted.
+#ifdef PRISM_RUNTIME_METRICS
+					{
+						auto resume_time = std::chrono::steady_clock::now();
+						auto delay_us = static_cast<uint64_t>(
+						    std::chrono::duration_cast<std::chrono::microseconds>(resume_time - st->suspend_time)
+						        .count());
+						auto& rm = RuntimeMetrics::Instance();
+						rm.continuation_delay_total_us.fetch_add(delay_us, std::memory_order_relaxed);
+						rm.continuation_count.fetch_add(1, std::memory_order_relaxed);
+					}
+#endif
 					auto expected = State::kSuspending;
 					if (st->status.compare_exchange_strong(
 					        expected, State::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
 					{
-						// Won: coroutine not yet suspended; await_suspend will return false.
 						return;
 					}
-					// Lost: coroutine is suspended (kSuspended); safe to resume exactly once.
 					st->handle.resume();
 				});
 
@@ -167,6 +184,9 @@ namespace prism
 			std::exception_ptr exception;
 			std::coroutine_handle<> handle;
 			std::atomic<int> status{ kSuspending };
+#ifdef PRISM_RUNTIME_METRICS
+			std::chrono::steady_clock::time_point suspend_time;
+#endif
 		};
 
 		std::shared_ptr<State> state_;
@@ -181,10 +201,10 @@ namespace prism
 		struct State;
 
 	public:
-		using Work = std::function<void()>;
+		using Work = std::move_only_function<void()>;
 
 		AsyncOp(IScheduler& scheduler, Work work)
-			    : state_(std::make_shared<State>(&scheduler, std::move(work)))
+		    : state_(std::make_shared<State>(&scheduler, std::move(work)))
 		{
 		}
 
@@ -196,10 +216,13 @@ namespace prism
 
 			bool await_suspend(std::coroutine_handle<> handle) const
 			{
-				auto st = state;
-				st->handle = handle;
+				state->handle = handle;
+#ifdef PRISM_RUNTIME_METRICS
+				state->suspend_time = std::chrono::steady_clock::now();
+#endif
+				IScheduler* blocking_scheduler = state->scheduler->BlockingScheduler();
 
-				st->scheduler->Submit([st] {
+				blocking_scheduler->Submit([st = state] {
 					try
 					{
 						st->work();
@@ -208,15 +231,23 @@ namespace prism
 					{
 						st->exception = std::current_exception();
 					}
-
+#ifdef PRISM_RUNTIME_METRICS
+					{
+						auto resume_time = std::chrono::steady_clock::now();
+						auto delay_us = static_cast<uint64_t>(
+						    std::chrono::duration_cast<std::chrono::microseconds>(resume_time - st->suspend_time)
+						        .count());
+						auto& rm = RuntimeMetrics::Instance();
+						rm.continuation_delay_total_us.fetch_add(delay_us, std::memory_order_relaxed);
+						rm.continuation_count.fetch_add(1, std::memory_order_relaxed);
+					}
+#endif
 					auto expected = State::kSuspending;
 					if (st->status.compare_exchange_strong(
 					        expected, State::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
 					{
-						// Worker wins: coroutine not yet suspended.
 						return;
 					}
-					// Coroutine wins: it is suspended; resume it now.
 					st->handle.resume();
 				});
 
@@ -260,6 +291,9 @@ namespace prism
 			std::exception_ptr exception;
 			std::coroutine_handle<> handle;
 			std::atomic<int> status{ kSuspending };
+#ifdef PRISM_RUNTIME_METRICS
+			std::chrono::steady_clock::time_point suspend_time;
+#endif
 		};
 
 		std::shared_ptr<State> state_;

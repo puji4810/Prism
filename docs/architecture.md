@@ -385,31 +385,60 @@ if (result.has_value()) {
 
 ---
 
-## Concurrency Model (Current)
+## Runtime Architecture
 
-**Current implementation:**
+Prism's async runtime uses a lane-isolated execution model. Each database instance owns a `RuntimeBundle` that partitions work across dedicated executors to prevent head-of-line blocking between foreground reads and background compaction.
 
-- Single-threaded (no locking)
-- External synchronization required
+### Physical Thread Layout
 
-**Future multi-threaded design:**
+Each `RuntimeBundle` manages four physical thread sources:
 
-```plaintext
-Writers:
-  - Mutex around DBImpl::Write()
-  - WAL writes serialized
-  - MemTable allows concurrent Add() with writer lock
+| Executor | Type | Threads | Purpose |
+|----------|------|---------|---------|
+| `ThreadPoolScheduler` (shared) | `ThreadPoolScheduler` | N workers | CPU-bound continuations and general dispatch |
+| `read_executor` | `BlockingExecutor` | 4 | Foreground async reads and writes |
+| `compaction_executor` | `BlockingExecutor` | 1 | Background compaction and flush (single-flight) |
+| `serial_lane` | `SerialLane` | 1 worker | FIFO-ordered file writes (Append / Flush / Sync) |
 
-Readers:
-  - Lock-free reads from MemTable
-  - Snapshot isolation via sequence numbers
-  - SkipList supports concurrent reads
+The `ThreadPoolScheduler` is process-wide and shared across all database instances. The other three executors are per-DB and constructed inside `RuntimeBundle`.
 
-Compaction:
-  - Background thread
-  - Immutable MemTable (imm_) doesn't need locks
-  - SSTable files are immutable
+### Scheduler Routing
+
+`AsyncOp` routes work through `IScheduler` adapters. The `runtime_scheduler` (an `ExecutorSchedulerAdapter`) is the main router that every async database operation sees:
+
 ```
+runtime_scheduler.Submit(job)
+  -> cpu_executor_impl -> ThreadPoolScheduler (shared CPU pool)
+
+runtime_scheduler.BlockingScheduler() -> read_scheduler -> read_executor
+  (foreground blocking work: GetAsync, PutAsync, etc.)
+
+runtime_scheduler.ContinuationScheduler() -> read_scheduler -> read_executor
+  (available for explicit continuations; AsyncOp resumes inline after work completion)
+```
+
+`include/async_op.h` uses `BlockingScheduler()` for the blocking work item and
+then runs the suspend/resume handshake inline on the worker that completed the operation. This avoids a
+second `BlockingExecutor::Submit()` on every read-heavy hot-path operation. The self-join hazard is handled
+at ownership boundaries instead: `AcquireRuntimeBundle()` defers actual `RuntimeBundle` deletion to an
+external cleanup thread if the final reference is released from a bundle-owned worker.
+
+Compaction does not go through `runtime_scheduler`. The `CompactionController` submits directly to `compaction_executor` so that background merge work never competes with the read lane.
+
+### Why Reads and Compaction Are Isolated
+
+**Before lane isolation**, a single `BlockingExecutor(1)` serialized both reads and compaction. Under read-heavy load the compaction queue could stall behind thousands of read operations, and conversely a long compaction job would block all foreground reads. VTune profiling showed peak queue depths of 23/24 with context-switch counts over 1.1M per benchmark run.
+
+**After lane isolation**:
+- Reads scale on a multi-threaded `BlockingExecutor(4)`
+- Compaction stays isolated on its own `BlockingExecutor(1)`
+- SerialLane guarantees ordered file writes without blocking either lane
+
+**Result**: Throughput on read-heavy workloads improved from 388,990 ops/s to 1,138,247 ops/s (2.93x). Context-switches dropped 87%, and task-clock per run fell 45%. The read lane now peaks at 23/24 utilization without fallback-to-blocking events, while the compaction lane maintains zero queue depth because it runs independently.
+
+### Instrumentation
+
+Opt-in runtime metrics are available by building with `-DPRISM_RUNTIME_METRICS`. When enabled, `RuntimeMetrics` tracks per-lane queue depths, enqueue waits, execution times, and continuation handoff delays. This instrumentation adds roughly 15% overhead and is intended for diagnostic use only.
 
 ---
 
