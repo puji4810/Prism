@@ -3,3 +3,7 @@ compile_commands.json
 build/
 .vscode/
 .cache/
+.sisyphus/
+.zed/
+.github/
+.cursor/

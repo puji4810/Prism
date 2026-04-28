@@ -1282,6 +1282,24 @@ namespace prism::bench
 		return "unknown";
 	}
 
+	std::string PhaseName(PhaseMode m)
+	{
+		switch (m)
+		{
+		case PhaseMode::kFull:
+			return "full";
+		case PhaseMode::kPrefillOnly:
+			return "prefill-only";
+		case PhaseMode::kWarmupOnly:
+			return "warmup-only";
+		case PhaseMode::kSteadyState:
+			return "steady-state";
+		case PhaseMode::kCompactionOverlapOnly:
+			return "compaction-overlap-only";
+		}
+		return "unknown";
+	}
+
 	Config ParseArgs(int argc, char** argv)
 	{
 		Config cfg;
@@ -1310,6 +1328,9 @@ namespace prism::bench
 				std::printf("  --warmup_rounds=<n>          Warmup rounds before measurement (default: 0)\n");
 				std::printf("  --no_latency                 Skip p50/p95 latency collection (default: off)\n");
 				std::printf("  --prefill=<-1|0|1>           Prefill: -1=auto, 0=off, 1=force (default: -1)\n");
+				std::printf("  --phase=<mode>               Profiling phase (default: full)\n");
+				std::printf("                               Modes: full, prefill-only, warmup-only,\n");
+				std::printf("                                      steady-state, compaction-overlap-only\n");
 				std::printf("  --db_dir=<path>              Use existing dir for async DB (default: temp)\n");
 				std::printf("  --keep_db=<0|1>              Keep DB dir after run (default: 0)\n");
 				std::printf("  --help                       Show this message\n");
@@ -1432,6 +1453,43 @@ namespace prism::bench
 				    std::string(bench_val).c_str());
 				exit(1);
 			}
+
+			bool phase_flag_handled = false;
+			if (arg == "--phase=full")
+			{
+				cfg.phase = PhaseMode::kFull;
+				phase_flag_handled = true;
+			}
+			if (arg == "--phase=prefill-only")
+			{
+				cfg.phase = PhaseMode::kPrefillOnly;
+				phase_flag_handled = true;
+			}
+			if (arg == "--phase=warmup-only")
+			{
+				cfg.phase = PhaseMode::kWarmupOnly;
+				phase_flag_handled = true;
+			}
+			if (arg == "--phase=steady-state")
+			{
+				cfg.phase = PhaseMode::kSteadyState;
+				phase_flag_handled = true;
+			}
+			if (arg == "--phase=compaction-overlap-only")
+			{
+				cfg.phase = PhaseMode::kCompactionOverlapOnly;
+				phase_flag_handled = true;
+			}
+
+			if (arg.starts_with("--phase=") && !phase_flag_handled)
+			{
+				std::string_view phase_val = arg.substr(8);
+				std::fprintf(stderr,
+				    "unknown --phase value: %s; allowed: full|prefill-only|warmup-only|"
+				    "steady-state|compaction-overlap-only\n",
+				    std::string(phase_val).c_str());
+				exit(1);
+			}
 		}
 
 		if (cfg.clients <= 0)
@@ -1465,6 +1523,22 @@ namespace prism::bench
 		if (cfg.prefill < -1 || cfg.prefill > 1)
 		{
 			cfg.prefill = -1;
+		}
+
+		// Phase mode adjustments
+		if (cfg.phase != PhaseMode::kFull)
+		{
+			// Non-full phase modes require prefill unless explicitly disabled
+			if (cfg.prefill == -1)
+			{
+				cfg.prefill = 1;
+			}
+
+			// compaction-overlap-only forces compaction_overlap benchmark mode
+			if (cfg.phase == PhaseMode::kCompactionOverlapOnly)
+			{
+				cfg.mode = BenchMode::kCompactionOverlap;
+			}
 		}
 
 		// sst_read_pipeline is async-only

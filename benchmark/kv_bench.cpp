@@ -194,7 +194,19 @@ namespace prism::bench
 			std::rethrow_exception(open_exc);
 		}
 
-		std::printf("scheduler_threads=%zu inflight_per_client=%d\n", scheduler.WorkerCount(), cfg.inflight_per_client);
+		std::printf("phase=%s scheduler_threads=%zu inflight_per_client=%d\n", PhaseName(cfg.phase).c_str(),
+		    scheduler.WorkerCount(), cfg.inflight_per_client);
+
+		// prefill-only: prefill already done above, return early
+		if (cfg.phase == PhaseMode::kPrefillOnly)
+		{
+			std::printf("phase=prefill-only: prefill completed, exiting (no measurement)\n");
+			if (!cfg.keep_db)
+			{
+				(void)std::filesystem::remove_all(dir);
+			}
+			return;
+		}
 
 		for (int w = 0; w < cfg.warmup_rounds; ++w)
 		{
@@ -218,6 +230,17 @@ namespace prism::bench
 			{
 				(void)RunAsyncMixed(*adb, scheduler, cfg, keys);
 			}
+		}
+
+		// warmup-only: warmup already done above, return early
+		if (cfg.phase == PhaseMode::kWarmupOnly)
+		{
+			std::printf("phase=warmup-only: warmup completed, exiting (no measurement)\n");
+			if (!cfg.keep_db)
+			{
+				(void)std::filesystem::remove_all(dir);
+			}
+			return;
 		}
 
 		std::vector<uint64_t> all_lat;
@@ -327,8 +350,9 @@ int main(int argc, char** argv)
 	Config cfg = ParseArgs(argc, argv);
 	const auto keys = MakeKeys(cfg.clients, cfg.ops_per_client);
 
-	std::printf("config: run=%s bench=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n", RunName(cfg).c_str(),
-	    BenchName(cfg.mode).c_str(), cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio);
+	std::printf("config: run=%s bench=%s phase=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n",
+	    RunName(cfg).c_str(), BenchName(cfg.mode).c_str(), PhaseName(cfg.phase).c_str(), cfg.clients, cfg.workers,
+	    cfg.ops_per_client, cfg.value_size, cfg.read_ratio);
 
 	if (cfg.do_sync)
 	{

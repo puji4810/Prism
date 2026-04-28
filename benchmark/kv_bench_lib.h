@@ -91,6 +91,16 @@ namespace prism::bench
 		kCompactionOverlap
 	};
 
+	// Profiling phase controls
+	enum class PhaseMode
+	{
+		kFull,
+		kPrefillOnly,
+		kWarmupOnly,
+		kSteadyState,
+		kCompactionOverlapOnly
+	};
+
 	// Configuration
 	struct Config
 	{
@@ -101,6 +111,7 @@ namespace prism::bench
 		int read_ratio = 0;
 		int rounds = 3;
 		BenchMode mode = BenchMode::kMixed;
+		PhaseMode phase = PhaseMode::kFull;
 		std::size_t write_buffer_size = 4 * 1024 * 1024;
 		bool do_sync = true;
 		bool do_async = true;
@@ -184,6 +195,7 @@ namespace prism::bench
 	// Naming helpers
 	std::string RunName(const Config& cfg);
 	std::string BenchName(BenchMode m);
+	std::string PhaseName(PhaseMode m);
 
 	// Argument parsing
 	Config ParseArgs(int argc, char** argv);
