@@ -68,7 +68,7 @@ sequenceDiagram
 **Why this matters:**
 - **WAL first**: Ensures durability before in-memory update. If a crash occurs, the WAL is the source of truth for pending writes.
 - **Batch atomic**: Multiple operations within a `WriteBatch` commit together. Either all operations are visible, or none are.
-- **Sequence number**: Monotonically increasing for MVCC. This allows readers to see a consistent snapshot of the data even while writes are in progress.
+- **Sequence number**: Monotonically increasing for MVCC, with a three-way split: `sequence_` (reservation), `versions_->LastSequence()` (persisted), and `visible_sequence_` (publication). Only published writes are visible to readers.
 - **Performance**: Writes are never blocked by disk seeks, as the WAL is append-only and the MemTable update is O(log N).
 
 ---
@@ -88,7 +88,7 @@ sequenceDiagram
     participant SST as SSTables (L0 -> LN)
 
     User->>DB: Get(key)
-    Note over DB: Create LookupKey(key, last_seq)
+    Note over DB: Create LookupKey(key, visible_sequence_)
     DB->>Mem: Get(LookupKey)
     alt Found in MemTable
         Mem-->>DB: Value / Deleted Tag
@@ -314,27 +314,39 @@ flowchart BT
 
 ## Sequence Number Management
 
+Prism uses a three-way sequence split for correct MVCC visibility:
+
 ```plaintext
 DBImpl:
-  uint64_t last_sequence_ = 0;
+  SequenceNumber sequence_ = 1;           // Next sequence to assign (reservation cursor)
+  std::atomic<SequenceNumber> visible_sequence_{0};  // Last fully committed + published sequence
+  // VersionSet::last_sequence_ persists the last assigned sequence in MANIFEST
+  // Invariant: sequence_ == versions_->LastSequence() + 1
 
 Write operation:
-  1. batch->SetSequence(++last_sequence_)
-  2. Write batch to WAL
-  3. Apply batch to MemTable
-     - Each operation gets sequence++
-   
-Read operation:
-  LookupKey lkey(user_key, last_sequence_);
-  // Sees all committed writes
-  
+  1. Reserve: batch.SetSequence(sequence_); sequence_ += batch.Count()
+  2. Persist metadata: versions_->SetLastSequence(sequence_ - 1)
+  3. Append batch to WAL
+  4. Apply batch to MemTable
+  5. Publish: visible_sequence_.store(sequence_ - 1)
+     // Readers only see writes after step 5 completes
+
+Read operation (unsnapshotted):
+  SequenceNumber snapshot = visible_sequence_.load();
+  LookupKey lkey(user_key, snapshot);
+  // Sees all committed + published writes
+
 Snapshot read:
-  auto snap = db.CaptureSnapshot();
+  auto snap = db.CaptureSnapshot();       // Freezes current visible_sequence_
   ReadOptions opts;
   opts.snapshot_handle = snap;
   db.Get(opts, key);
   // Sees data at the captured snapshot sequence
 ```
+
+**Key invariant**: `sequence_` may advance (reserved) before the write is safe to read.
+Only after `visible_sequence_` advances are newly written entries visible to unsnapshotted reads.
+This prevents readers from observing partially-committed batch writes.
 
 ---
 
@@ -342,12 +354,14 @@ Snapshot read:
 
 ### Status and Result<T>
 
-**Status:** `std::expected<void, Error>`
+**Status:** Custom class encapsulating success or an error code with message.
 
 - Used for operations that don't return values
 - Examples: Put, Delete, Write
+- Error types: NotFound, Corruption, NotSupported, InvalidArgument, IOError
+- Check with `s.ok()` or `s.IsNotFound()`, etc.
 
-**Result<T>:** `std::expected<T, Error>`
+**Result<T>:** `std::expected<T, Status>`
 
 - Used for operations that return values
 - Examples: Get returns `Result<std::string>`
@@ -355,31 +369,33 @@ Snapshot read:
 **Error types:**
 
 ```cpp
-enum class ErrorCode {
-    OK,
-    NotFound,
-    Corruption,
-    NotSupported,
-    InvalidArgument,
-    IOError
-};
+// Status static factory methods:
+Status::OK()
+Status::NotFound(msg)
+Status::Corruption(msg)
+Status::NotSupported(msg)
+Status::InvalidArgument(msg)
+Status::IOError(msg)
+
+// Check for specific errors:
+s.ok(), s.IsNotFound(), s.IsCorruption(), s.IsIOError(), etc.
 ```
 
 **Usage:**
 
 ```cpp
 // Writing
-Status s = db->Put(key, value);
-if (!s.has_value()) {
-    // Handle error: s.error()
+Status s = db.Put(WriteOptions(), key, value);
+if (!s.ok()) {
+    // Handle error: s.ToString()
 }
 
 // Reading
-Result<std::string> result = db->Get(key);
+Result<std::string> result = db.Get(ReadOptions(), key);
 if (result.has_value()) {
     std::string value = *result;
 } else {
-    Error err = result.error();
+    Status err = result.error();
 }
 ```
 
@@ -404,26 +420,27 @@ The `ThreadPoolScheduler` is process-wide and shared across all database instanc
 
 ### Scheduler Routing
 
-`AsyncOp` routes work through `IScheduler` adapters. The `runtime_scheduler` (an `ExecutorSchedulerAdapter`) is the main router that every async database operation sees:
+`AsyncOp` routes work through `IScheduler` adapters. There are two primary routing paths:
 
+**AsyncDB operations** (`PutAsync`, `GetAsync`, etc.) use `foreground_db_scheduler`:
 ```
-runtime_scheduler.Submit(job)
-  -> cpu_executor_impl -> ThreadPoolScheduler (shared CPU pool)
+foreground_db_scheduler.Submit(job)
+  -> cpu_executor_impl -> ThreadPoolScheduler (shared CPU pool, worker-local fast path)
+```
+Work executes on the CPU pool. The completing worker runs the suspend/resume handshake inline and calls `handle.resume()` directly, avoiding a second queue hop.
 
-runtime_scheduler.BlockingScheduler() -> read_scheduler -> read_executor
-  (foreground blocking work: GetAsync, PutAsync, etc.)
+**AsyncEnv file operations** use `read_scheduler` and `serial_scheduler`:
+```
+read_scheduler.Submit(job)
+  -> read_executor (BlockingExecutor, 4 threads)
+  Foreground file I/O: ReadAtAsync, GetFileSizeAsync, etc.
 
-runtime_scheduler.ContinuationScheduler() -> read_scheduler -> read_executor
-  (available for explicit continuations; AsyncOp resumes inline after work completion)
+serial_scheduler.Submit(job)
+  -> serial_lane (SerialLane, 1 thread)
+  FIFO-ordered writes: AppendAsync, FlushAsync, SyncAsync, CloseAsync
 ```
 
-`include/async_op.h` uses `BlockingScheduler()` for the blocking work item and
-then runs the suspend/resume handshake inline on the worker that completed the operation. This avoids a
-second `BlockingExecutor::Submit()` on every read-heavy hot-path operation. The self-join hazard is handled
-at ownership boundaries instead: `AcquireRuntimeBundle()` defers actual `RuntimeBundle` deletion to an
-external cleanup thread if the final reference is released from a bundle-owned worker.
-
-Compaction does not go through `runtime_scheduler`. The `CompactionController` submits directly to `compaction_executor` so that background merge work never competes with the read lane.
+Compaction does not go through `runtime_scheduler`. The `CompactionController` submits directly to `compaction_executor` so that background merge work never competes with the read lane or CPU pool.
 
 ### Why Reads and Compaction Are Isolated
 
@@ -483,7 +500,7 @@ SSTable := Data Blocks | Meta Block | Index Block | Footer
 
 **Goals:**
 
-- **Space Reclamation**: (Planned for v2) Remove deleted/overwritten keys once they are no longer visible to any snapshot.
+- **Space Reclamation**: Snapshot-aware dropping of superseded values and obsolete tombstones during compaction (implemented).
 - **Read Optimization**: Maintain the leveled structure to bound read amplification.
 - **Write Performance**: Ensure L0 does not accumulate too many files, which could stall writes.
 
@@ -501,28 +518,50 @@ SSTable := Data Blocks | Meta Block | Index Block | Footer
 
 ---
 
-## Configuration (Future)
+## Configuration
 
 ```cpp
 struct Options {
     // MemTable
     size_t write_buffer_size = 4 * 1024 * 1024;  // 4MB
-  
-    // WAL
-    bool sync = false;  // fsync after every write?
-  
-    // Compaction
+    
+    // File management
     int max_open_files = 1000;
     size_t block_size = 4 * 1024;  // 4KB
     int block_restart_interval = 16;
-  
+    size_t max_file_size = 2 * 1024 * 1024;  // 2MB
+
+    // Creation
+    bool create_if_missing = false;
+    bool error_if_exists = false;
+
     // Compression
     CompressionType compression = kSnappyCompression;
-  
+    int zstd_compression_level = 1;
+
     // Cache
-    size_t block_cache_size = 8 * 1024 * 1024;  // 8MB
-  
+    Cache* block_cache = nullptr;
+
+    // Filter
+    const FilterPolicy* filter_policy = nullptr;
+
     // Comparator
     const Comparator* comparator = BytewiseComparator();
+
+    // Environment
+    Env* env = Env::Default();
 };
+
+struct WriteOptions {
+    bool sync = false;  // fsync before acknowledging write?
+};
+
+struct ReadOptions {
+    bool verify_checksums = false;
+    bool fill_cache = true;
+    std::optional<Snapshot> snapshot_handle;  // Point-in-time read
+};
+```
+
+Note: This is a simplified overview. See `include/options.h` for the complete definition.
 ```

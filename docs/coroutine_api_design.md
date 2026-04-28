@@ -76,10 +76,10 @@ sequenceDiagram
 ```mermaid
 graph LR
     subgraph Work["Incoming Work"]
-        COMP["Compaction"]
-        IO["Blocking I/O"]
-        DB["DB Put/Get"]
-        WRITE["Ordered File Write"]
+        COMPACTION["Compaction"]
+        IO["File I/O<br/>(AsyncEnv)"]
+        DB["DB Put/Get<br/>(AsyncDB)"]
+        WRITE["Ordered File Write<br/>(AsyncWritableFile)"]
     end
 
     subgraph Execs["Executors"]
@@ -89,20 +89,20 @@ graph LR
         SER["serial_lane (1 thr)"]
     end
 
-    COMP --> COMP
+    COMPACTION --> COMP
     IO --> READ
-    DB --> READ
+    DB --> CPU
     WRITE --> SER
 
+    CPU -->|"inline AsyncOp resume"| CPU
     READ -->|"inline AsyncOp resume"| READ
-    SER -->|"Continuation"| CPU
-    CPU -->|"general dispatch"| CPU
+    SER -->|"inline AsyncOp resume"| SER
 ```
 
-- **read_executor**: foreground async DB operations and blocking file reads
+- **cpu_executor**: `AsyncDB` foreground operations (Put/Get/Delete/Write) via `foreground_db_scheduler` — runs on shared `ThreadPoolScheduler` worker-local fast paths
+- **read_executor**: `AsyncEnv` blocking file I/O and filesystem metadata (ReadAtAsync, GetFileSizeAsync, etc.)
 - **compaction_executor**: background compaction/flush work with single-flight control
-- **serial_lane**: FIFO-ordered writable file appends/flushes/closes
-- **cpu_executor**: shared `ThreadPoolScheduler` for general CPU dispatch and `AsyncOp` resume continuations
+- **serial_lane**: FIFO-ordered `AsyncWritableFile` Append/Flush/Sync/Close
 
 ### 1.4 Compaction: Structured Lifetime & Cancellation
 
@@ -145,11 +145,11 @@ The `RuntimeBundle` is the central runtime container, shared via `std::shared_pt
 
 | Executor            | Type                       | Threads         | Schedules                                                                    |
 | ------------------- | -------------------------- | --------------- | ---------------------------------------------------------------------------- |
-| `read_executor`     | `BlockingExecutor`         | 4               | Foreground async DB work and blocking reads                                  |
+| `read_executor`     | `BlockingExecutor`         | 4               | `AsyncEnv` file I/O — blocking reads and filesystem metadata                 |
 | `compaction_executor` | `BlockingExecutor`       | 1               | Background compaction/flush single-flight work                               |
-| `cpu_executor`      | `ThreadPoolExecutor`       | N (shared pool) | General CPU dispatch                                                         |
-| `serial_lane`       | `SerialLane`               | 1               | FIFO-ordered file writes                                                     |
-| `runtime_scheduler` | `ExecutorSchedulerAdapter` | routing only    | Delegates blocking work → read lane; `AsyncOp` resumes inline after completion |
+| `cpu_executor`      | `ThreadPoolExecutor`       | N (shared pool) | `AsyncDB` foreground operations (Put/Get/Delete/Write), general CPU dispatch |
+| `serial_lane`       | `SerialLane`               | 1               | FIFO-ordered `AsyncWritableFile` Append/Flush/Sync/Close                     |
+| `foreground_db_scheduler` | `ExecutorSchedulerAdapter` | routing only    | `AsyncDB` entry point — submits to CPU pool; `AsyncOp` resumes inline        |
 
 ### Why Separate Lanes?
 
@@ -159,14 +159,15 @@ Without separation, a long-running compaction would occupy the same execution la
 - **Compaction never blocks foreground progress** — compaction stays isolated on its own lane
 - **Single-flight compaction is enforced by `CompactionController`**, not by thread pool availability
 
-### The `runtime_scheduler` Router
+### The `foreground_db_scheduler` Router
 
-Every `AsyncOp` receives an `IScheduler*`. At `await_suspend()`:
+Every `AsyncDB` operation wraps work in an `AsyncOp` that receives the `foreground_db_scheduler`. At `await_suspend()`:
 
-1. `scheduler->BlockingScheduler()` → `read_executor` — where `st->work()` executes
-2. The completing worker runs the CAS handshake inline and calls `st->handle.resume()` directly when the coroutine has already suspended
+1. `scheduler->BlockingScheduler()` returns the same `foreground_db_scheduler` (itself)
+2. Work is submitted to the shared CPU pool via `ThreadPoolScheduler` worker-local fast paths
+3. The completing worker runs the CAS handshake inline and calls `st->handle.resume()` directly
 
-This keeps the read-heavy hot path on the lightweight read lane while avoiding a second `BlockingExecutor::Submit()` for every operation. If coroutine teardown releases the final `RuntimeBundle` reference on that lane, the custom `AcquireRuntimeBundle()` deleter transfers actual destruction to an external cleanup thread, so the read executor never joins itself.
+This keeps `AsyncDB` hot-path operations on the lightweight CPU pool while avoiding a second queue hop. `AsyncEnv` file I/O operations use a separate `read_scheduler` routed to `read_executor` (4 threads), and ordered writable-file operations use `serial_scheduler` routed to `SerialLane` (1 thread). If coroutine teardown releases the final `RuntimeBundle` reference on a bundle-owned worker, `AcquireRuntimeBundle()` defers actual destruction to an external cleanup thread, preventing any executor from self-joining.
 
 ## 3. Core Abstraction: `AsyncOp<T>`
 
@@ -225,7 +226,7 @@ Database writes (appends to logs or SSTables) must be strictly ordered. `AsyncWr
 
 ### Implementation (Offload Model)
 
-- **Runtime dispatch**: Every call is packaged into a lambda and submitted through the `runtime_scheduler`. Foreground async DB work and the follow-up resume path both run through the read lane today.
+- **Runtime dispatch**: Every `AsyncDB` call is packaged into a lambda and submitted through the `foreground_db_scheduler`, which routes to the shared CPU pool via `ThreadPoolScheduler` worker-local fast paths. `AsyncEnv` file I/O operations route through `read_scheduler` → `read_executor` (4 threads). Order-sensitive writable-file operations route through `serial_scheduler` → `serial_lane` (1 thread).
 - **Simplicity**: This allows for a clean async API without requiring a massive refactor of the core `DBImpl` engine.
 - **Snapshot Safety**: Since SSTables are immutable and MemTables use sequence-number-based MVCC, a `Snapshot` obtained from the sync engine is safe to use across execution boundaries.
 

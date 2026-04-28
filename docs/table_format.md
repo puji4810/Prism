@@ -665,7 +665,7 @@ Get("foo", snapshot_seq=35) → NotFound (sees deletion at seq=30)
 
 ---
 
-## TableCache (Future)
+## TableCache
 
 ```mermaid
 graph LR
@@ -675,11 +675,11 @@ graph LR
         H2[Handle: file_number=2 → Table*]
         HN[Handle: file_number=N → Table*]
     end
-  
+   
     LRU --> H1
     LRU --> H2
     LRU --> HN
-  
+   
     H1 --> T1[Table 1<br/>index in memory]
     H2 --> T2[Table 2<br/>index in memory]
     HN --> TN[Table N<br/>index in memory]
@@ -692,6 +692,8 @@ graph LR
 - Amortize index block parsing
 
 **Eviction:** LRU (Least Recently Used)
+
+**Status:** Implemented — used by `DBImpl` for SSTable access in reads and compaction.
 
 ---
 
@@ -779,5 +781,5 @@ graph TB
 
 ---
 
-**Last Updated:** 2025-11-1
-**Status:** Design documentation (implementation pending)
+**Last Updated:** 2026-04-28
+**Status:** Implemented — matches current `include/table/` source code
