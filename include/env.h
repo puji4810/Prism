@@ -168,18 +168,6 @@ namespace prism
 		// May create the named file if it does not already exist.
 		virtual Result<std::unique_ptr<FileLock>> LockFile(const std::string& fname) = 0;
 
-		// Arrange to run "(*function)(arg)" once in a background thread.
-		//
-		// "function" may run in an unspecified thread.  Multiple functions
-		// added to the same Env may run concurrently in different threads.
-		// I.e., the caller may not assume that background work items are
-		// serialized.
-		virtual void Schedule(void (*function)(void* arg), void* arg) = 0;
-
-		// Start a new thread, invoking "function(arg)" within the new thread.
-		// When "function(arg)" returns, the thread will be destroyed.
-		virtual void StartThread(void (*function)(void* arg), void* arg) = 0;
-
 		// *path is set to a temporary directory that can be used for testing. It may
 		// or may not have just been created. The directory may or may not differ
 		// between runs of the same process, but subsequent calls will return the
@@ -278,6 +266,10 @@ namespace prism
 			}
 			return result.size();
 		}
+
+		// Return a permanently usable file descriptor for direct OS-backed reads when
+		// available. Returns -1 when the implementation cannot safely expose one.
+		virtual int FileDescriptor() const noexcept { return -1; }
 	};
 
 	// A file abstraction for sequential writing.  The implementation
@@ -378,8 +370,6 @@ namespace prism
 		Result<std::size_t> GetFileSize(const std::string& f) override { return target_->GetFileSize(f); }
 		Status RenameFile(const std::string& s, const std::string& t) override { return target_->RenameFile(s, t); }
 		Result<std::unique_ptr<FileLock>> LockFile(const std::string& f) override { return target_->LockFile(f); }
-		void Schedule(void (*f)(void*), void* a) override { return target_->Schedule(f, a); }
-		void StartThread(void (*f)(void*), void* a) override { return target_->StartThread(f, a); }
 		Result<std::string> GetTestDirectory() override { return target_->GetTestDirectory(); }
 		Result<std::unique_ptr<Logger>> NewLogger(const std::string& fname) override { return target_->NewLogger(fname); }
 		uint64_t NowMicros() override { return target_->NowMicros(); }

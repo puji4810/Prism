@@ -6,14 +6,19 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 
+// Forward-declared to avoid exposing internal runtime types in public header.
+// Defined in src/runtime_executor.h; included in src/async_env.cpp.
+namespace prism { struct RuntimeBundle; }
+
 namespace prism
 {
+	class IoReactor;
+
 	// AsyncRandomAccessFile: Asynchronous wrapper for random-access file reads.
 	//
 	// Design:
@@ -49,15 +54,16 @@ namespace prism
 		AsyncOp<Result<std::string>> ReadAtStringAsync(uint64_t offset, std::size_t n) const;
 
 	private:
-		ThreadPoolScheduler* scheduler_;
+		std::shared_ptr<RuntimeBundle> runtime_;
 		std::shared_ptr<RandomAccessFile> file_;
+		IoReactor* reactor_{ nullptr };
 	};
 
 	// AsyncWritableFile: Asynchronous wrapper for writable files (append-only).
 	//
 	// Serialization Contract:
 	// - All async operations execute in FIFO (submission) order regardless of thread scheduling.
-	// - A ticket-based SerialState ensures each lambda waits until prior ops complete before running.
+	// - RuntimeBundle::serial_scheduler provides one-at-a-time execution without blocking shared workers.
 	// - After CloseAsync completes, subsequent Append/Flush/Sync ops return IOError("file closed").
 	//
 	// Lifetime: file_ is held via shared_ptr; wrapper may be destroyed while ops are in-flight.
@@ -79,26 +85,25 @@ namespace prism
 		AsyncOp<Status> CloseAsync();
 
 	private:
-		// SerialState: Ticket-queue for FIFO ordering. Shared by all lambdas submitted from this wrapper.
-		struct SerialState
+		struct WriteState
 		{
 			std::mutex mu;
-			std::condition_variable cv;
-			uint64_t next_ticket{ 0 }; // incremented at call-time (under mu)
-			uint64_t now_serving{ 0 }; // incremented after each op completes
 			bool closed{ false };
 		};
 
-		ThreadPoolScheduler* scheduler_;
+		std::shared_ptr<RuntimeBundle> runtime_;
 		std::shared_ptr<WritableFile> file_;
-		std::shared_ptr<SerialState> serial_;
+		std::shared_ptr<WriteState> write_state_;
 	};
 
 	// AsyncEnv: Asynchronous filesystem operations.
 	//
 	// Current Implementation:
 	// - Wraps synchronous Env operations in thread pool tasks
-	// - All operations block a thread pool thread during execution
+	// - Random-access file factories may select the reactor-backed read path when available
+	// - Write-side file creation plus metadata ops stay on blocking workers; append/flush/sync/close
+	//   remain serialized on AsyncWritableFile's dedicated lane
+	// - Reactor offload for write-side operations is intentionally deferred
 	//
 	// Future Migration Path:
 	// - Replace with io_uring (Linux) / kqueue (BSD) / IOCP (Windows)
@@ -119,7 +124,7 @@ namespace prism
 		AsyncOp<Result<std::size_t>> GetFileSizeAsync(std::string fname);
 
 	private:
-		ThreadPoolScheduler* scheduler_;
+		std::shared_ptr<RuntimeBundle> runtime_;
 		Env* env_;
 	};
 }

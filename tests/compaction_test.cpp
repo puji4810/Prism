@@ -27,41 +27,6 @@ using namespace prism;
 
 namespace
 {
-	class BlockingScheduleEnv final: public EnvWrapper
-	{
-	public:
-		explicit BlockingScheduleEnv(Env* target)
-		    : EnvWrapper(target)
-		{
-		}
-
-		void ReleaseScheduledWork()
-		{
-			std::lock_guard<std::mutex> lock(mu_);
-			hold_ = false;
-			cv_.notify_all();
-		}
-
-		int ScheduledCalls() const { return scheduled_calls_.load(std::memory_order_acquire); }
-
-		void Schedule(void (*function)(void*), void* arg) override
-		{
-			scheduled_calls_.fetch_add(1, std::memory_order_release);
-			std::thread([this, function, arg] {
-				std::unique_lock<std::mutex> lock(mu_);
-				cv_.wait(lock, [this] { return !hold_; });
-				lock.unlock();
-				function(arg);
-			}).detach();
-		}
-
-	private:
-		std::mutex mu_;
-		std::condition_variable cv_;
-		bool hold_ = true;
-		std::atomic<int> scheduled_calls_{ 0 };
-	};
-
 	class FailingTableEnv final: public EnvWrapper
 	{
 	public:
@@ -267,53 +232,6 @@ TEST_F(CompactionTest, MultipleIteratorsPinIndependently)
 
 	int refs_final = impl->TEST_CurrentVersionRefs();
 	EXPECT_EQ(refs_final, base_refs) << "After all iterators are destroyed refs should be back to baseline";
-}
-
-TEST_F(CompactionTest, SingleBackgroundCompactionScheduled)
-{
-	BlockingScheduleEnv env(Env::Default());
-	Options opts;
-	opts.env = &env;
-	opts.create_if_missing = true;
-	opts.write_buffer_size = 128;
-
-	auto open = DBImpl::OpenInternal(opts, kDbName);
-	ASSERT_TRUE(open.has_value()) << open.error().ToString();
-	auto db = std::move(open.value());
-	auto* impl = db.get();
-
-	for (int i = 0; i < 64; ++i)
-	{
-		ASSERT_TRUE(db->Put("seed" + std::to_string(i), std::string(64, 'v')).ok());
-		if (impl->TEST_HasImmutableMemTable())
-		{
-			break;
-		}
-	}
-	ASSERT_TRUE(impl->TEST_HasImmutableMemTable());
-
-	std::atomic<bool> stop{ false };
-	std::vector<std::thread> writers;
-	for (int i = 0; i < 3; ++i)
-	{
-		writers.emplace_back([&db, &stop, i] {
-			int seq = 0;
-			while (!stop.load(std::memory_order_acquire))
-			{
-				db->Put("blocked" + std::to_string(i) + "_" + std::to_string(seq++), "x");
-			}
-		});
-	}
-
-	std::this_thread::sleep_for(std::chrono::milliseconds(80));
-	EXPECT_EQ(env.ScheduledCalls(), 1);
-
-	env.ReleaseScheduledWork();
-	stop.store(true, std::memory_order_release);
-	for (std::thread& writer : writers)
-	{
-		writer.join();
-	}
 }
 
 TEST_F(CompactionTest, BackgroundErrorBecomesSticky)

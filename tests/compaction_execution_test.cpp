@@ -504,4 +504,57 @@ namespace prism
 		    << "old values at seq 1 and 2 should have been reclaimed";
 	}
 
+	// ── Error recovery ─────────────────────────────────────────────────────────
+	//
+	// Verifies that after a failed compaction (table-write failure), the system
+	// can recover and run a subsequent compaction successfully.
+
+	TEST_F(CompactionExecutionTest, CompactionRecoversAfterFailedOutput)
+	{
+		FailingTableEnv env(Env::Default());
+		Options options;
+		options.env = &env;
+		Open(options);
+
+		// Create 4 L0 files with overlapping key ranges so that PickCompaction
+		// picks ALL of them as a single compaction unit (matching the pattern
+		// used by MergesInputsWithoutDroppingTombstones).  Non-overlapping
+		// ranges would let the picker advance compact_pointer_ between the
+		// first (failed) and second call, compacting different subsets.
+		AddTableFileLocked(0, { Entry{ "k", 5, kTypeValue, "v_a" } });
+		AddTableFileLocked(0, { Entry{ "k", 4, kTypeValue, "v_b" } });
+		AddTableFileLocked(0, { Entry{ "k", 3, kTypeValue, "v_c" } });
+		AddTableFileLocked(0, { Entry{ "k", 2, kTypeValue, "v_d" } });
+
+		const int l0_before = static_cast<int>(impl_->TEST_LevelFilesCopy(0).size());
+		ASSERT_EQ(l0_before, 4);
+
+		// Phase 1: injected failure — compaction must fail and clean up.
+		env.SetFailTableWrites(true);
+		Status s = RunPickedCompaction();
+		EXPECT_FALSE(s.ok());
+		EXPECT_TRUE(impl_->TEST_PendingOutputsEmpty());
+
+		// After failure, L0 files should still be present (version set unchanged).
+		EXPECT_EQ(static_cast<int>(impl_->TEST_LevelFilesCopy(0).size()), 4);
+
+		// Phase 2: clear the failure and run compaction again.
+		env.SetFailTableWrites(false);
+		s = RunPickedCompaction();
+		ASSERT_TRUE(s.ok()) << "compaction failed to recover: " << s.ToString();
+
+		// The second compaction should consume ALL 4 L0 files and produce L1 output.
+		EXPECT_LT(static_cast<int>(impl_->TEST_LevelFilesCopy(0).size()), 4)
+		    << "L0 files should decrease after recovery compaction";
+		EXPECT_GE(static_cast<int>(impl_->TEST_LevelFilesCopy(1).size()), 1)
+		    << "Recovery compaction should produce at least one L1 output file";
+
+		// Verify that the compacted data is accessible in the output level.
+		{
+			const std::vector<ParsedLevelEntry> entries = ReadLevelEntriesForKey(1, "k");
+			EXPECT_GE(static_cast<int>(entries.size()), 1)
+			    << "key 'k' should be present in L1 after recovery compaction";
+		}
+	}
+
 } // namespace prism

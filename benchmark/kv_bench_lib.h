@@ -121,7 +121,6 @@ namespace prism::bench
 		std::size_t max_inflight_observed = 0;
 		std::size_t max_client_inflight = 0;
 		int write_sync = 0;
-		int bg_scheduled = 0;
 		int bg_sleeps = 0;
 	};
 
