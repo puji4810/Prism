@@ -191,6 +191,62 @@ namespace
 		EXPECT_EQ(prism::bench::BenchName(prism::bench::BenchMode::kCompactionOverlap), "compaction_overlap");
 	}
 
+	TEST(KVBenchAsyncMatrixTest, PhaseDefaults)
+	{
+		prism::bench::Config cfg;
+		EXPECT_EQ(cfg.phase, prism::bench::PhaseMode::kFull);
+	}
+
+	TEST(KVBenchAsyncMatrixTest, PhaseParsing)
+	{
+		char* argv_full[] = { const_cast<char*>("test"), const_cast<char*>("--phase=full") };
+		auto cfg_full = prism::bench::ParseArgs(2, argv_full);
+		EXPECT_EQ(cfg_full.phase, prism::bench::PhaseMode::kFull);
+
+		char* argv_prefill[] = { const_cast<char*>("test"), const_cast<char*>("--phase=prefill-only") };
+		auto cfg_prefill = prism::bench::ParseArgs(2, argv_prefill);
+		EXPECT_EQ(cfg_prefill.phase, prism::bench::PhaseMode::kPrefillOnly);
+
+		char* argv_warmup[] = { const_cast<char*>("test"), const_cast<char*>("--phase=warmup-only") };
+		auto cfg_warmup = prism::bench::ParseArgs(2, argv_warmup);
+		EXPECT_EQ(cfg_warmup.phase, prism::bench::PhaseMode::kWarmupOnly);
+
+		char* argv_steady[] = { const_cast<char*>("test"), const_cast<char*>("--phase=steady-state") };
+		auto cfg_steady = prism::bench::ParseArgs(2, argv_steady);
+		EXPECT_EQ(cfg_steady.phase, prism::bench::PhaseMode::kSteadyState);
+
+		char* argv_compaction[] = { const_cast<char*>("test"), const_cast<char*>("--phase=compaction-overlap-only") };
+		auto cfg_compaction = prism::bench::ParseArgs(2, argv_compaction);
+		EXPECT_EQ(cfg_compaction.phase, prism::bench::PhaseMode::kCompactionOverlapOnly);
+	}
+
+	TEST(KVBenchAsyncMatrixTest, PhaseNameAllValues)
+	{
+		EXPECT_EQ(prism::bench::PhaseName(prism::bench::PhaseMode::kFull), "full");
+		EXPECT_EQ(prism::bench::PhaseName(prism::bench::PhaseMode::kPrefillOnly), "prefill-only");
+		EXPECT_EQ(prism::bench::PhaseName(prism::bench::PhaseMode::kWarmupOnly), "warmup-only");
+		EXPECT_EQ(prism::bench::PhaseName(prism::bench::PhaseMode::kSteadyState), "steady-state");
+		EXPECT_EQ(prism::bench::PhaseName(prism::bench::PhaseMode::kCompactionOverlapOnly), "compaction-overlap-only");
+	}
+
+	TEST(KVBenchAsyncMatrixTest, PhaseAutoEnablesPrefill)
+	{
+		// Phase modes should auto-enable prefill when prefill=-1 (default)
+		char* argv[] = { const_cast<char*>("test"), const_cast<char*>("--phase=steady-state") };
+		auto cfg = prism::bench::ParseArgs(2, argv);
+		EXPECT_EQ(cfg.phase, prism::bench::PhaseMode::kSteadyState);
+		EXPECT_EQ(cfg.prefill, 1);
+	}
+
+	TEST(KVBenchAsyncMatrixTest, PhaseCompactionOverlapForcesMode)
+	{
+		// compaction-overlap-only should force kCompactionOverlap mode
+		char* argv[] = { const_cast<char*>("test"), const_cast<char*>("--phase=compaction-overlap-only") };
+		auto cfg = prism::bench::ParseArgs(2, argv);
+		EXPECT_EQ(cfg.phase, prism::bench::PhaseMode::kCompactionOverlapOnly);
+		EXPECT_EQ(cfg.mode, prism::bench::BenchMode::kCompactionOverlap);
+	}
+
 	TEST(KVBenchAsyncMatrixTest, InflightZeroClampsToOne)
 	{
 		char* argv[] = { const_cast<char*>("test"), const_cast<char*>("--inflight_per_client=0") };
