@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <stdexcept>
 #include <string>
 
@@ -44,6 +45,36 @@ namespace prism::tests
 		// Submit executes `job()` immediately before returning.
 		// priority is intentionally ignored (single-threaded inline execution has no ordering concept).
 		void Submit(Job job, std::size_t /*priority*/ = 0) override { job(); }
+	};
+
+	class ManualScheduler: public IScheduler
+	{
+	public:
+		void Submit(Job job, std::size_t /*priority*/ = 0) override { queue_.push_back(std::move(job)); }
+
+		bool Empty() const { return queue_.empty(); }
+		std::size_t Size() const { return queue_.size(); }
+
+		void RunOne()
+		{
+			Job job = std::move(queue_.front());
+			queue_.pop_front();
+			job();
+		}
+
+	private:
+		std::deque<Job> queue_;
+	};
+
+	class SplitManualScheduler: public IScheduler
+	{
+	public:
+		void Submit(Job job, std::size_t priority = 0) override { continuation.Submit(std::move(job), priority); }
+		IScheduler* BlockingScheduler() noexcept override { return &blocking; }
+		IScheduler* ContinuationScheduler() noexcept override { return &continuation; }
+
+		ManualScheduler blocking;
+		ManualScheduler continuation;
 	};
 
 	// ---------------------------------------------------------------------------
@@ -230,6 +261,29 @@ namespace prism::tests
 		int result = task.SyncWait();
 		EXPECT_EQ(result, 7);
 		EXPECT_EQ(side_effects.load(), 2);
+	}
+
+	TEST(AsyncOpTest, BlockingWorkResumesCoroutineInline)
+	{
+		SplitManualScheduler sched;
+
+		auto task = [&]() -> Task<int> {
+			int result = co_await AsyncOp<int>(sched, [] { return 99; });
+			co_return result;
+		}();
+
+		ASSERT_EQ(sched.blocking.Size(), 1u);
+		EXPECT_TRUE(sched.continuation.Empty());
+
+		sched.blocking.RunOne();
+
+		EXPECT_TRUE(sched.blocking.Empty());
+		EXPECT_TRUE(sched.continuation.Empty())
+		    << "hot-path resume should not bounce through a continuation queue";
+
+		auto result = task.SyncWaitFor(std::chrono::milliseconds(1));
+		ASSERT_TRUE(result.has_value());
+		EXPECT_EQ(result.value(), 99);
 	}
 
 } // namespace prism::tests

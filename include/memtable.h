@@ -59,7 +59,6 @@ namespace prism
 		using Table = SkipList<const char*, KeyComparator>;
 		KeyComparator comparator_;
 		std::atomic<int> refs_;
-
 		Arena arena_;
 		Table table_;
 	};
