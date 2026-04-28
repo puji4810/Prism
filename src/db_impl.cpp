@@ -806,8 +806,16 @@ namespace prism
 
 	void DBImpl::InstallSuperVersion()
 	{
-		// Precondition: caller holds unique_lock(mutex_). Publication and retirement are serialized by
+		// Precondition: caller holds unique_lock(mutex_). Publication is serialized by
 		// the DB mutex so readers never observe partially constructed state.
+		//
+		// Acquire-gap safety: retired SuperVersions are NEVER Unref'd during normal
+		// operation — they are accumulated and drained only in ~DBImpl() after all
+		// background work has quiesced.  This guarantees that a reader which loaded
+		// super_version_ before the exchange can always safely call Ref() because
+		// the SuperVersion is never freed while the DB is live.  The memory cost is
+		// bounded by the number of state changes (memtable rotations + compactions),
+		// typically a few hundred objects across the DB lifetime.
 		SuperVersion* sv = new SuperVersion;
 		sv->mem = mem_;
 		if (sv->mem != nullptr)
@@ -825,21 +833,13 @@ namespace prism
 			sv->current->Ref();
 		}
 		sv->sequence = visible_sequence_.load(std::memory_order_acquire);
-		sv->Ref();
-
-		const int to_clean = 1 - retired_index_;
-		for (SuperVersion* retired : retired_super_versions_[to_clean])
-		{
-			retired->Unref();
-		}
-		retired_super_versions_[to_clean].clear();
+		sv->Ref(); // publication reference — released in ~DBImpl()
 
 		SuperVersion* old = super_version_.exchange(sv, std::memory_order_acq_rel);
 		if (old != nullptr)
 		{
 			retired_super_versions_[retired_index_].push_back(old);
 		}
-		retired_index_ = to_clean;
 	}
 
 	Status DBImpl::CloseLogFile()
@@ -1282,7 +1282,6 @@ namespace prism
 
 		// Per-key tracking state for oldest-live-snapshot-aware drop decisions.
 		std::string current_user_key;
-		// ::std::string_view current_user_key;
 		bool has_current_user_key = false;
 		SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
 
