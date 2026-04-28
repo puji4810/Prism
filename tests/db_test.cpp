@@ -5,7 +5,9 @@
 
 #include <gtest/gtest.h>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -15,6 +17,20 @@ namespace
 {
 	// Characters used for large value generation
 	const char kValueChar = 'X';
+
+	bool WaitUntil(const std::function<bool()>& condition, std::chrono::milliseconds timeout)
+	{
+		const auto deadline = std::chrono::steady_clock::now() + timeout;
+		while (std::chrono::steady_clock::now() < deadline)
+		{
+			if (condition())
+			{
+				return true;
+			}
+			std::this_thread::yield();
+		}
+		return condition();
+	}
 }
 
 // ===========================================================================
@@ -1076,4 +1092,144 @@ TEST_F(DBTest, ShutdownRejectsStaleSnapshotDeterministically)
 	auto plain = db2->Get("stale_key");
 	ASSERT_TRUE(plain.has_value()) << plain.error().ToString();
 	EXPECT_EQ("after", plain.value());
+}
+
+TEST_F(DBTest, GetSurvivesMemtableRotationRace)
+{
+	Options opts;
+	opts.create_if_missing = true;
+	opts.write_buffer_size = 128;
+
+	auto open = DBImpl::OpenInternal(opts, "test_db");
+	ASSERT_TRUE(open.has_value()) << open.error().ToString();
+	auto db = std::move(open.value());
+	auto* impl = db.get();
+
+	impl->TEST_HoldBackgroundCompaction(true);
+	ASSERT_TRUE(db->Put("hot_key", "hot_value").ok());
+	ASSERT_NE(impl->TEST_CurrentSuperVersion(), nullptr);
+
+	const int baseline_refs = impl->TEST_CurrentVersionRefs();
+	std::atomic<bool> reader_started{ false };
+	std::atomic<bool> rotation_done{ false };
+	std::atomic<bool> stop{ false };
+	std::atomic<int> post_rotation_reads{ 0 };
+	std::atomic<int> bad_reads{ 0 };
+	std::atomic<int> null_super_versions{ 0 };
+
+	std::thread reader([&] {
+		reader_started.store(true, std::memory_order_release);
+		while (!stop.load(std::memory_order_acquire))
+		{
+			if (impl->TEST_CurrentSuperVersion() == nullptr)
+			{
+				null_super_versions.fetch_add(1, std::memory_order_relaxed);
+			}
+
+			auto result = db->Get("hot_key");
+			if (!result.has_value() || result.value() != "hot_value")
+			{
+				bad_reads.fetch_add(1, std::memory_order_relaxed);
+			}
+
+			if (rotation_done.load(std::memory_order_acquire))
+			{
+				post_rotation_reads.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	});
+
+	ASSERT_TRUE(WaitUntil([&] { return reader_started.load(std::memory_order_acquire); }, std::chrono::milliseconds(500)));
+
+	for (int i = 0; i < 64 && !impl->TEST_HasImmutableMemTable(); ++i)
+	{
+		ASSERT_TRUE(db->Put("fill_rotation_" + std::to_string(i), std::string(64, 'r')).ok());
+	}
+	ASSERT_TRUE(impl->TEST_HasImmutableMemTable());
+	ASSERT_NE(impl->TEST_CurrentSuperVersion(), nullptr);
+
+	rotation_done.store(true, std::memory_order_release);
+	ASSERT_TRUE(WaitUntil(
+	    [&] { return post_rotation_reads.load(std::memory_order_acquire) >= 200; }, std::chrono::milliseconds(2000)));
+
+	stop.store(true, std::memory_order_release);
+	reader.join();
+
+	impl->TEST_HoldBackgroundCompaction(false);
+	ASSERT_TRUE(WaitUntil([&] { return !impl->TEST_HasImmutableMemTable(); }, std::chrono::milliseconds(5000)));
+
+	EXPECT_EQ(0, bad_reads.load(std::memory_order_acquire));
+	EXPECT_EQ(0, null_super_versions.load(std::memory_order_acquire));
+	EXPECT_LE(impl->TEST_CurrentVersionRefs(), baseline_refs);
+}
+
+TEST_F(DBTest, GetSurvivesCompactionVersionTurnoverRace)
+{
+	Options opts;
+	opts.create_if_missing = true;
+	opts.write_buffer_size = 128;
+
+	auto open = DBImpl::OpenInternal(opts, "test_db");
+	ASSERT_TRUE(open.has_value()) << open.error().ToString();
+	auto db = std::move(open.value());
+	auto* impl = db.get();
+	impl->TEST_HoldBackgroundCompaction(true);
+
+	ASSERT_TRUE(db->Put("compaction_hot", "stable_value").ok());
+	for (int i = 0; i < 64 && !impl->TEST_HasImmutableMemTable(); ++i)
+	{
+		ASSERT_TRUE(db->Put("compaction_fill_" + std::to_string(i), std::string(32, kValueChar)).ok());
+	}
+	ASSERT_TRUE(impl->TEST_HasImmutableMemTable());
+
+	SuperVersion* initial_sv = impl->TEST_CurrentSuperVersion();
+	ASSERT_NE(initial_sv, nullptr);
+	const int baseline_refs = impl->TEST_CurrentVersionRefs();
+
+	std::atomic<bool> reader_started{ false };
+	std::atomic<bool> turnover_done{ false };
+	std::atomic<bool> stop{ false };
+	std::atomic<int> post_turnover_reads{ 0 };
+	std::atomic<int> bad_reads{ 0 };
+	std::atomic<int> null_super_versions{ 0 };
+
+	std::thread reader([&] {
+		reader_started.store(true, std::memory_order_release);
+		while (!stop.load(std::memory_order_acquire))
+		{
+			if (impl->TEST_CurrentSuperVersion() == nullptr)
+			{
+				null_super_versions.fetch_add(1, std::memory_order_relaxed);
+			}
+
+			auto result = db->Get("compaction_hot");
+			if (!result.has_value() || result.value() != "stable_value")
+			{
+				bad_reads.fetch_add(1, std::memory_order_relaxed);
+			}
+
+			if (turnover_done.load(std::memory_order_acquire))
+			{
+				post_turnover_reads.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	});
+
+	ASSERT_TRUE(WaitUntil([&] { return reader_started.load(std::memory_order_acquire); }, std::chrono::milliseconds(500)));
+
+	Status s = impl->TEST_RunBackgroundCompactionOnce();
+	ASSERT_TRUE(s.ok()) << s.ToString();
+	ASSERT_FALSE(impl->TEST_HasImmutableMemTable());
+	ASSERT_NE(impl->TEST_CurrentSuperVersion(), initial_sv) << "Flush install should publish a new SuperVersion";
+
+	turnover_done.store(true, std::memory_order_release);
+	ASSERT_TRUE(WaitUntil(
+	    [&] { return post_turnover_reads.load(std::memory_order_acquire) >= 200; }, std::chrono::milliseconds(2000)));
+
+	stop.store(true, std::memory_order_release);
+	reader.join();
+
+	EXPECT_EQ(0, bad_reads.load(std::memory_order_acquire));
+	EXPECT_EQ(0, null_super_versions.load(std::memory_order_acquire));
+	EXPECT_LE(impl->TEST_CurrentVersionRefs(), baseline_refs);
 }
