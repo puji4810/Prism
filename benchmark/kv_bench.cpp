@@ -14,6 +14,14 @@
 
 #include <unistd.h>
 
+// VTune ITT instrumentation (optional -- compiles to no-ops when not available)
+#if __has_include(<ittnotify.h>)
+#include <ittnotify.h>
+#else
+inline void __itt_pause(void) {}
+inline void __itt_resume(void) {}
+#endif
+
 namespace prism::bench
 {
 	static void RunSyncBenchmark(const Config& cfg, const std::vector<std::vector<std::string>>& keys)
@@ -51,7 +59,9 @@ namespace prism::bench
 		    = (cfg.prefill == 1) || (cfg.prefill == -1 && (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0));
 		if (should_prefill_sync)
 		{
+			if (cfg.profile_pause_prefill) __itt_pause();
 			Prefill(db, keys, cfg.ops_per_client, cfg.value_size);
+			if (cfg.profile_pause_prefill) __itt_resume();
 		}
 
 		if (cfg.mode == BenchMode::kDiskRead)
@@ -172,16 +182,19 @@ namespace prism::bench
 
 		if (should_prefill)
 		{
+			if (cfg.profile_pause_prefill) __itt_pause();
 			Options prefill_options = options;
 			prefill_options.env = env_to_use;
 			auto pre = Database::Open(prefill_options, dir);
 			if (!pre.has_value())
 			{
 				std::fprintf(stderr, "async prefill open failed: %s\n", pre.error().ToString().c_str());
+				if (cfg.profile_pause_prefill) __itt_resume();
 				return;
 			}
 			auto pre_db = std::move(pre.value());
 			Prefill(pre_db, keys, cfg.ops_per_client, cfg.value_size);
+			if (cfg.profile_pause_prefill) __itt_resume();
 		}
 
 		auto open_sem = std::binary_semaphore(0);
