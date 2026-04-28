@@ -2005,96 +2005,41 @@ namespace prism
 
 	std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& read_options)
 	{
-		// Phase A (SuperVersion-lite): build a stable read view, then release the DB lock.
-		//
-		// TODO(phase-b): Replace this with a real Version/VersionSet + SuperVersion.
-		// - Needed for compaction and safe table file deletion (iterators must pin versions/files).
-		// TODO(async-scan): Provide AsyncIterator / NextAsync() to avoid blocking scans.
-		struct SuperVersionLite
+		SuperVersion* sv = super_version_.load(std::memory_order_acquire);
+		if (sv == nullptr)
 		{
-			struct TableFileRef
-			{
-				uint64_t number;
-				uint64_t file_size;
-			};
-
-			MemTable* mem = nullptr;
-			MemTable* imm = nullptr;
-			Version* current = nullptr;
-			std::vector<TableFileRef> files;
-			SequenceNumber snapshot = 0;
-		};
-
-		auto release_sv = [](void*, void* arg) {
-			auto* sv = reinterpret_cast<SuperVersionLite*>(arg);
-			if (sv->current != nullptr)
-			{
-				sv->current->Unref();
-			}
-			if (sv->imm != nullptr)
-			{
-				sv->imm->Unref();
-			}
-			if (sv->mem != nullptr)
-			{
-				sv->mem->Unref();
-			}
-			delete sv;
-		};
-
-		SuperVersionLite* sv = nullptr;
-		{
-			std::shared_lock<std::shared_mutex> lock(mutex_);
-			sv = new SuperVersionLite;
-			auto snapshot_result = ResolveSnapshotSequence(read_options.snapshot_handle);
-			if (!snapshot_result.has_value())
-			{
-				delete sv;
-				return std::unique_ptr<Iterator>(NewErrorIterator(snapshot_result.error()));
-			}
-			sv->snapshot = snapshot_result.value();
-
-			sv->mem = mem_;
-			if (sv->mem != nullptr)
-			{
-				sv->mem->Ref();
-			}
-
-			sv->imm = imm_;
-			if (sv->imm != nullptr)
-			{
-				sv->imm->Ref();
-			}
-
-			sv->current = versions_->current();
-			sv->current->Ref();
-
-			for (int level = 0; level < kNumLevels; ++level)
-			{
-				const auto& level_files = sv->current->files(level);
-				for (const FileMetaData* file : level_files)
-				{
-					sv->files.push_back(SuperVersionLite::TableFileRef{ file->number, file->file_size });
-				}
-			}
+			return std::unique_ptr<Iterator>(NewErrorIterator(Status::Corruption("database not initialized")));
 		}
+		sv->Ref();
+
+		auto snapshot_result = ResolveSnapshotSequence(read_options.snapshot_handle);
+		if (!snapshot_result.has_value())
+		{
+			sv->Unref();
+			return std::unique_ptr<Iterator>(NewErrorIterator(snapshot_result.error()));
+		}
+		SequenceNumber snapshot = snapshot_result.value();
 
 		std::vector<Iterator*> children;
-		children.reserve(sv->files.size() + 2);
+		children.reserve(2 + kNumLevels);
 
 		children.push_back(sv->mem->NewIterator());
 		if (sv->imm != nullptr)
 		{
 			children.push_back(sv->imm->NewIterator());
 		}
-		for (const auto& file : sv->files)
+		for (int level = 0; level < kNumLevels; ++level)
 		{
-			children.push_back(table_cache_->NewIterator(read_options, file.number, file.file_size));
+			for (const FileMetaData* file : sv->current->files(level))
+			{
+				children.push_back(table_cache_->NewIterator(read_options, file->number, file->file_size));
+			}
 		}
 
 		Iterator* internal_iter = NewMergingIterator(&internal_comparator_, children.data(), static_cast<int>(children.size()));
-		auto iter = std::make_unique<DBIter>(internal_comparator_.user_comparator(), internal_iter, sv->snapshot);
-		iter->RegisterCleanup(release_sv, nullptr, sv);
+		auto iter = std::make_unique<DBIter>(internal_comparator_.user_comparator(), internal_iter, snapshot);
+		iter->RegisterCleanup(
+		    [](void*, void* arg) { reinterpret_cast<SuperVersion*>(arg)->Unref(); }, nullptr, sv);
 		return iter;
 	}
 
@@ -2135,7 +2080,14 @@ namespace prism
 	int DBImpl::TEST_CurrentVersionRefs() const
 	{
 		std::lock_guard<std::shared_mutex> lock(mutex_);
-		return versions_->current()->TEST_Refs();
+		int refs = versions_->current()->TEST_Refs();
+		SuperVersion* sv = super_version_.load(std::memory_order_acquire);
+		if (sv != nullptr && sv->current == versions_->current())
+		{
+			refs -= 1;
+			refs += sv->refs_.load(std::memory_order_acquire) - 1;
+		}
+		return refs;
 	}
 
 	bool DBImpl::TEST_HasImmutableMemTable() const
