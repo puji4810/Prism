@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -35,34 +36,36 @@ namespace prism
 		virtual IScheduler* ContinuationScheduler() noexcept { return this; }
 	};
 
-	// ThreadPoolScheduler: Multi-queue dispatch thread pool with priority and delayed task support.
+	// ThreadPoolScheduler: Worker-local thread pool with fallback priority and delayed task support.
 	//
-	// Architecture (push-based multi-queue dispatch):
+	// Architecture (split-role topology):
 	// - N worker threads (WorkThread), each with its own task queue
-	// - 1 priority dispatcher thread: processes priority_queue_, dispatches to idle workers
+	// - Foreground immediate Submit() pushes directly to worker-local queues
+	// - 1 priority dispatcher thread: fallback/background path only
 	// - 1 lazy dispatcher thread: processes delayed tasks (lazy_queue_), dispatches when ready
-	// - pending_list_: tracks idle workers ready to accept tasks
+	// - pending_list_: tracks idle workers for fallback/background dispatch only
 	//
 	// Task Submission Paths:
-	// 1. Submit(job, priority): Immediate execution via priority queue
-	//    - Higher priority tasks execute first
-	//    - Dispatcher tries to find an idle worker (TryDispatch)
-	//    - If no idle workers, waits until one becomes available
+	// 1. Submit(job, priority): Immediate execution
+	//    - priority == 0: throughput-first fast path to worker-local queue
+	//      * worker self-submit -> same worker queue
+	//      * external submit -> least-loaded worker queue
+	//    - priority > 0: fallback/background priority queue
 	//
 	// 2. SubmitAfter(deadline, job): Delayed execution
 	//    - Stored in lazy_queue_ until deadline expires
-	//    - LazyLoop wakes up at deadline, dispatches task
-	//    - Falls back to priority queue (max priority) if no idle workers
+	//    - LazyLoop wakes up at deadline, pushes directly to a worker when possible
+	//    - Falls back to priority queue (max priority) if direct routing is unsuitable
 	//
 	// 3. SubmitIn(ctx, job): Affinity to specific worker thread
-	//    - Directly pushes to that worker's queue (bypasses dispatchers)
+	//    - Directly pushes to that worker's queue as pinned/non-stealable work
 	//    - Used for continuation on same thread (cache locality)
 	//
-	// Idle Worker Registration & Dispatch:
+	// Fallback Dispatch:
 	// - Each worker has its own queue (mutex-protected deque)
-	// - When a worker becomes idle, it re-enters pending_list_
-	// - Dispatchers assign new tasks to idle workers (PushDispatched)
-	// - QueuedJob: per-task metadata; `dispatched` flag drives pending re-registration.
+	// - Each worker tracks an approximate atomic load counter for fast external balancing
+	// - Workers re-enter pending_list_ only for fallback/background dispatch
+	// - QueuedJob tracks dispatch/pinning metadata; `dispatched` preserves pending-list invariants
 	//
 	// - Shutdown Protocol:
 	// - Exit() sets exit_flag_, wakes all threads.
@@ -163,9 +166,11 @@ namespace prism
 
 			// Push: Direct submission (used by SubmitIn for affinity)
 			void Push(Job job);
+			void Push(Job job, bool stealable);
 
 			// PushDispatched: Submission from dispatcher (marks job as dispatched=true)
 			void PushDispatched(Job job);
+			std::size_t Load() const noexcept;
 
 			// Wake: Signal semaphore (used during shutdown)
 			void Wake();
@@ -177,16 +182,20 @@ namespace prism
 
 		private:
 			void Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept;
+			bool TrySteal(ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state);
 
 			std::counting_semaphore<> semaphore_{ 0z };
 			std::jthread thread_{};
 			std::mutex mutex_;
-			struct QueuedJob
+		struct QueuedJob
 			{
 				Job job;
 				bool dispatched{ false };
+				bool stealable{ true };
+				bool stolen{ false };
 			};
 			std::deque<QueuedJob> queue_;
+			std::atomic<std::size_t> load_{ 0 };
 		};
 
 		struct PriorityTask
@@ -208,6 +217,8 @@ namespace prism
 		// TryDispatch: Find idle worker and assign job. Returns false if no idle workers.
 		// Only consumes `job` on success so callers can safely retry/fallback.
 		bool TryDispatch(Job& job);
+		bool TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable);
+		std::size_t ChooseLeastLoadedWorker() const;
 
 		// PriorityLoop: Dispatcher thread that processes priority_queue_
 		void PriorityLoop();

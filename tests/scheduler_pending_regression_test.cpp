@@ -197,8 +197,106 @@ TEST(SchedulerPendingRegressionTest, WorkerReregistersAfterDispatchedJob)
 	ASSERT_TRUE(WaitFor(step, 2)) << "worker did not re-register after dispatched job (zombie)";
 }
 
+
 // ---------------------------------------------------------------------------
-// TEST 4: Affinity-only jobs must NOT trigger re-registration
+// TEST 4: Worker re-registers after draining a stolen batch to empty
+//
+// Forces one worker to steal multiple jobs from another, then verifies that
+// once the stolen batch drains to empty the thief re-enters pending_list_ and
+// the priority dispatcher can still place queued fallback work.
+// ---------------------------------------------------------------------------
+TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorityDispatch)
+{
+	ThreadPoolScheduler scheduler(2);
+
+	std::atomic<int> victim_ctx_ready{ 0 };
+	std::atomic<int> thief_ctx_ready{ 0 };
+	std::atomic<int> hold_victim_worker{ 0 };
+	std::atomic<int> victim_worker_running{ 0 };
+	std::atomic<int> thief_worker_running{ 0 };
+	std::atomic<int> release_stolen_batch{ 0 };
+	std::atomic<int> stolen_done{ 0 };
+	std::atomic<int> priority_done{ 0 };
+	std::atomic<int> final_job_done{ 0 };
+
+	auto wait_until = [](auto&& pred, std::chrono::milliseconds timeout = 5s) {
+		auto start = std::chrono::steady_clock::now();
+		while (!pred())
+		{
+			if (std::chrono::steady_clock::now() - start > timeout)
+			{
+				return false;
+			}
+			std::this_thread::yield();
+		}
+		return true;
+	};
+
+	ThreadPoolScheduler::Context victim_ctx;
+	ThreadPoolScheduler::Context thief_ctx;
+
+	scheduler.Submit([&scheduler, &victim_ctx, &victim_ctx_ready]() {
+		victim_ctx = scheduler.CaptureContext();
+		ASSERT_TRUE(victim_ctx.IsValid());
+		victim_ctx_ready.store(1, std::memory_order_release);
+	});
+	scheduler.Submit([&scheduler, &thief_ctx, &thief_ctx_ready]() {
+		thief_ctx = scheduler.CaptureContext();
+		ASSERT_TRUE(thief_ctx.IsValid());
+		thief_ctx_ready.store(1, std::memory_order_release);
+	});
+
+	ASSERT_TRUE(WaitFor(victim_ctx_ready, 1)) << "victim context capture stalled";
+	ASSERT_TRUE(WaitFor(thief_ctx_ready, 1)) << "thief context capture stalled";
+	ASSERT_TRUE(victim_ctx.IsValid());
+	ASSERT_TRUE(thief_ctx.IsValid());
+	ASSERT_FALSE(victim_ctx == thief_ctx) << "test requires distinct workers";
+
+	scheduler.SubmitIn(victim_ctx, [&hold_victim_worker, &victim_worker_running]() {
+		victim_worker_running.store(1, std::memory_order_release);
+		while (hold_victim_worker.load(std::memory_order_acquire) == 0)
+		{
+			std::this_thread::yield();
+		}
+	});
+	ASSERT_TRUE(WaitFor(victim_worker_running, 1)) << "victim worker did not stay occupied";
+
+	constexpr int kStolenBatch = 3;
+	for (int i = 0; i < kStolenBatch; ++i)
+	{
+		scheduler.SubmitIn(victim_ctx, [&release_stolen_batch, &stolen_done, &thief_worker_running]() {
+			thief_worker_running.store(1, std::memory_order_release);
+			while (release_stolen_batch.load(std::memory_order_acquire) == 0)
+			{
+				std::this_thread::yield();
+			}
+			stolen_done.fetch_add(1, std::memory_order_release);
+		});
+	}
+
+	hold_victim_worker.store(1, std::memory_order_release);
+
+	scheduler.Submit([&priority_done]() {
+		priority_done.fetch_add(1, std::memory_order_release);
+	}, 1);
+
+	ASSERT_TRUE(WaitFor(thief_worker_running, 1, 5s))
+		<< "expected thief worker to start executing stolen batch";
+
+	release_stolen_batch.store(1, std::memory_order_release);
+
+	ASSERT_TRUE(WaitFor(stolen_done, kStolenBatch, 5s)) << "stolen batch did not fully drain";
+	ASSERT_TRUE(WaitFor(priority_done, 1, 5s))
+		<< "priority work stalled after stolen batch drained to idle";
+
+	scheduler.Submit([&final_job_done]() {
+		final_job_done.fetch_add(1, std::memory_order_release);
+	}, 2);
+	ASSERT_TRUE(WaitFor(final_job_done, 1, 5s)) << "scheduler did not remain dispatchable after regression scenario";
+}
+
+// ---------------------------------------------------------------------------
+// TEST 5: Affinity-only jobs must NOT trigger re-registration
 //
 // Submits only affinity jobs to a pinned worker. The worker must NOT
 // end up double-registered in pending_list_ (which would let the dispatcher

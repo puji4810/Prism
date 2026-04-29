@@ -11,6 +11,7 @@ target("kv_bench")
     add_includedirs(common_includedirs)
     add_includedirs("$(projectdir)/benchmark")
     add_packages("crc32c")
+    add_defines("PRISM_RUNTIME_METRICS")
 
 target("async_bench")
     set_kind("binary")

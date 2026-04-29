@@ -428,49 +428,67 @@ namespace prism::bench
 		return out;
 	}
 
-	Detached RunAsyncMixedLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::string value,
+	namespace
+	{
+		void UpdateMax(std::atomic<std::size_t>& target, std::size_t candidate)
+		{
+			std::size_t observed = target.load(std::memory_order_relaxed);
+			while (candidate > observed)
+			{
+				if (target.compare_exchange_weak(observed, candidate, std::memory_order_relaxed))
+				{
+					break;
+				}
+			}
+		}
+
+		void RecordInflightEnter(std::atomic<std::size_t>& inflight, std::atomic<std::size_t>& max_inflight)
+		{
+			const std::size_t current = inflight.fetch_add(1, std::memory_order_relaxed) + 1;
+			UpdateMax(max_inflight, current);
+		}
+
+		void RecordInflightLeave(std::atomic<std::size_t>& inflight) { inflight.fetch_sub(1, std::memory_order_relaxed); }
+
+		std::size_t SlotOpCount(std::size_t total_ops, int num_slots, int slot_id)
+		{
+			const std::size_t base = total_ops / static_cast<std::size_t>(num_slots);
+			const std::size_t remainder = total_ops % static_cast<std::size_t>(num_slots);
+			return base + (static_cast<std::size_t>(slot_id) < remainder ? 1 : 0);
+		}
+
+		std::size_t SlotStartIndex(std::size_t total_ops, int num_slots, int slot_id)
+		{
+			const std::size_t base = total_ops / static_cast<std::size_t>(num_slots);
+			const std::size_t remainder = total_ops % static_cast<std::size_t>(num_slots);
+			return static_cast<std::size_t>(slot_id) * base
+			    + std::min(static_cast<std::size_t>(slot_id), remainder);
+		}
+	} // namespace
+
+	Detached RunAsyncMixedClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count, std::string value,
 	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
 	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
-			std::mt19937_64 rng(static_cast<uint64_t>(client_id * 1000 + lane_id + 1));
+			std::mt19937_64 rng(static_cast<uint64_t>(client_id * 1000 + slot_id + 1));
 			co_await gate;
-
-			const std::size_t ops_per_lane = cfg.ops_per_client / static_cast<std::size_t>(num_lanes);
-			const std::size_t start_idx = static_cast<std::size_t>(lane_id) * ops_per_lane;
-			const std::size_t end_idx = (lane_id == num_lanes - 1) ? cfg.ops_per_client : start_idx + ops_per_lane;
 
 			if (!cfg.no_latency)
 			{
-				lat.reserve(end_idx - start_idx);
+				lat.reserve(op_count);
 			}
 
-			for (std::size_t i = start_idx; i < end_idx; ++i)
+			for (std::size_t op = 0; op < op_count; ++op)
 			{
+				const std::size_t i = start_index + op;
 				const bool do_read = (cfg.read_ratio > 0) && (static_cast<int>(rng() % 100) < cfg.read_ratio);
 				const uint64_t begin = NowNs();
 
-				const std::size_t cur_global = global_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_global = global_max_inflight.load(std::memory_order_relaxed);
-				while (cur_global > observed_global)
-				{
-					if (global_max_inflight.compare_exchange_weak(observed_global, cur_global, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
-
-				const std::size_t cur_client = client_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_client = client_max_inflight.load(std::memory_order_relaxed);
-				while (cur_client > observed_client)
-				{
-					if (client_max_inflight.compare_exchange_weak(observed_client, cur_client, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
+				RecordInflightEnter(global_inflight, global_max_inflight);
+				RecordInflightEnter(client_inflight, client_max_inflight);
 
 				if (do_read)
 				{
@@ -481,8 +499,8 @@ namespace prism::bench
 					(void)co_await db.PutAsync(WriteOptions(), keys[static_cast<std::size_t>(client_id)][i], value);
 				}
 
-				global_inflight.fetch_sub(1, std::memory_order_relaxed);
-				client_inflight.fetch_sub(1, std::memory_order_relaxed);
+				RecordInflightLeave(global_inflight);
+				RecordInflightLeave(client_inflight);
 
 				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
@@ -499,52 +517,34 @@ namespace prism::bench
 		co_return;
 	}
 
-	Detached RunAsyncDiskReadLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::vector<uint64_t>& lat,
+	Detached RunAsyncDiskReadClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::vector<uint64_t>& lat,
 	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
 	    std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
 			co_await gate;
-
-			const std::size_t ops_per_lane = cfg.ops_per_client / static_cast<std::size_t>(num_lanes);
-			const std::size_t start_idx = static_cast<std::size_t>(lane_id) * ops_per_lane;
-			const std::size_t end_idx = (lane_id == num_lanes - 1) ? cfg.ops_per_client : start_idx + ops_per_lane;
+			(void)slot_id;
 
 			if (!cfg.no_latency)
 			{
-				lat.reserve(end_idx - start_idx);
+				lat.reserve(op_count);
 			}
 
-			for (std::size_t i = start_idx; i < end_idx; ++i)
+			for (std::size_t op = 0; op < op_count; ++op)
 			{
+				const std::size_t i = start_index + op;
 				const uint64_t begin = NowNs();
 
-				const std::size_t cur_global = global_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_global = global_max_inflight.load(std::memory_order_relaxed);
-				while (cur_global > observed_global)
-				{
-					if (global_max_inflight.compare_exchange_weak(observed_global, cur_global, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
-
-				const std::size_t cur_client = client_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_client = client_max_inflight.load(std::memory_order_relaxed);
-				while (cur_client > observed_client)
-				{
-					if (client_max_inflight.compare_exchange_weak(observed_client, cur_client, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
+				RecordInflightEnter(global_inflight, global_max_inflight);
+				RecordInflightEnter(client_inflight, client_max_inflight);
 
 				(void)co_await db.GetAsync(ReadOptions(), keys[static_cast<std::size_t>(client_id)][i]);
 
-				global_inflight.fetch_sub(1, std::memory_order_relaxed);
-				client_inflight.fetch_sub(1, std::memory_order_relaxed);
+				RecordInflightLeave(global_inflight);
+				RecordInflightLeave(client_inflight);
 
 				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
@@ -567,11 +567,11 @@ namespace prism::bench
 		StartGate gate;
 
 		const int effective_inflight = (cfg.inflight_per_client < 1) ? 1 : cfg.inflight_per_client;
-		const int total_lanes = cfg.clients * effective_inflight;
-		DoneState done(total_lanes);
+		const int total_slots = cfg.clients * effective_inflight;
+		DoneState done(total_slots);
 
 		std::vector<std::vector<uint64_t>> lat;
-		lat.resize(static_cast<std::size_t>(total_lanes));
+		lat.resize(static_cast<std::size_t>(total_slots));
 		const std::string value = MakeValue(cfg.value_size);
 
 		std::atomic<std::size_t> global_inflight{ 0 };
@@ -584,15 +584,18 @@ namespace prism::bench
 			client_max_inflight[static_cast<std::size_t>(c)].store(0, std::memory_order_relaxed);
 		}
 
-		int lane_idx = 0;
+		int slot_idx = 0;
 		for (int c = 0; c < cfg.clients; ++c)
 		{
-			for (int l = 0; l < effective_inflight; ++l)
+			for (int slot = 0; slot < effective_inflight; ++slot)
 			{
-				RunAsyncMixedLane(db, gate, done, cfg, keys, c, l, effective_inflight, value, lat[static_cast<std::size_t>(lane_idx)],
+				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
+				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
+				RunAsyncMixedClient(db, gate, done, cfg, keys, c, slot, start_index, op_count, value,
+				    lat[static_cast<std::size_t>(slot_idx)],
 				    global_inflight, global_max_inflight, client_inflight[static_cast<std::size_t>(c)],
 				    client_max_inflight[static_cast<std::size_t>(c)]);
-				++lane_idx;
+				++slot_idx;
 			}
 		}
 
@@ -639,11 +642,11 @@ namespace prism::bench
 		StartGate gate;
 
 		const int effective_inflight = (cfg.inflight_per_client < 1) ? 1 : cfg.inflight_per_client;
-		const int total_lanes = cfg.clients * effective_inflight;
-		DoneState done(total_lanes);
+		const int total_slots = cfg.clients * effective_inflight;
+		DoneState done(total_slots);
 
 		std::vector<std::vector<uint64_t>> lat;
-		lat.resize(static_cast<std::size_t>(total_lanes));
+		lat.resize(static_cast<std::size_t>(total_slots));
 
 		std::atomic<std::size_t> global_inflight{ 0 };
 		std::atomic<std::size_t> global_max_inflight{ 0 };
@@ -655,15 +658,18 @@ namespace prism::bench
 			client_max_inflight[static_cast<std::size_t>(c)].store(0, std::memory_order_relaxed);
 		}
 
-		int lane_idx = 0;
+		int slot_idx = 0;
 		for (int c = 0; c < cfg.clients; ++c)
 		{
-			for (int l = 0; l < effective_inflight; ++l)
+			for (int slot = 0; slot < effective_inflight; ++slot)
 			{
-				RunAsyncDiskReadLane(db, gate, done, cfg, keys, c, l, effective_inflight, lat[static_cast<std::size_t>(lane_idx)],
+				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
+				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
+				RunAsyncDiskReadClient(db, gate, done, cfg, keys, c, slot, start_index, op_count,
+				    lat[static_cast<std::size_t>(slot_idx)],
 				    global_inflight, global_max_inflight, client_inflight[static_cast<std::size_t>(c)],
 				    client_max_inflight[static_cast<std::size_t>(c)]);
-				++lane_idx;
+				++slot_idx;
 			}
 		}
 
@@ -703,56 +709,38 @@ namespace prism::bench
 		return out;
 	}
 
-	Detached RunAsyncSstReadPipelineLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::vector<uint64_t>& lat,
+	Detached RunAsyncSstReadPipelineClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::vector<uint64_t>& lat,
 	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
 	    std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
 			co_await gate;
-
-			const std::size_t ops_per_lane = cfg.ops_per_client / static_cast<std::size_t>(num_lanes);
-			const std::size_t start_idx = static_cast<std::size_t>(lane_id) * ops_per_lane;
-			const std::size_t end_idx = (lane_id == num_lanes - 1) ? cfg.ops_per_client : start_idx + ops_per_lane;
+			(void)slot_id;
 
 			if (!cfg.no_latency)
 			{
-				lat.reserve(end_idx - start_idx);
+				lat.reserve(op_count);
 			}
 
 			// Use fill_cache=false for SST read pipeline benchmark
 			ReadOptions read_opts;
 			read_opts.fill_cache = false;
 
-			for (std::size_t i = start_idx; i < end_idx; ++i)
+			for (std::size_t op = 0; op < op_count; ++op)
 			{
+				const std::size_t i = start_index + op;
 				const uint64_t begin = NowNs();
 
-				const std::size_t cur_global = global_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_global = global_max_inflight.load(std::memory_order_relaxed);
-				while (cur_global > observed_global)
-				{
-					if (global_max_inflight.compare_exchange_weak(observed_global, cur_global, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
-
-				const std::size_t cur_client = client_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_client = client_max_inflight.load(std::memory_order_relaxed);
-				while (cur_client > observed_client)
-				{
-					if (client_max_inflight.compare_exchange_weak(observed_client, cur_client, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
+				RecordInflightEnter(global_inflight, global_max_inflight);
+				RecordInflightEnter(client_inflight, client_max_inflight);
 
 				(void)co_await db.GetAsync(read_opts, keys[static_cast<std::size_t>(client_id)][i]);
 
-				global_inflight.fetch_sub(1, std::memory_order_relaxed);
-				client_inflight.fetch_sub(1, std::memory_order_relaxed);
+				RecordInflightLeave(global_inflight);
+				RecordInflightLeave(client_inflight);
 
 				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
@@ -776,11 +764,11 @@ namespace prism::bench
 		StartGate gate;
 
 		const int effective_inflight = (cfg.inflight_per_client < 1) ? 1 : cfg.inflight_per_client;
-		const int total_lanes = cfg.clients * effective_inflight;
-		DoneState done(total_lanes);
+		const int total_slots = cfg.clients * effective_inflight;
+		DoneState done(total_slots);
 
 		std::vector<std::vector<uint64_t>> lat;
-		lat.resize(static_cast<std::size_t>(total_lanes));
+		lat.resize(static_cast<std::size_t>(total_slots));
 
 		std::atomic<std::size_t> global_inflight{ 0 };
 		std::atomic<std::size_t> global_max_inflight{ 0 };
@@ -792,15 +780,18 @@ namespace prism::bench
 			client_max_inflight[static_cast<std::size_t>(c)].store(0, std::memory_order_relaxed);
 		}
 
-		int lane_idx = 0;
+		int slot_idx = 0;
 		for (int c = 0; c < cfg.clients; ++c)
 		{
-			for (int l = 0; l < effective_inflight; ++l)
+			for (int slot = 0; slot < effective_inflight; ++slot)
 			{
-				RunAsyncSstReadPipelineLane(db, gate, done, cfg, keys, c, l, effective_inflight, lat[static_cast<std::size_t>(lane_idx)],
+				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
+				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
+				RunAsyncSstReadPipelineClient(db, gate, done, cfg, keys, c, slot, start_index, op_count,
+				    lat[static_cast<std::size_t>(slot_idx)],
 				    global_inflight, global_max_inflight, client_inflight[static_cast<std::size_t>(c)],
 				    client_max_inflight[static_cast<std::size_t>(c)]);
-				++lane_idx;
+				++slot_idx;
 			}
 		}
 
@@ -840,55 +831,37 @@ namespace prism::bench
 		return out;
 	}
 
-	Detached RunAsyncCompactionOverlapReaderLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::vector<uint64_t>& lat,
+	Detached RunAsyncCompactionOverlapReaderClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::vector<uint64_t>& lat,
 	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
 	    std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
 			co_await gate;
-
-			const std::size_t ops_per_lane = cfg.ops_per_client / static_cast<std::size_t>(num_lanes);
-			const std::size_t start_idx = static_cast<std::size_t>(lane_id) * ops_per_lane;
-			const std::size_t end_idx = (lane_id == num_lanes - 1) ? cfg.ops_per_client : start_idx + ops_per_lane;
+			(void)slot_id;
 
 			if (!cfg.no_latency)
 			{
-				lat.reserve(end_idx - start_idx);
+				lat.reserve(op_count);
 			}
 
 			ReadOptions read_opts;
 			read_opts.fill_cache = false;
 
-			for (std::size_t i = start_idx; i < end_idx; ++i)
+			for (std::size_t op = 0; op < op_count; ++op)
 			{
+				const std::size_t i = start_index + op;
 				const uint64_t begin = NowNs();
 
-				const std::size_t cur_global = global_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_global = global_max_inflight.load(std::memory_order_relaxed);
-				while (cur_global > observed_global)
-				{
-					if (global_max_inflight.compare_exchange_weak(observed_global, cur_global, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
-
-				const std::size_t cur_client = client_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_client = client_max_inflight.load(std::memory_order_relaxed);
-				while (cur_client > observed_client)
-				{
-					if (client_max_inflight.compare_exchange_weak(observed_client, cur_client, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
+				RecordInflightEnter(global_inflight, global_max_inflight);
+				RecordInflightEnter(client_inflight, client_max_inflight);
 
 				(void)co_await db.GetAsync(read_opts, keys[static_cast<std::size_t>(client_id)][i]);
 
-				global_inflight.fetch_sub(1, std::memory_order_relaxed);
-				client_inflight.fetch_sub(1, std::memory_order_relaxed);
+				RecordInflightLeave(global_inflight);
+				RecordInflightLeave(client_inflight);
 
 				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
@@ -905,50 +878,31 @@ namespace prism::bench
 		co_return;
 	}
 
-	Detached RunAsyncCompactionOverlapWriterLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg, int client_id,
-	    int lane_id, int num_lanes, std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
+	Detached RunAsyncCompactionOverlapWriterClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg, int client_id,
+	    int slot_id, std::size_t start_index, std::size_t op_count, std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
 	    std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
 	    std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
 			co_await gate;
-
-			const std::size_t ops_per_lane = cfg.ops_per_client / static_cast<std::size_t>(num_lanes);
-			const std::size_t start_idx = static_cast<std::size_t>(lane_id) * ops_per_lane;
-			const std::size_t end_idx = (lane_id == num_lanes - 1) ? cfg.ops_per_client : start_idx + ops_per_lane;
+			(void)slot_id;
 
 			if (!cfg.no_latency)
 			{
-				lat.reserve(end_idx - start_idx);
+				lat.reserve(op_count);
 			}
 
 			WriteOptions write_opts;
 			write_opts.sync = false;
 
-			for (std::size_t i = start_idx; i < end_idx; ++i)
+			for (std::size_t op = 0; op < op_count; ++op)
 			{
+				const std::size_t i = start_index + op;
 				const uint64_t begin = NowNs();
 
-				const std::size_t cur_global = global_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_global = global_max_inflight.load(std::memory_order_relaxed);
-				while (cur_global > observed_global)
-				{
-					if (global_max_inflight.compare_exchange_weak(observed_global, cur_global, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
-
-				const std::size_t cur_client = client_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_client = client_max_inflight.load(std::memory_order_relaxed);
-				while (cur_client > observed_client)
-				{
-					if (client_max_inflight.compare_exchange_weak(observed_client, cur_client, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
+				RecordInflightEnter(global_inflight, global_max_inflight);
+				RecordInflightEnter(client_inflight, client_max_inflight);
 
 				char key_buf[64];
 				const int n = std::snprintf(key_buf, sizeof(key_buf), "cw_%d_%zu", client_id, i);
@@ -956,8 +910,8 @@ namespace prism::bench
 
 				(void)co_await db.PutAsync(write_opts, key, value);
 
-				global_inflight.fetch_sub(1, std::memory_order_relaxed);
-				client_inflight.fetch_sub(1, std::memory_order_relaxed);
+				RecordInflightLeave(global_inflight);
+				RecordInflightLeave(client_inflight);
 
 				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
@@ -984,13 +938,13 @@ namespace prism::bench
 		const int half_clients = cfg.clients / 2;
 		const int num_readers = (half_clients < 1) ? 1 : half_clients;
 		const int num_writers = cfg.clients - num_readers;
-		const int total_reader_lanes = num_readers * effective_inflight;
-		const int total_writer_lanes = num_writers * effective_inflight;
-		const int total_lanes = total_reader_lanes + total_writer_lanes;
-		DoneState done(total_lanes);
+		const int total_reader_slots = num_readers * effective_inflight;
+		const int total_writer_slots = num_writers * effective_inflight;
+		const int total_slots = total_reader_slots + total_writer_slots;
+		DoneState done(total_slots);
 
 		std::vector<std::vector<uint64_t>> lat;
-		lat.resize(static_cast<std::size_t>(total_lanes));
+		lat.resize(static_cast<std::size_t>(total_slots));
 		const std::string value = MakeValue(cfg.value_size);
 
 		std::atomic<std::size_t> global_inflight{ 0 };
@@ -1003,26 +957,30 @@ namespace prism::bench
 			client_max_inflight[static_cast<std::size_t>(c)].store(0, std::memory_order_relaxed);
 		}
 
-		int lane_idx = 0;
+		int slot_idx = 0;
 		for (int c = 0; c < num_readers; ++c)
 		{
-			for (int l = 0; l < effective_inflight; ++l)
+			for (int slot = 0; slot < effective_inflight; ++slot)
 			{
-				RunAsyncCompactionOverlapReaderLane(db, gate, done, cfg, keys, c, l, effective_inflight,
-				    lat[static_cast<std::size_t>(lane_idx)], global_inflight, global_max_inflight,
+				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
+				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
+				RunAsyncCompactionOverlapReaderClient(db, gate, done, cfg, keys, c, slot, start_index, op_count,
+				    lat[static_cast<std::size_t>(slot_idx)], global_inflight, global_max_inflight,
 				    client_inflight[static_cast<std::size_t>(c)], client_max_inflight[static_cast<std::size_t>(c)]);
-				++lane_idx;
+				++slot_idx;
 			}
 		}
 
 		for (int c = num_readers; c < cfg.clients; ++c)
 		{
-			for (int l = 0; l < effective_inflight; ++l)
+			for (int slot = 0; slot < effective_inflight; ++slot)
 			{
-				RunAsyncCompactionOverlapWriterLane(db, gate, done, cfg, c, l, effective_inflight, value,
-				    lat[static_cast<std::size_t>(lane_idx)], global_inflight, global_max_inflight,
+				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
+				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
+				RunAsyncCompactionOverlapWriterClient(db, gate, done, cfg, c, slot, start_index, op_count, value,
+				    lat[static_cast<std::size_t>(slot_idx)], global_inflight, global_max_inflight,
 				    client_inflight[static_cast<std::size_t>(c)], client_max_inflight[static_cast<std::size_t>(c)]);
-				++lane_idx;
+				++slot_idx;
 			}
 		}
 
@@ -1062,55 +1020,36 @@ namespace prism::bench
 		return out;
 	}
 
-	Detached RunAsyncDurabilityWriteLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::string value,
+	Detached RunAsyncDurabilityWriteClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count, std::string value,
 	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
 	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
 			co_await gate;
-
-			const std::size_t ops_per_lane = cfg.ops_per_client / static_cast<std::size_t>(num_lanes);
-			const std::size_t start_idx = static_cast<std::size_t>(lane_id) * ops_per_lane;
-			const std::size_t end_idx = (lane_id == num_lanes - 1) ? cfg.ops_per_client : start_idx + ops_per_lane;
+			(void)slot_id;
 
 			if (!cfg.no_latency)
 			{
-				lat.reserve(end_idx - start_idx);
+				lat.reserve(op_count);
 			}
 
 			WriteOptions write_opts;
 			write_opts.sync = true;
 
-			for (std::size_t i = start_idx; i < end_idx; ++i)
+			for (std::size_t op = 0; op < op_count; ++op)
 			{
+				const std::size_t i = start_index + op;
 				const uint64_t begin = NowNs();
 
-				const std::size_t cur_global = global_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_global = global_max_inflight.load(std::memory_order_relaxed);
-				while (cur_global > observed_global)
-				{
-					if (global_max_inflight.compare_exchange_weak(observed_global, cur_global, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
-
-				const std::size_t cur_client = client_inflight.fetch_add(1, std::memory_order_relaxed) + 1;
-				std::size_t observed_client = client_max_inflight.load(std::memory_order_relaxed);
-				while (cur_client > observed_client)
-				{
-					if (client_max_inflight.compare_exchange_weak(observed_client, cur_client, std::memory_order_relaxed))
-					{
-						break;
-					}
-				}
+				RecordInflightEnter(global_inflight, global_max_inflight);
+				RecordInflightEnter(client_inflight, client_max_inflight);
 
 				(void)co_await db.PutAsync(write_opts, keys[static_cast<std::size_t>(client_id)][i], value);
 
-				global_inflight.fetch_sub(1, std::memory_order_relaxed);
-				client_inflight.fetch_sub(1, std::memory_order_relaxed);
+				RecordInflightLeave(global_inflight);
+				RecordInflightLeave(client_inflight);
 
 				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
@@ -1134,11 +1073,11 @@ namespace prism::bench
 		StartGate gate;
 
 		const int effective_inflight = (cfg.inflight_per_client < 1) ? 1 : cfg.inflight_per_client;
-		const int total_lanes = cfg.clients * effective_inflight;
-		DoneState done(total_lanes);
+		const int total_slots = cfg.clients * effective_inflight;
+		DoneState done(total_slots);
 
 		std::vector<std::vector<uint64_t>> lat;
-		lat.resize(static_cast<std::size_t>(total_lanes));
+		lat.resize(static_cast<std::size_t>(total_slots));
 		const std::string value = MakeValue(cfg.value_size);
 
 		std::atomic<std::size_t> global_inflight{ 0 };
@@ -1151,15 +1090,17 @@ namespace prism::bench
 			client_max_inflight[static_cast<std::size_t>(c)].store(0, std::memory_order_relaxed);
 		}
 
-		int lane_idx = 0;
+		int slot_idx = 0;
 		for (int c = 0; c < cfg.clients; ++c)
 		{
-			for (int l = 0; l < effective_inflight; ++l)
+			for (int slot = 0; slot < effective_inflight; ++slot)
 			{
-				RunAsyncDurabilityWriteLane(db, gate, done, cfg, keys, c, l, effective_inflight, value,
-				    lat[static_cast<std::size_t>(lane_idx)], global_inflight, global_max_inflight,
+				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
+				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
+				RunAsyncDurabilityWriteClient(db, gate, done, cfg, keys, c, slot, start_index, op_count, value,
+				    lat[static_cast<std::size_t>(slot_idx)], global_inflight, global_max_inflight,
 				    client_inflight[static_cast<std::size_t>(c)], client_max_inflight[static_cast<std::size_t>(c)]);
-				++lane_idx;
+				++slot_idx;
 			}
 		}
 

@@ -47,6 +47,16 @@ namespace prism
 		std::atomic<uint64_t> compaction_jobs_submitted{ 0 };
 		std::atomic<uint64_t> compaction_jobs_completed{ 0 };
 
+		// Scheduler-aware counters — always available (no PRISM_RUNTIME_METRICS gate).
+		// These track the redesigned split-role scheduler's fast path, steal, and
+		// locality behavior. Atomic increments are negligible overhead on the hot path.
+		std::atomic<uint64_t> foreground_fastpath_submits{ 0 };   // Submit(job,0) that bypassed dispatcher
+		std::atomic<uint64_t> foreground_fallback_submits{ 0 };   // Submit() that fell back to priority path
+		std::atomic<uint64_t> steal_attempts{ 0 };                // TrySteal() invocations
+		std::atomic<uint64_t> steal_successes{ 0 };               // TrySteal() that moved jobs
+		std::atomic<uint64_t> worker_local_jobs_completed{ 0 };   // jobs completed from own queue
+		std::atomic<uint64_t> stolen_jobs_completed{ 0 };         // jobs completed after being stolen
+
 		void Reset() noexcept;
 
 		void PrintMetrics() const noexcept;

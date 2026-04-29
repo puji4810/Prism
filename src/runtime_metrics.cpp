@@ -34,6 +34,13 @@ namespace prism
 
 		compaction_jobs_submitted.store(0, std::memory_order_relaxed);
 		compaction_jobs_completed.store(0, std::memory_order_relaxed);
+
+		foreground_fastpath_submits.store(0, std::memory_order_relaxed);
+		foreground_fallback_submits.store(0, std::memory_order_relaxed);
+		steal_attempts.store(0, std::memory_order_relaxed);
+		steal_successes.store(0, std::memory_order_relaxed);
+		worker_local_jobs_completed.store(0, std::memory_order_relaxed);
+		stolen_jobs_completed.store(0, std::memory_order_relaxed);
 	}
 
 	void RuntimeMetrics::PrintMetrics() const noexcept
@@ -72,7 +79,13 @@ namespace prism
 		    "active_compaction_lane:     %d\n"
 		    "fallback_to_blocking_count: %lu\n"
 		    "shutdown_wait_count:        %lu\n"
-		    "shutdown_wait_duration_us:  %lu\n",
+		    "shutdown_wait_duration_us:  %lu\n"
+		    "foreground_fastpath_submits:    %lu\n"
+		    "foreground_fallback_submits:    %lu\n"
+		    "steal_attempts:             %lu\n"
+		    "steal_successes:            %lu\n"
+		    "worker_local_jobs_completed:%lu\n"
+		    "stolen_jobs_completed:      %lu\n",
 		    static_cast<unsigned long>(blocking_jobs_submitted.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(blocking_jobs_completed.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(read_in_flight),
@@ -118,7 +131,13 @@ namespace prism
 		    active_compaction_lane.load(std::memory_order_relaxed),
 		    static_cast<unsigned long>(fallback_to_blocking_count.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(shutdown_wait_count.load(std::memory_order_relaxed)),
-		    static_cast<unsigned long>(shutdown_wait_duration_us.load(std::memory_order_relaxed)));
+		    static_cast<unsigned long>(shutdown_wait_duration_us.load(std::memory_order_relaxed)),
+		    static_cast<unsigned long>(foreground_fastpath_submits.load(std::memory_order_relaxed)),
+		    static_cast<unsigned long>(foreground_fallback_submits.load(std::memory_order_relaxed)),
+		    static_cast<unsigned long>(steal_attempts.load(std::memory_order_relaxed)),
+		    static_cast<unsigned long>(steal_successes.load(std::memory_order_relaxed)),
+		    static_cast<unsigned long>(worker_local_jobs_completed.load(std::memory_order_relaxed)),
+		    static_cast<unsigned long>(stolen_jobs_completed.load(std::memory_order_relaxed)));
 	}
 
 	RuntimeMetrics& RuntimeMetrics::Instance() noexcept

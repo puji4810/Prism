@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "runtime_metrics.h"
 
 #include <algorithm>
 #include <limits>
@@ -11,6 +12,7 @@ namespace prism
 	{
 		constexpr std::size_t kMinThreads = 2;
 		constexpr std::size_t kLazyFallbackPriority = (std::numeric_limits<std::size_t>::max)();
+		constexpr auto kStealBackoff = std::chrono::microseconds(100);
 
 		// Thread-local state: set by each WorkThread at the start of Consume(), cleared on exit.
 		// Used by CaptureContext() to determine whether the calling thread belongs to a specific
@@ -24,6 +26,14 @@ namespace prism
 			if (requested > 0)
 				return std::max<std::size_t>(requested, kMinThreads);
 			return std::max<std::size_t>(hw, kMinThreads);
+		}
+
+		std::uint64_t NextRandom(std::uint64_t& state) noexcept
+		{
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			return state;
 		}
 	}
 
@@ -61,12 +71,31 @@ namespace prism
 		{
 			priority_thread_.join();
 		}
+
+		// Step 2: promote any delayed residue before workers stop draining so shutdown-visible
+		// worker execution/stealing can still consume the promoted work.
+		while (!lazy_queue_.empty())
+		{
+			auto task = lazy_queue_.top();
+			lazy_queue_.pop();
+			if (!TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), false, true))
+			{
+				std::lock_guard lock(priority_mutex_);
+				priority_queue_.push(PriorityTask{ std::move(task.job), kLazyFallbackPriority });
+			}
+		}
+		for (auto& t : work_threads_)
+		{
+			t.Wake();
+		}
+
+		// Step 3: workers drain their local queues (and may steal peer work) until empty.
 		for (auto& t : work_threads_)
 		{
 			t.Join();
 		}
 
-		// Step 2: sequential drain — all threads are stopped, no more races.
+		// Step 4: sequential drain — all threads are stopped, no more races.
 		// Loop until stable: tasks executed during drain may call Submit() again,
 		// creating new entries that must also be drained.
 		// Mark this (destructor) thread as belonging to the scheduler so that
@@ -78,11 +107,16 @@ namespace prism
 		{
 			work_remains = false;
 
-			// 2a. Promote all remaining delayed tasks to immediate execution.
+			// 4a. Promote any delayed residue that was submitted during drain.
 			while (!lazy_queue_.empty())
 			{
 				auto task = lazy_queue_.top();
 				lazy_queue_.pop();
+				if (TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), false, true))
+				{
+					work_remains = true;
+					continue;
+				}
 				try
 				{
 					task.job();
@@ -94,11 +128,16 @@ namespace prism
 				work_remains = true;
 			}
 
-			// 2b. Drain all remaining priority tasks inline.
+			// 4b. Drain all remaining priority tasks inline.
 			while (!priority_queue_.empty())
 			{
 				auto job = std::move(const_cast<Job&>(priority_queue_.top().job));
 				priority_queue_.pop();
+				if (TryPushToWorker(std::move(job), ChooseLeastLoadedWorker(), false, true))
+				{
+					work_remains = true;
+					continue;
+				}
 				try
 				{
 					job();
@@ -110,7 +149,7 @@ namespace prism
 				work_remains = true;
 			}
 
-			// 2c. Drain each worker's local queue (tasks dispatched but not yet started).
+			// 4c. Drain each worker's local queue (tasks dispatched but not yet started).
 			for (auto& t : work_threads_)
 			{
 				if (t.DrainRemaining())
@@ -143,6 +182,26 @@ namespace prism
 		// Worker re-entrant submissions during shutdown are supported and drained.
 		assert(!IsExitRequested() || (t_current_scheduler == this));
 
+		if (priority == 0)
+		{
+			if (t_current_scheduler == this)
+			{
+				if (TryPushToWorker(std::move(job), t_current_worker_index, false, true))
+				{
+					RuntimeMetrics::Instance().foreground_fastpath_submits.fetch_add(1, std::memory_order_relaxed);
+					return;
+				}
+			}
+
+			const auto worker_index = ChooseLeastLoadedWorker();
+			if (TryPushToWorker(std::move(job), worker_index, false, true))
+			{
+				RuntimeMetrics::Instance().foreground_fastpath_submits.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+		}
+
+		RuntimeMetrics::Instance().foreground_fallback_submits.fetch_add(1, std::memory_order_relaxed);
 		{
 			std::lock_guard lock(priority_mutex_);
 			priority_queue_.push(PriorityTask{ std::move(job), priority });
@@ -185,6 +244,41 @@ namespace prism
 		    static_cast<const void*>(this), static_cast<const void*>(ctx.scheduler_), ctx.worker_index_);
 #endif
 		Submit(std::move(job));
+	}
+
+	bool ThreadPoolScheduler::TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable)
+	{
+		if (worker_index >= work_threads_.size())
+		{
+			return false;
+		}
+
+		auto& worker = work_threads_[worker_index];
+		if (dispatched)
+		{
+			worker.PushDispatched(std::move(job));
+		}
+		else
+		{
+			worker.Push(std::move(job), stealable);
+		}
+		return true;
+	}
+
+	std::size_t ThreadPoolScheduler::ChooseLeastLoadedWorker() const
+	{
+		std::size_t best_index = 0;
+		std::size_t best_load = work_threads_.front().Load();
+		for (std::size_t i = 1; i < work_threads_.size(); ++i)
+		{
+			const auto load = work_threads_[i].Load();
+			if (load < best_load)
+			{
+				best_load = load;
+				best_index = i;
+			}
+		}
+		return best_index;
 	}
 
 	bool ThreadPoolScheduler::TryDispatch(Job& job)
@@ -256,8 +350,8 @@ namespace prism
 				}
 				lock.unlock();
 
-				// Try direct dispatch to idle worker; fallback to priority queue if all busy
-				if (!TryDispatch(task.job))
+				const auto worker_index = ChooseLeastLoadedWorker();
+				if (!TryPushToWorker(std::move(task.job), worker_index, false, true))
 				{
 					{
 						std::lock_guard priority_lock(priority_mutex_);
@@ -301,6 +395,7 @@ namespace prism
 		{
 			auto job = std::move(queue_.front().job);
 			queue_.pop_front();
+			load_.fetch_sub(1, std::memory_order_relaxed);
 			try
 			{
 				job();
@@ -320,7 +415,18 @@ namespace prism
 	{
 		{
 			std::lock_guard lock(mutex_);
-			queue_.push_back(QueuedJob{ std::move(job), false });
+			queue_.push_back(QueuedJob{ std::move(job), false, true });
+			load_.fetch_add(1, std::memory_order_relaxed);
+		}
+		semaphore_.release();
+	}
+
+	void ThreadPoolScheduler::WorkThread::Push(Job job, bool stealable)
+	{
+		{
+			std::lock_guard lock(mutex_);
+			queue_.push_back(QueuedJob{ std::move(job), false, stealable });
+			load_.fetch_add(1, std::memory_order_relaxed);
 		}
 		semaphore_.release();
 	}
@@ -329,58 +435,188 @@ namespace prism
 	{
 		{
 			std::lock_guard lock(mutex_);
-			queue_.push_back(QueuedJob{ std::move(job), true });
+			queue_.push_back(QueuedJob{ std::move(job), true, true });
+			load_.fetch_add(1, std::memory_order_relaxed);
 		}
 		semaphore_.release();
 	}
 
+	std::size_t ThreadPoolScheduler::WorkThread::Load() const noexcept
+	{
+		return load_.load(std::memory_order_relaxed);
+	}
+
 	void ThreadPoolScheduler::WorkThread::Wake() { semaphore_.release(); }
+
+	bool ThreadPoolScheduler::WorkThread::TrySteal(
+	    ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state)
+	{
+		RuntimeMetrics::Instance().steal_attempts.fetch_add(1, std::memory_order_relaxed);
+
+		if (scheduler.work_threads_.size() <= 1)
+		{
+			return false;
+		}
+
+		std::size_t victim_index = NextRandom(rng_state) % (scheduler.work_threads_.size() - 1);
+		if (victim_index >= worker_index)
+		{
+			++victim_index;
+		}
+
+		auto& victim = scheduler.work_threads_[victim_index];
+		std::scoped_lock lock(mutex_, victim.mutex_);
+		if (!queue_.empty())
+		{
+			return false;
+		}
+
+		std::size_t stealable_count = 0;
+		for (const auto& queued : victim.queue_)
+		{
+			if (queued.stealable)
+			{
+				++stealable_count;
+			}
+		}
+		if (stealable_count == 0)
+		{
+			return false;
+		}
+
+		const std::size_t steal_count = std::max<std::size_t>(1, stealable_count / 2);
+		std::vector<QueuedJob> stolen;
+		stolen.reserve(steal_count);
+		for (std::size_t i = victim.queue_.size(); i > 0 && stolen.size() < steal_count; --i)
+		{
+			auto& candidate = victim.queue_[i - 1];
+			if (!candidate.stealable)
+			{
+				continue;
+			}
+			stolen.push_back(std::move(candidate));
+			victim.queue_.erase(victim.queue_.begin() + static_cast<std::ptrdiff_t>(i - 1));
+		}
+		if (stolen.empty())
+		{
+			return false;
+		}
+
+		for (auto& queued : stolen)
+		{
+			queued.stolen = true;
+			queue_.push_front(std::move(queued));
+		}
+		victim.load_.fetch_sub(stolen.size(), std::memory_order_relaxed);
+		load_.fetch_add(stolen.size(), std::memory_order_relaxed);
+
+		RuntimeMetrics::Instance().steal_successes.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
 
 	void ThreadPoolScheduler::WorkThread::Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept
 	{
 		// Register this thread with the scheduler instance so CaptureContext() can validate.
 		t_current_scheduler = &scheduler;
 		t_current_worker_index = worker_index;
+		std::uint64_t rng_state = (static_cast<std::uint64_t>(worker_index) + 1) * 0x9e3779b97f4a7c15ull;
 
 		while (true)
 		{
 			semaphore_.acquire();
-			if (scheduler.IsExitRequested())
+
+			while (true)
 			{
-				break;
+				QueuedJob queued;
+				bool queue_empty_after = false;
+				bool has_job = false;
+				{
+					std::lock_guard lock(mutex_);
+					if (!queue_.empty())
+					{
+						queued = std::move(queue_.front());
+						queue_.pop_front();
+						load_.fetch_sub(1, std::memory_order_relaxed);
+						queue_empty_after = queue_.empty();
+						has_job = true;
+					}
+				}
+
+			if (has_job)
+				{
+					try
+					{
+						queued.job();
+					}
+					catch (...)
+					{
+						std::terminate();
+					}
+
+					if (queued.stolen)
+					{
+						RuntimeMetrics::Instance().stolen_jobs_completed.fetch_add(1, std::memory_order_relaxed);
+					}
+					else
+					{
+						RuntimeMetrics::Instance().worker_local_jobs_completed.fetch_add(1, std::memory_order_relaxed);
+					}
+
+					bool should_reregister = queue_empty_after;
+					if (queued.stolen && !should_reregister)
+					{
+						std::lock_guard lock(mutex_);
+						should_reregister = queue_.empty();
+					}
+
+					// Re-register as pending only when the queue becomes empty.
+					// Per-task queue_empty_after still prevents affinity work from re-registering
+					// while dispatcher-owned work remains queued behind it.
+					// Stolen batches need a post-execution empty check because the worker may
+					// drain to idle after the last stolen job even when the pre-pop state was non-empty.
+					if (should_reregister)
+					{
+						{
+							std::lock_guard lock(scheduler.pending_mutex_);
+							scheduler.pending_list_.push_back(this);
+						}
+						scheduler.priority_waiter_.release();
+					}
+
+					if (scheduler.IsExitRequested())
+					{
+						std::lock_guard lock(mutex_);
+						if (queue_.empty())
+						{
+							break;
+						}
+					}
+					continue;
+				}
+
+				if (TrySteal(scheduler, worker_index, rng_state))
+				{
+					continue;
+				}
+
+				if (scheduler.IsExitRequested())
+				{
+					break;
+				}
+
+				if (!semaphore_.try_acquire_for(kStealBackoff))
+				{
+					break;
+				}
 			}
 
-			QueuedJob queued;
-			bool queue_empty_after;
+			if (scheduler.IsExitRequested())
 			{
 				std::lock_guard lock(mutex_);
 				if (queue_.empty())
 				{
-					continue;
+					break;
 				}
-				queued = std::move(queue_.front());
-				queue_.pop_front();
-				queue_empty_after = queue_.empty();
-			}
-
-			try
-			{
-				queued.job();
-			}
-			catch (...)
-			{
-				std::terminate();
-			}
-
-			// Re-register as pending only when the completed job was dispatcher-owned
-			// AND the queue is now empty — ensures affinity jobs cannot flip re-registration.
-			if (queued.dispatched && queue_empty_after)
-			{
-				{
-					std::lock_guard lock(scheduler.pending_mutex_);
-					scheduler.pending_list_.push_back(this);
-				}
-				scheduler.priority_waiter_.release();
 			}
 		}
 

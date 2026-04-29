@@ -131,15 +131,20 @@ namespace prism
 	//
 	// Physical threads (only 4 sources):
 	//   ThreadPoolScheduler (external, shared) — N worker threads, priority + timer
-	//   BlockingExecutor(4) — foreground read lane for blocking async work
+	//   BlockingExecutor(4) — async file-I/O / metadata lane
 	//   BlockingExecutor(1) — background compaction lane (single-flight preserved)
 	//   SerialLane — 1 FIFO worker for ordered file writes
 	//
-	// Scheduler routing :
+	// Scheduler routing:
+	//   foreground_db_scheduler.Submit(job) → cpu_executor_impl → ThreadPoolScheduler::Submit(job, 0)
+	//     (worker-local fast path / stealing-enabled shared CPU pool)
 	//   runtime_scheduler.Submit(job) → cpu_executor_impl → ThreadPoolScheduler
 	//   runtime_scheduler.BlockingScheduler() → read_scheduler → read_executor
-	//   runtime_scheduler.ContinuationScheduler() → read_scheduler → read_executor
+	//   runtime_scheduler.ContinuationScheduler() → cpu_scheduler → cpu_executor_impl
 	//     (available for explicit continuations; AsyncOp resumes inline after work completion)
+	//   read_scheduler.Submit(job) → read_executor
+	//   compaction_scheduler.Submit(job) → compaction_executor
+	//   serial_scheduler.Submit(job) → serial_lane
 	//
 	// Ownership: RuntimeBundle is held via shared_ptr and registered by ThreadPoolScheduler
 	// key in a global weak registry (AcquireRuntimeBundle). If the last reference is
@@ -167,9 +172,9 @@ namespace prism
 		// provides SubmitAfter() — reserved for future timer use.
 		ThreadPoolScheduler* timer_source;
 
-		// read_executor: foreground blocking lane for AsyncOp work dispatched via
-		// runtime_scheduler.BlockingScheduler(). Multiple workers let read-heavy
-		// workloads scale without serializing behind compaction.
+		// read_executor: async file-I/O blocking lane. AsyncEnv defaults here so
+		// file reads and metadata calls stay isolated from foreground DB work and
+		// from the single-flight compaction lane.
 		BlockingExecutor read_executor;
 
 		// compaction_executor: single-threaded FIFO dedicated to background
@@ -200,10 +205,19 @@ namespace prism
 		// serial_scheduler: wraps serial_lane for ordered writes.
 		ExecutorSchedulerAdapter serial_scheduler;
 
-		// runtime_scheduler: wraps cpu_executor_impl for Submit(), but explicitly routes
-		// BlockingScheduler/ContinuationScheduler → read_scheduler for async DB lane affinity.
-		// This is the split-routing adapter used by AsyncDB operations (asyncdb.cpp).
+		// runtime_scheduler: legacy split-routing adapter. Direct Submit() stays on the
+		// shared CPU pool, BlockingScheduler() redirects blocking work to read_scheduler,
+		// and explicit continuations resolve back to cpu_scheduler. AsyncDB and AsyncEnv
+		// no longer use this adapter; it remains only for explicit legacy callers and
+		// routing tests that verify the split-lane contract.
 		ExecutorSchedulerAdapter runtime_scheduler;
+
+		// foreground_db_scheduler: wraps cpu_executor_impl and keeps both blocking work and
+		// continuations on the shared thread pool. AsyncDB foreground operations use this
+		// adapter so CPU-resident DB work lands on ThreadPoolScheduler::Submit(job, 0),
+		// bypassing the old priority dispatcher/read-lane bottleneck while preserving
+		// explicit read/compaction/serial isolation for blocking subsystems.
+		ExecutorSchedulerAdapter foreground_db_scheduler;
 
 		// -- I/O backend configuration --
 

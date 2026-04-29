@@ -95,3 +95,31 @@ TEST(SchedulerStressTest, MixedWorkload)
 	EXPECT_EQ(immediate->load(), kNumTasks);
 	EXPECT_EQ(affinity->load(), kNumTasks);
 }
+
+TEST(SchedulerStressTest, MixedAffinityAndStolenWorkCompletesAll)
+{
+	ThreadPoolScheduler scheduler(4);
+	auto counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumTasks = 1000;
+
+	for (int i = 0; i < kNumTasks; ++i)
+	{
+		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
+
+		scheduler.Submit([&scheduler, counter]() {
+			auto ctx = scheduler.CaptureContext();
+			scheduler.SubmitIn(ctx, [counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
+		});
+	}
+
+	auto start = std::chrono::steady_clock::now();
+	while (std::chrono::steady_clock::now() - start < 10s)
+	{
+		if (counter->load() == kNumTasks * 2)
+			break;
+		std::this_thread::yield();
+	}
+
+	EXPECT_EQ(counter->load(), kNumTasks * 2)
+	    << "Mixed Submit + SubmitIn must all complete exactly once";
+}

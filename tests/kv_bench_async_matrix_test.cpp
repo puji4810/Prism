@@ -318,6 +318,42 @@ namespace
 		auto stats = prism::bench::RunAsyncMixed(async_db, scheduler, cfg, keys);
 
 		EXPECT_GT(stats.max_client_inflight, 1);
+		EXPECT_GE(stats.max_inflight_observed, static_cast<std::size_t>(cfg.clients));
+
+		std::filesystem::remove_all(db_dir);
+	}
+
+	TEST(KVBenchAsyncMatrixTest, OutstandingWindowReachesConfiguredDepth)
+	{
+		std::string db_dir = MakeTestDir();
+		prism::Options options;
+		options.create_if_missing = true;
+		options.write_buffer_size = 4 * 1024 * 1024;
+
+		prism::ThreadPoolScheduler scheduler(4);
+
+		prism::bench::Config cfg;
+		cfg.clients = 2;
+		cfg.workers = 4;
+		cfg.ops_per_client = 256;
+		cfg.value_size = 100;
+		cfg.read_ratio = 100;
+		cfg.inflight_per_client = 4;
+		cfg.no_latency = true;
+		cfg.prefill = 1;
+
+		auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
+		{
+			auto db = OpenDatabase(options, db_dir);
+			PrefillDatabase(db, keys, cfg.ops_per_client, cfg.value_size);
+		}
+
+		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+		auto stats = prism::bench::RunAsyncMixed(async_db, scheduler, cfg, keys);
+
+		EXPECT_GE(stats.max_client_inflight, static_cast<std::size_t>(cfg.inflight_per_client));
+		EXPECT_GE(stats.max_inflight_observed,
+		    static_cast<std::size_t>(cfg.clients * cfg.inflight_per_client));
 
 		std::filesystem::remove_all(db_dir);
 	}
