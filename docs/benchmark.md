@@ -51,26 +51,23 @@ Built from `benchmark/kv_bench.cpp` + `benchmark/kv_bench_lib.cpp`. Supports syn
 
 ### Building `kv_bench` for Perf Profiling
 
-The default build (`benchmark/xmake.lua`) includes `PRISM_RUNTIME_METRICS`, which enables
-per-lane queue-depth / enqueue-wait / execution-time counters. This instrumentation adds
-**~15% overhead** and will skew `perf record` / `perf stat` results.
+`PRISM_RUNTIME_METRICS` enables per-lane queue-depth / enqueue-wait / execution-time counters.
+This instrumentation adds **~15% overhead** and will skew `perf record` / `perf stat` results.
 
-**When profiling with perf, remove the define before building:**
+**By default, `PRISM_RUNTIME_METRICS` is disabled.** Enable it only when you need the
+`RuntimeMetrics` counters (e.g. to verify lane queue depths during a new scheduler optimization).
+
+**To build with runtime metrics enabled:**
 
 ```bash
-# Option 1 (recommended): Comment out the line in benchmark/xmake.lua
-#   line 14:  remove_defines("PRISM_RUNTIME_METRICS")
-# Then rebuild:
-xmake f -m release && xmake build kv_bench
-
-# Option 2: Override via xmake config (if supported by your xmake version)
-xmake f -m release --undefines=PRISM_RUNTIME_METRICS && xmake build kv_bench
+xmake f -m release --runtime_metrics=y && xmake build kv_bench
 ```
 
-Keep `PRISM_RUNTIME_METRICS` enabled only when you specifically need the
-`RuntimeMetrics` counters (e.g. to verify lane queue depths during a new
-scheduler optimization). For throughput/latency/perf profiling, always
-remove it.
+**For throughput/latency/perf profiling, build without runtime metrics (default):**
+
+```bash
+xmake f -m release && xmake build kv_bench
+```
 
 ### Benchmark Modes
 
