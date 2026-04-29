@@ -143,7 +143,12 @@ namespace prism
 	{
 	}
 
-	void ThreadPoolExecutor::Submit(std::function<void()> work) { scheduler_->Submit(std::move(work), kCpuContinuationPriority); }
+	void ThreadPoolExecutor::Submit(std::function<void()> work)
+	{
+		// Priority 0 is the shared CPU pool fast path: direct worker-local enqueue
+		// plus stealing, with no bounce through the legacy priority dispatcher.
+		scheduler_->Submit(std::move(work), kCpuContinuationPriority);
+	}
 
 	BlockingExecutor::BlockingExecutor(std::size_t thread_count, BlockingExecutorLane lane)
 	    : lane_(lane)
@@ -347,7 +352,8 @@ namespace prism
 	    , read_scheduler(read_executor)
 	    , compaction_scheduler(compaction_executor)
 	    , serial_scheduler(serial_lane)
-	    , runtime_scheduler(cpu_executor_impl, &read_scheduler, &read_scheduler)
+	    , runtime_scheduler(cpu_executor_impl, &read_scheduler, &cpu_scheduler)
+	    , foreground_db_scheduler(cpu_executor_impl)
 	{
 	}
 

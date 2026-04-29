@@ -11,7 +11,6 @@
 
 #include "runtime_executor.h"
 #include "compaction_controller.h"
-#include "task_scope.h"
 
 #include "db_impl.h"
 
@@ -24,7 +23,6 @@
 #include <semaphore>
 #include <string>
 #include <thread>
-#include <vector>
 
 namespace prism::tests
 {
@@ -81,7 +79,11 @@ TEST(RuntimeLaneTest, ReadAndCompactionExecutorsAreSeparate)
 	IScheduler* blocking = runtime.runtime_scheduler.BlockingScheduler();
 	EXPECT_EQ(blocking, &runtime.read_scheduler);
 	EXPECT_NE(blocking, &runtime.compaction_scheduler);
-	EXPECT_EQ(runtime.runtime_scheduler.ContinuationScheduler(), &runtime.read_scheduler);
+	EXPECT_EQ(runtime.runtime_scheduler.ContinuationScheduler(), &runtime.cpu_scheduler);
+	EXPECT_EQ(runtime.foreground_db_scheduler.BlockingScheduler(), &runtime.foreground_db_scheduler);
+	EXPECT_EQ(runtime.foreground_db_scheduler.ContinuationScheduler(), &runtime.foreground_db_scheduler);
+	EXPECT_EQ(runtime.cpu_scheduler.BlockingScheduler(), &runtime.cpu_scheduler);
+	EXPECT_EQ(runtime.cpu_scheduler.ContinuationScheduler(), &runtime.cpu_scheduler);
 	EXPECT_EQ(runtime.read_scheduler.ContinuationScheduler(), &runtime.read_scheduler);
 	EXPECT_EQ(runtime.compaction_scheduler.ContinuationScheduler(), &runtime.compaction_scheduler);
 	EXPECT_EQ(runtime.serial_scheduler.ContinuationScheduler(), &runtime.serial_scheduler);
@@ -135,6 +137,39 @@ TEST(RuntimeLaneTest, ForegroundProgressDuringBackgroundCompaction)
 	EXPECT_TRUE(WaitUntil([&compaction_finished] { return compaction_finished.load(); }, 5s));
 }
 
+TEST(RuntimeLaneTest, ForegroundDbSchedulerBypassesBusyReadLane)
+{
+	ThreadPoolScheduler scheduler(4);
+	RuntimeBundle runtime(scheduler);
+
+	constexpr int kReadWorkers = 4;
+	std::binary_semaphore read_started(0);
+	std::binary_semaphore release_reads(0);
+
+	for (int i = 0; i < kReadWorkers; ++i)
+	{
+		runtime.read_scheduler.Submit([&] {
+			read_started.release();
+			release_reads.acquire();
+		});
+	}
+
+	for (int i = 0; i < kReadWorkers; ++i)
+	{
+		ASSERT_TRUE(read_started.try_acquire_for(5s));
+	}
+
+	std::binary_semaphore foreground_done(0);
+	runtime.foreground_db_scheduler.Submit([&] { foreground_done.release(); });
+	EXPECT_TRUE(foreground_done.try_acquire_for(5s))
+	    << "foreground DB work was blocked behind read-lane work";
+
+	for (int i = 0; i < kReadWorkers; ++i)
+	{
+		release_reads.release();
+	}
+}
+
 TEST(RuntimeLaneTest, RuntimeBundleCanReleaseLastReferenceFromReadWorker)
 {
 	ThreadPoolScheduler scheduler(2);
@@ -147,6 +182,46 @@ TEST(RuntimeLaneTest, RuntimeBundleCanReleaseLastReferenceFromReadWorker)
 	});
 
 	EXPECT_TRUE(released_on_worker.try_acquire_for(5s));
+}
+
+TEST(RuntimeLaneTest, DeferredDeletionIsSafeWithActiveCpuBurst)
+{
+	ThreadPoolScheduler scheduler(4);
+	auto runtime = AcquireRuntimeBundle(scheduler);
+	std::weak_ptr<RuntimeBundle> weak_runtime = runtime;
+
+	constexpr int kBurstJobs = 128;
+	std::binary_semaphore burst_submitted(0);
+	std::binary_semaphore released_on_read_worker(0);
+	std::atomic<bool> allow_burst{ false };
+	std::atomic<int> burst_completed{ 0 };
+
+	runtime->foreground_db_scheduler.Submit([&] {
+		for (int i = 0; i < kBurstJobs; ++i)
+		{
+			scheduler.Submit([&] {
+				while (!allow_burst.load(std::memory_order_acquire))
+				{
+					std::this_thread::yield();
+				}
+				burst_completed.fetch_add(1, std::memory_order_release);
+			});
+		}
+		burst_submitted.release();
+	});
+
+	ASSERT_TRUE(burst_submitted.try_acquire_for(5s));
+
+	runtime->read_executor.Submit([runtime = std::move(runtime), &released_on_read_worker]() mutable {
+		runtime.reset();
+		released_on_read_worker.release();
+	});
+
+	ASSERT_TRUE(released_on_read_worker.try_acquire_for(5s));
+	allow_burst.store(true, std::memory_order_release);
+
+	EXPECT_TRUE(WaitUntil([&] { return burst_completed.load(std::memory_order_acquire) == kBurstJobs; }, 5s));
+	EXPECT_TRUE(WaitUntil([&] { return weak_runtime.expired(); }, 5s));
 }
 
 // ===========================================================================

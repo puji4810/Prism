@@ -38,7 +38,7 @@ namespace prism
 	AsyncOp<Result<AsyncDB>> AsyncDB ::OpenAsync(ThreadPoolScheduler& scheduler, const Options& options, std::string dbname)
 	{
 		auto runtime = AcquireRuntimeBundle(scheduler);
-		return AsyncOp<Result<AsyncDB>>(RuntimeFrom(runtime).runtime_scheduler,
+		return AsyncOp<Result<AsyncDB>>(RuntimeFrom(runtime).foreground_db_scheduler,
 		    [runtime, options, dbname = std::move(dbname)]() -> Result<AsyncDB> {
 			auto db = Database::Open(options, dbname);
 			if (!db.has_value())
@@ -51,7 +51,7 @@ namespace prism
 
 	AsyncOp<Status> AsyncDB::PutAsync(const WriteOptions& options, std::string key, std::string value)
 	{
-		return AsyncOp<Status>(RuntimeFrom(state_->runtime_).runtime_scheduler,
+		return AsyncOp<Status>(RuntimeFrom(state_->runtime_).foreground_db_scheduler,
 		    [state = state_, opts = options, key = std::move(key), value = std::move(value)]() {
 			return state->db_.Put(opts, Slice(key), Slice(value));
 		});
@@ -59,7 +59,7 @@ namespace prism
 
 	AsyncOp<Result<std::string>> AsyncDB::GetAsync(const ReadOptions& options, std::string key)
 	{
-		return AsyncOp<Result<std::string>>(RuntimeFrom(state_->runtime_).runtime_scheduler,
+		return AsyncOp<Result<std::string>>(RuntimeFrom(state_->runtime_).foreground_db_scheduler,
 		    [state = state_, opts = options, key = std::move(key)]() {
 #ifdef PRISM_RUNTIME_METRICS
 			auto db_start = std::chrono::steady_clock::now();
@@ -80,13 +80,13 @@ namespace prism
 
 	AsyncOp<Status> AsyncDB::DeleteAsync(const WriteOptions& options, std::string key)
 	{
-		return AsyncOp<Status>(RuntimeFrom(state_->runtime_).runtime_scheduler,
+		return AsyncOp<Status>(RuntimeFrom(state_->runtime_).foreground_db_scheduler,
 		    [state = state_, opts = options, key = std::move(key)]() { return state->db_.Delete(opts, Slice(key)); });
 	}
 
 	AsyncOp<Status> AsyncDB::WriteAsync(const WriteOptions& options, WriteBatch batch)
 	{
-		return AsyncOp<Status>(RuntimeFrom(state_->runtime_).runtime_scheduler,
+		return AsyncOp<Status>(RuntimeFrom(state_->runtime_).foreground_db_scheduler,
 		    [state = state_, opts = options, batch = std::move(batch)]() mutable {
 			return state->db_.Write(opts, std::move(batch));
 		});

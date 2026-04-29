@@ -341,3 +341,62 @@ TEST(SchedulerShutdownTest, NoDoubleExecutionDuringDrain)
 	EXPECT_EQ(actual, kNumTasks * 2) << "Expected exactly " << (kNumTasks * 2) << " task executions, got " << actual
 	                                 << " (tasks were either dropped or double-executed during drain)";
 }
+
+// ---------------------------------------------------------------------------
+// WorkerLocalReentrantSubmitDuringShutdownDrain
+// Worker threads that submit new jobs during shutdown drain must still have
+// those late-submitted jobs drained. This is the re-entrant submit invariant:
+// draining jobs may spawn more work, and the system must not drop it.
+// ---------------------------------------------------------------------------
+TEST(SchedulerShutdownTest, WorkerLocalReentrantSubmitDuringShutdownDrain)
+{
+	auto outer_counter = std::make_shared<std::atomic<int>>(0);
+	auto inner_counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kOuter = 200;
+
+	{
+		ThreadPoolScheduler scheduler(4);
+		for (int i = 0; i < kOuter; ++i)
+		{
+			scheduler.Submit([&scheduler, outer_counter, inner_counter]() {
+				outer_counter->fetch_add(1, std::memory_order_relaxed);
+				// Re-entrant submit: worker submits a child job during its own execution.
+				// During shutdown drain, this child must also be drained.
+				scheduler.Submit([inner_counter]() {
+					inner_counter->fetch_add(1, std::memory_order_relaxed);
+				});
+			});
+		}
+	}
+
+	EXPECT_EQ(outer_counter->load(), kOuter) << "Outer tasks were dropped";
+	EXPECT_EQ(inner_counter->load(), kOuter)
+	    << "Inner re-entrant tasks were dropped during shutdown drain";
+}
+
+// ---------------------------------------------------------------------------
+// DelayedTaskPromotesDuringShutdownWithFallback
+// SubmitAfter with a far-future deadline that will NOT expire naturally.
+// On scheduler destruction, these must be promoted to immediate execution
+// via the fallback/drain path. Tests the delayed-task promotion invariant.
+// ---------------------------------------------------------------------------
+TEST(SchedulerShutdownTest, DelayedTaskPromotesDuringShutdownWithFallback)
+{
+	auto counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumTasks = 200;
+
+	{
+		ThreadPoolScheduler scheduler(4);
+
+		auto future = std::chrono::steady_clock::now() + 30s;
+		for (int i = 0; i < kNumTasks; ++i)
+		{
+			scheduler.SubmitAfter(future, [counter]() {
+				counter->fetch_add(1, std::memory_order_relaxed);
+			});
+		}
+	}
+
+	EXPECT_EQ(counter->load(), kNumTasks)
+	    << "Delayed tasks with future deadline were not promoted/executed during shutdown";
+}

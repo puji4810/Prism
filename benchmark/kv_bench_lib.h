@@ -147,37 +147,39 @@ namespace prism::bench
 	Stats RunSyncDiskRead(Database& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
 	Stats RunSyncDurabilityWrite(Database& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
 
-	// Async benchmark lane workers (per-client lane with inflight tracking)
-	Detached RunAsyncMixedLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::string value,
-	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
-	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight);
-
-	Detached RunAsyncDiskReadLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::vector<uint64_t>& lat,
-	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
-	    std::atomic<std::size_t>& client_max_inflight);
-
-	Detached RunAsyncSstReadPipelineLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::vector<uint64_t>& lat,
-	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
-	    std::atomic<std::size_t>& client_max_inflight);
-
-	Detached RunAsyncDurabilityWriteLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::string value,
-	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
-	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight);
-
-	// Compaction overlap benchmark lane workers
-	Detached RunAsyncCompactionOverlapReaderLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int lane_id, int num_lanes, std::vector<uint64_t>& lat,
-	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
-	    std::atomic<std::size_t>& client_max_inflight);
-
-	Detached RunAsyncCompactionOverlapWriterLane(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg, int client_id,
-	    int lane_id, int num_lanes, std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
+	// Async benchmark window workers (real outstanding-window semantics)
+	Detached RunAsyncMixedClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
 	    std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
 	    std::atomic<std::size_t>& client_max_inflight);
+
+	Detached RunAsyncDiskReadClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
+	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight);
+
+	Detached RunAsyncSstReadPipelineClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
+	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight);
+
+	Detached RunAsyncDurabilityWriteClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
+	    std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
+	    std::atomic<std::size_t>& client_max_inflight);
+
+	// Compaction overlap benchmark window workers
+	Detached RunAsyncCompactionOverlapReaderClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
+	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight);
+
+	Detached RunAsyncCompactionOverlapWriterClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg, int client_id,
+	    int slot_id, std::size_t start_index, std::size_t op_count, std::string value, std::vector<uint64_t>& lat,
+	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
+	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight);
 
 	// Async benchmark runners
 	Stats RunAsyncMixed(AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
