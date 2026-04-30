@@ -354,18 +354,22 @@ namespace prism
 				break;
 			}
 
-			std::lock_guard lock(priority_mutex_);
-			// Over-notification from worker threads may result in empty queue
-			if (priority_queue_.empty())
+			PriorityTask task;
 			{
-				continue;
+				std::lock_guard lock(priority_mutex_);
+				// Over-notification from worker threads may result in empty queue
+				if (priority_queue_.empty())
+				{
+					continue;
+				}
+
+				task = std::move(const_cast<PriorityTask&>(priority_queue_.top()));
+				priority_queue_.pop();
 			}
 
-			// Try to dispatch top-priority task to idle worker.
-			// Only pop from queue after successful dispatch to ensure tasks aren't lost.
-			if (TryDispatch(const_cast<Job&>(priority_queue_.top().job)))
+			if (!TryDispatch(task.job))
 			{
-				priority_queue_.pop();
+				PushToPriorityQueue(std::move(task.job), task.priority, /*wake=*/false);
 			}
 		}
 	}
