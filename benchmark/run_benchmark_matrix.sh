@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
-# run_benchmark_matrix.sh — Run the canonical 5-variant benchmark matrix for Prism kv_bench.
+# run_benchmark_matrix.sh — Run the canonical 9-variant benchmark matrix for Prism kv_bench.
+#
+# Inflight sweep:
+#   v1-v5 use inflight=1 (serialized overhead baseline).
+#   v6-v9 use inflight=16 (async throughput measurement).
+#   Comparing v1↔v6, v2↔v7, v3↔v8, v4↔v9 isolates the inflight scaling factor
+#   at each (clients, workers, value_size) combination.
 #
 # Usage:
 #   ./run_benchmark_matrix.sh [OUTPUT_DIR]

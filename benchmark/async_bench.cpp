@@ -44,6 +44,7 @@ namespace prism::bench
 			std::string backend_name = "thread_pool";
 			std::string workload = "random_read";
 			std::size_t ops = 10000;
+			int inflight = 1;
 		};
 
 		struct ReadRequest
@@ -122,7 +123,7 @@ namespace prism::bench
 				std::fprintf(stderr, "error: %.*s\n", static_cast<int>(error.size()), error.data());
 			}
 			std::fprintf(stderr,
-			    "usage: %s [--backend=thread_pool|blocking_lane] [--workload=random_read] [--ops=N]\n",
+			    "usage: %s [--backend=thread_pool|blocking_lane] [--workload=random_read] [--ops=N] [--inflight=N]\n",
 			    argv0);
 			std::exit(1);
 		}
@@ -178,6 +179,12 @@ namespace prism::bench
 				else if (arg.starts_with("--ops="))
 				{
 					cfg.ops = ParseSize(arg.substr(std::string_view("--ops=").size()), argv[0]);
+				}
+				else if (arg.starts_with("--inflight="))
+				{
+					const auto val = static_cast<int>(ParseSize(
+					    arg.substr(std::string_view("--inflight=").size()), argv[0]));
+					cfg.inflight = (val < 1) ? 1 : val;
 				}
 				else
 				{
@@ -282,7 +289,7 @@ namespace prism::bench
 			return task.SyncWait();
 		}
 
-		std::vector<double> RunRandomReadBenchmark(
+		std::vector<double> RunRandomReadBenchmarkSequential(
 		    const std::vector<AsyncRandomAccessFile>& files, const std::vector<ReadRequest>& requests)
 		{
 			auto task = [&](const std::vector<AsyncRandomAccessFile>* p_files,
@@ -314,6 +321,99 @@ namespace prism::bench
 			}(std::addressof(files), std::addressof(requests));
 
 			return task.SyncWait();
+		}
+
+		std::size_t SlotStart(std::size_t total, int num_slots, int slot_id)
+		{
+			const std::size_t base = total / static_cast<std::size_t>(num_slots);
+			const std::size_t remainder = total % static_cast<std::size_t>(num_slots);
+			return static_cast<std::size_t>(slot_id) * base
+			    + std::min(static_cast<std::size_t>(slot_id), remainder);
+		}
+
+		std::size_t SlotCount(std::size_t total, int num_slots, int slot_id)
+		{
+			const std::size_t base = total / static_cast<std::size_t>(num_slots);
+			const std::size_t remainder = total % static_cast<std::size_t>(num_slots);
+			return base + (static_cast<std::size_t>(slot_id) < remainder ? 1 : 0);
+		}
+
+		std::vector<double> RunRandomReadBenchmarkConcurrent(
+		    ThreadPoolScheduler& scheduler,
+		    const std::vector<AsyncRandomAccessFile>& files,
+		    const std::vector<ReadRequest>& requests,
+		    int inflight)
+		{
+			StartGate gate;
+			DoneState done(inflight);
+
+			std::mutex lat_mutex;
+			std::vector<double> all_latencies;
+			all_latencies.reserve(requests.size());
+			std::atomic<std::size_t> bytes_read{ 0 };
+
+			for (int slot = 0; slot < inflight; ++slot)
+			{
+				const std::size_t start_idx = SlotStart(requests.size(), inflight, slot);
+				const std::size_t op_count = SlotCount(requests.size(), inflight, slot);
+
+				[&](std::size_t start, std::size_t count) -> Detached {
+					try
+					{
+						co_await gate;
+
+						std::vector<double> local_lat;
+						local_lat.reserve(count);
+						std::array<std::byte, kRecordSize> scratch{ };
+						std::size_t local_bytes = 0;
+
+						for (std::size_t i = 0; i < count; ++i)
+						{
+							const auto& request = requests[start + i];
+							const auto t0 = Clock::now();
+							auto result = co_await files[request.file_index].ReadAtAsync(
+							    request.offset, std::span<std::byte>(scratch));
+							const auto t1 = Clock::now();
+							if (!result.has_value())
+							{
+								throw std::runtime_error(result.error().ToString());
+							}
+							local_bytes += result.value();
+							local_lat.push_back(
+							    std::chrono::duration<double, std::micro>(t1 - t0).count());
+						}
+
+						bytes_read.fetch_add(local_bytes, std::memory_order_relaxed);
+
+						{
+							std::lock_guard lock(lat_mutex);
+							all_latencies.insert(all_latencies.end(), local_lat.begin(),
+							    local_lat.end());
+						}
+					}
+					catch (...)
+					{
+						done.exception = std::current_exception();
+					}
+					done.NotifyDone();
+					co_return;
+				}(start_idx, op_count);
+			}
+
+			gate.Open(scheduler);
+			done.done.acquire();
+
+			if (done.exception)
+			{
+				std::rethrow_exception(done.exception);
+			}
+
+			if (bytes_read.load(std::memory_order_relaxed) == 0)
+			{
+				throw std::runtime_error("benchmark read zero bytes");
+			}
+
+			return all_latencies;
 		}
 
 		double PercentileUs(std::vector<double> latencies, double p)
@@ -360,7 +460,15 @@ int main(int argc, char** argv)
 		const auto files = OpenAsyncFiles(async_env, file_paths);
 
 		const auto start = Clock::now();
-		auto latencies_us = RunRandomReadBenchmark(files, requests);
+		std::vector<double> latencies_us;
+		if (cfg.inflight <= 1)
+		{
+			latencies_us = RunRandomReadBenchmarkSequential(files, requests);
+		}
+		else
+		{
+			latencies_us = RunRandomReadBenchmarkConcurrent(scheduler, files, requests, cfg.inflight);
+		}
 		const auto end = Clock::now();
 
 		const double elapsed_seconds = std::chrono::duration<double>(end - start).count();
@@ -369,6 +477,14 @@ int main(int argc, char** argv)
 		std::printf("backend: %s\n", cfg.backend_name.c_str());
 		std::printf("workload: %s\n", cfg.workload.c_str());
 		std::printf("ops: %zu\n", cfg.ops);
+		if (cfg.inflight <= 1)
+		{
+			std::printf("inflight: %d (serialized overhead baseline)\n", cfg.inflight);
+		}
+		else
+		{
+			std::printf("inflight: %d\n", cfg.inflight);
+		}
 		std::printf("throughput: %.2f ops/sec\n", throughput);
 		std::printf("p50: %.2f us\n", PercentileUs(latencies_us, 0.50));
 		std::printf("p95: %.2f us\n", PercentileUs(latencies_us, 0.95));
