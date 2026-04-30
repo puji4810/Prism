@@ -197,6 +197,10 @@ namespace prism
 			bool HandleJobCompletion(const QueuedJob& job, bool queue_empty_after,
 			                        ThreadPoolScheduler& scheduler) noexcept;
 
+			// Mechanics: register this worker as idle in pending_list_ and signal
+			// the priority dispatcher so it can route work here.
+			void RegisterAsIdleWorker(ThreadPoolScheduler& scheduler);
+
 			std::counting_semaphore<> semaphore_{ 0z };
 			std::jthread thread_{};
 			std::mutex mutex_;
@@ -245,6 +249,26 @@ namespace prism
 
 		bool IsExitRequested() const noexcept;
 		void Exit() noexcept;
+
+		// ── Policy helpers (path-selection decisions) ──────────────────
+		// ShouldUseFastPath: returns true when priority==0 enables the
+		//   worker-local submit fast path rather than priority-queue dispatch.
+		static bool ShouldUseFastPath(std::size_t priority) noexcept;
+
+		// ShouldAcceptSubmitDuringShutdown: gate that permits only worker
+		//   re-entrant submits after exit_flag_ is set.
+		bool ShouldAcceptSubmitDuringShutdown() const noexcept;
+
+		// ShouldPromoteLazyTask: returns true when a delayed task's deadline
+		//   has expired, meaning it should be dispatched immediately.
+		static bool ShouldPromoteLazyTask(
+		    const LazyTask& task,
+		    std::chrono::steady_clock::time_point now) noexcept;
+
+		// ── Mechanics helpers (queue/thread operations) ─────────────────
+		// PushToPriorityQueue: enqueue a job into priority_queue_ and
+		//   optionally wake the priority dispatcher thread.
+		void PushToPriorityQueue(Job job, std::size_t priority, bool wake = true);
 
 		std::vector<WorkThread> work_threads_;
 		std::vector<WorkThread*> pending_list_;
