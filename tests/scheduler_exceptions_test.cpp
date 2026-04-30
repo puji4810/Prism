@@ -178,3 +178,158 @@ TEST(SchedulerExceptionsTest, DrainRemainingThrowTerminates)
 // ---------------------------------------------------------------------------
 // GoogleTest main
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// CaughtExceptionDoesNotAffectScheduler
+// A task that internally catches its own exception must not affect the
+// scheduler's ability to process subsequent tasks. The worker and scheduler
+// must remain healthy.
+// ---------------------------------------------------------------------------
+TEST(SchedulerExceptionsTest, CaughtExceptionDoesNotAffectScheduler)
+{
+	ThreadPoolScheduler scheduler(2);
+
+	std::atomic<int> before_counter{ 0 };
+	std::atomic<int> after_counter{ 0 };
+
+	// Submit a task that throws and catches internally.
+	scheduler.Submit([&before_counter]() {
+		try
+		{
+			throw std::runtime_error("handled inside task");
+		}
+		catch (...)
+		{
+		}
+		before_counter.fetch_add(1, std::memory_order_release);
+	});
+
+	// Wait for it to complete, then submit more work.
+	auto start = std::chrono::steady_clock::now();
+	while (before_counter.load(std::memory_order_acquire) == 0
+	       && std::chrono::steady_clock::now() - start < 5s)
+		std::this_thread::yield();
+
+	ASSERT_EQ(before_counter.load(), 1)
+	    << "Task that caught its own exception did not complete";
+
+	for (int i = 0; i < 50; ++i)
+	{
+		scheduler.Submit([&after_counter]() {
+			after_counter.fetch_add(1, std::memory_order_relaxed);
+		});
+	}
+
+	start = std::chrono::steady_clock::now();
+	while (after_counter.load(std::memory_order_acquire) < 50
+	       && std::chrono::steady_clock::now() - start < 5s)
+		std::this_thread::yield();
+
+	EXPECT_EQ(after_counter.load(), 50)
+	    << "Scheduler unable to process tasks after internally caught exception: "
+	    << after_counter.load() << "/50";
+}
+
+// ---------------------------------------------------------------------------
+// MultipleWorkersHandleInternalExceptions
+// All workers processing tasks that catch internal exceptions must continue
+// processing subsequent work.
+// ---------------------------------------------------------------------------
+TEST(SchedulerExceptionsTest, MultipleWorkersHandleInternalExceptions)
+{
+	ThreadPoolScheduler scheduler(4);
+
+	std::atomic<int> exception_tasks_done{ 0 };
+	std::atomic<int> followup_tasks_done{ 0 };
+	constexpr int kNumExceptionTasks = 100;
+
+	for (int i = 0; i < kNumExceptionTasks; ++i)
+	{
+		scheduler.Submit([&exception_tasks_done]() {
+			try
+			{
+				if (exception_tasks_done.load(std::memory_order_relaxed) % 3 == 0)
+					throw std::logic_error("periodic internal exception");
+			}
+			catch (...)
+			{
+			}
+			exception_tasks_done.fetch_add(1, std::memory_order_release);
+		});
+	}
+
+	auto start = std::chrono::steady_clock::now();
+	while (exception_tasks_done.load(std::memory_order_acquire) < kNumExceptionTasks
+	       && std::chrono::steady_clock::now() - start < 5s)
+		std::this_thread::yield();
+
+	ASSERT_EQ(exception_tasks_done.load(), kNumExceptionTasks)
+	    << "Exception-handling tasks did not all complete";
+
+	// Submit follow-up work to verify scheduler health.
+	for (int i = 0; i < 200; ++i)
+	{
+		scheduler.Submit([&followup_tasks_done]() {
+			followup_tasks_done.fetch_add(1, std::memory_order_relaxed);
+		});
+	}
+
+	start = std::chrono::steady_clock::now();
+	while (followup_tasks_done.load(std::memory_order_acquire) < 200
+	       && std::chrono::steady_clock::now() - start < 5s)
+		std::this_thread::yield();
+
+	EXPECT_EQ(followup_tasks_done.load(), 200)
+	    << "Scheduler unhealthy after multiple workers handled internal exceptions: "
+	    << followup_tasks_done.load() << "/200";
+}
+
+// ---------------------------------------------------------------------------
+// AffinityJobCaughtExceptionWorkerRemainsHealthy
+// An affinity task that catches its own exception must not corrupt the worker's
+// local queue. Follow-up affinity tasks must still execute on the same worker.
+// ---------------------------------------------------------------------------
+TEST(SchedulerExceptionsTest, AffinityJobCaughtExceptionWorkerRemainsHealthy)
+{
+	ThreadPoolScheduler scheduler(2);
+
+	std::atomic<bool> outer_done{ false };
+	std::thread::id outer_tid;
+	std::atomic<int> inner_done{ 0 };
+	std::thread::id inner_tid;
+
+	scheduler.Submit([&scheduler, &outer_done, &outer_tid, &inner_done, &inner_tid]() {
+		outer_tid = std::this_thread::get_id();
+		auto ctx = scheduler.CaptureContext();
+		ASSERT_TRUE(ctx.IsValid());
+
+		// Submit an affinity task that catches its own exception.
+		scheduler.SubmitIn(ctx, []() {
+			try
+			{
+				throw std::runtime_error("affinity internal exception");
+			}
+			catch (...)
+			{
+			}
+		});
+
+		// Follow-up affinity task to verify worker is still healthy.
+		scheduler.SubmitIn(ctx, [&inner_done, &inner_tid]() {
+			inner_tid = std::this_thread::get_id();
+			inner_done.fetch_add(1, std::memory_order_release);
+		});
+
+		outer_done.store(true, std::memory_order_release);
+	});
+
+	auto start = std::chrono::steady_clock::now();
+	while (inner_done.load(std::memory_order_acquire) < 1
+	       && std::chrono::steady_clock::now() - start < 5s)
+		std::this_thread::yield();
+
+	EXPECT_EQ(inner_done.load(), 1)
+	    << "Follow-up affinity task did not complete after caught exception";
+	EXPECT_EQ(outer_tid, inner_tid)
+	    << "Affinity worker changed after internally caught exception";
+}

@@ -329,3 +329,121 @@ TEST(SchedulerPendingRegressionTest, AffinityJobsDoNotSpuriouslyReregister)
 	}
 	ASSERT_TRUE(WaitFor(health, 10, 5s)) << "scheduler unhealthy after affinity chain";
 }
+
+// ---------------------------------------------------------------------------
+// TEST 6: Idle workers wake and make progress after new submissions
+//
+// Verify that after all workers go idle (drain to empty), a new submission
+// wakes a worker and makes progress. This characterizes the basic wakeup
+// contract for the pending_list_ / dispatcher pipeline.
+// ---------------------------------------------------------------------------
+TEST(SchedulerPendingRegressionTest, IdleWorkersWakeOnNewSubmissions)
+{
+	ThreadPoolScheduler scheduler(2);
+
+	std::atomic<int> first_batch{ 0 };
+	std::atomic<int> second_batch{ 0 };
+
+	// Drain the scheduler: submit a batch, wait for completion.
+	for (int i = 0; i < 100; ++i)
+	{
+		scheduler.Submit([&first_batch]() {
+			first_batch.fetch_add(1, std::memory_order_relaxed);
+		});
+	}
+	ASSERT_TRUE(WaitFor(first_batch, 100, 5s)) << "First batch did not complete";
+
+	// Workers should now be idle. Submit a second batch.
+	for (int i = 0; i < 100; ++i)
+	{
+		scheduler.Submit([&second_batch]() {
+			second_batch.fetch_add(1, std::memory_order_relaxed);
+		});
+	}
+
+	ASSERT_TRUE(WaitFor(second_batch, 100, 5s))
+	    << "Idle workers did not wake for second batch: " << second_batch.load() << "/100";
+}
+
+// ---------------------------------------------------------------------------
+// TEST 7: Multiple batch-drain cycles without zombie state
+//
+// Submit a batch, wait for completion, submit another batch, and repeat
+// through several cycles. Each batch must complete in full. This guards
+// against cumulative zombie or pending-list drain failures.
+// ---------------------------------------------------------------------------
+TEST(SchedulerPendingRegressionTest, ProgressiveBatchCyclesNoZombie)
+{
+	ThreadPoolScheduler scheduler(2);
+
+	constexpr int kCycles = 5;
+	constexpr int kPerCycle = 500;
+
+	for (int cycle = 0; cycle < kCycles; ++cycle)
+	{
+		std::atomic<int> counter{ 0 };
+		for (int i = 0; i < kPerCycle; ++i)
+		{
+			scheduler.Submit([&counter]() {
+				counter.fetch_add(1, std::memory_order_relaxed);
+			});
+		}
+		ASSERT_TRUE(WaitFor(counter, kPerCycle, 10s))
+		    << "Cycle " << cycle << " stalled at " << counter.load() << "/" << kPerCycle;
+	}
+
+	// Final health check: single affinity submission still routes correctly.
+	std::atomic<int> health{ 0 };
+	scheduler.Submit([&scheduler, &health]() {
+		auto ctx = scheduler.CaptureContext();
+		if (ctx.IsValid())
+		{
+			scheduler.SubmitIn(ctx, [&health]() {
+				health.fetch_add(1, std::memory_order_relaxed);
+			});
+		}
+	});
+	ASSERT_TRUE(WaitFor(health, 1, 5s))
+	    << "Scheduler unhealthy after batch cycles: affinity path broken";
+}
+
+// ---------------------------------------------------------------------------
+// TEST 8: Wakeup progress under mixed priority and delayed task flood
+//
+// Submit a mix of immediate tasks, priority tasks, and delayed tasks with
+// very short deadlines. Verify all tasks complete even when the lazy and
+// priority dispatchers compete for worker attention.
+// ---------------------------------------------------------------------------
+TEST(SchedulerPendingRegressionTest, MixedPriorityLazyWakeupProgress)
+{
+	ThreadPoolScheduler scheduler(2);
+
+	std::atomic<int> counter{ 0 };
+	constexpr int kImmediate = 200;
+	constexpr int kPriority = 200;
+	constexpr int kDelayed = 200;
+
+	for (int i = 0; i < kImmediate; ++i)
+	{
+		scheduler.Submit([&counter]() {
+			counter.fetch_add(1, std::memory_order_relaxed);
+		});
+	}
+	for (int i = 0; i < kPriority; ++i)
+	{
+		scheduler.Submit([&counter]() {
+			counter.fetch_add(1, std::memory_order_relaxed);
+		}, static_cast<std::size_t>(i % 5 + 1));
+	}
+	auto past = std::chrono::steady_clock::now() - 1s;
+	for (int i = 0; i < kDelayed; ++i)
+	{
+		scheduler.SubmitAfter(past, [&counter]() {
+			counter.fetch_add(1, std::memory_order_relaxed);
+		});
+	}
+
+	const int expected = kImmediate + kPriority + kDelayed;
+	ASSERT_TRUE(WaitFor(counter, expected, 15s))
+	    << "Mixed priority/lazy wakeup: " << counter.load() << "/" << expected << " completed";
+}

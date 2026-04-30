@@ -187,3 +187,127 @@ TEST(SchedulerInvariantTest, ZeroWakeupEmptySchedulerMainSubmit)
 
 	EXPECT_TRUE(done.load());
 }
+
+// ---------------------------------------------------------------------------
+// INVARIANT 5: PriorityTasksAllCompleteNoStarvation
+//
+// Submit tasks with mixed priorities to the priority-queue path. Every task
+// must execute exactly once, and no priority level must starve. This
+// characterizes the priority heap dispatch behavior before refactoring.
+// ---------------------------------------------------------------------------
+TEST(SchedulerInvariantTest, PriorityTasksAllCompleteNoStarvation)
+{
+	ThreadPoolScheduler scheduler(2);
+
+	auto counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumTasks = 500;
+
+	for (int i = 0; i < kNumTasks; ++i)
+	{
+		scheduler.Submit(
+		    [counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 10));
+	}
+
+	ASSERT_TRUE(PollUntil(
+	    [&] { return counter->load(std::memory_order_acquire) == kNumTasks; }, 10s))
+	    << "Priority tasks not all completed: " << counter->load() << "/" << kNumTasks;
+	EXPECT_EQ(counter->load(), kNumTasks);
+}
+
+// ---------------------------------------------------------------------------
+// INVARIANT 6: SamePriorityTasksAllComplete
+//
+// Submit many tasks with identical priority. All must execute without loss
+// or starvation, verifying FIFO-approximate behavior within the same priority
+// bucket.
+// ---------------------------------------------------------------------------
+TEST(SchedulerInvariantTest, SamePriorityTasksAllComplete)
+{
+	ThreadPoolScheduler scheduler(4);
+
+	auto counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumTasks = 1000;
+	constexpr std::size_t kPriority = 42;
+
+	for (int i = 0; i < kNumTasks; ++i)
+	{
+		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kPriority);
+	}
+
+	ASSERT_TRUE(PollUntil(
+	    [&] { return counter->load(std::memory_order_acquire) == kNumTasks; }, 10s))
+	    << "Same-priority tasks not all completed: " << counter->load() << "/" << kNumTasks;
+	EXPECT_EQ(counter->load(), kNumTasks);
+}
+
+// ---------------------------------------------------------------------------
+// INVARIANT 7: ConcurrentPrioritySubmissionPreservesProgress
+//
+// Multiple threads concurrently submitting tasks with mixed priorities must
+// not drop any task. This stress-tests priority_mutex_ and priority_queue_
+// under concurrent access.
+// ---------------------------------------------------------------------------
+TEST(SchedulerInvariantTest, ConcurrentPrioritySubmissionPreservesProgress)
+{
+	ThreadPoolScheduler scheduler(4);
+
+	auto counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kThreads = 4;
+	constexpr int kPerThread = 200;
+
+	std::vector<std::thread> threads;
+	for (int t = 0; t < kThreads; ++t)
+	{
+		threads.emplace_back([&scheduler, counter, t]() {
+			for (int i = 0; i < kPerThread; ++i)
+			{
+				scheduler.Submit(
+				    [counter]() { counter->fetch_add(1, std::memory_order_relaxed); },
+				    static_cast<std::size_t>((i + t) % 10));
+			}
+		});
+	}
+
+	for (auto& th : threads)
+		th.join();
+
+	const int expected = kThreads * kPerThread;
+	ASSERT_TRUE(PollUntil(
+	    [&] { return counter->load(std::memory_order_acquire) == expected; }, 10s))
+	    << "Concurrent priority submits lost tasks: " << counter->load() << "/" << expected;
+	EXPECT_EQ(counter->load(), expected);
+}
+
+// ---------------------------------------------------------------------------
+// INVARIANT 8: HighPriorityTasksProgressUnderConcurrentLoad
+//
+// Under sustained concurrent submission of mixed-priority tasks, high-priority
+// tasks must eventually complete. This guards against unbounded starvation
+// where low-priority tasks could consume all worker capacity.
+// ---------------------------------------------------------------------------
+TEST(SchedulerInvariantTest, HighPriorityTasksProgressUnderConcurrentLoad)
+{
+	ThreadPoolScheduler scheduler(2);
+
+	auto counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kHighPriority = 100;
+	constexpr int kLowPriority = 2000;
+	constexpr std::size_t kHighPri = 1000;
+	constexpr std::size_t kLowPri = 1;
+
+	// Submit high-priority tasks first, then flood with low-priority.
+	for (int i = 0; i < kHighPriority; ++i)
+	{
+		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kHighPri);
+	}
+	for (int i = 0; i < kLowPriority; ++i)
+	{
+		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kLowPri);
+	}
+
+	const int expected = kHighPriority + kLowPriority;
+	ASSERT_TRUE(PollUntil(
+	    [&] { return counter->load(std::memory_order_acquire) == expected; }, 15s))
+	    << "Mixed high/low priority tasks not all completed: " << counter->load() << "/" << expected;
+	EXPECT_EQ(counter->load(), expected);
+}
