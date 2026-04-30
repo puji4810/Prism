@@ -6,12 +6,17 @@ This document describes Prism's benchmark suite — the `kv_bench` binary, the s
 
 ```bash
 # Build
-xmake f -m release && xmake build kv_bench
+xmake f -m release && xmake build kv_bench async_bench
 
 # Run a quick sync + async mixed workload
 ./build/linux/x86_64/release/kv_bench --run=both --bench=mixed --ops=10000
 
-# Run the canonical 5-variant matrix with perf stat
+# Async microbenchmark — inflight sweep
+for n in 1 2 4 8 16; do
+    ./build/linux/x86_64/release/async_bench --ops=10000 --inflight=$n
+done
+
+# Run the canonical 9-variant matrix with perf stat
 ./benchmark/run_benchmark_matrix.sh results_baseline
 
 # Compare two results
@@ -114,9 +119,72 @@ kv_bench --run=async --bench=compaction_overlap --clients=4 --ops=20000 --value_
 
 ---
 
-## 2. `run_benchmark_matrix.sh` — Canonical 5-Variant Matrix
+## 2. `async_bench` — Async Microbenchmark
 
-Runs a standardized set of benchmark variants with `perf stat` for hardware counter collection.
+A lightweight coroutine throughput benchmark that performs raw `AsyncRandomAccessFile::ReadAtAsync` calls with no database overhead. Measures pure async I/O path performance: coroutine suspend/resume cost, scheduler dispatch latency, and file read throughput.
+
+Built from `benchmark/async_bench.cpp` + `benchmark/kv_bench_lib.cpp`.
+
+### CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--backend=<mode>` | `thread_pool\|blocking_lane` | `thread_pool` | Async execution backend |
+| `--workload=<mode>` | `random_read` | `random_read` | Workload type (only random_read supported) |
+| `--ops=<n>` | int | 10000 | Total read operations |
+| `--inflight=<n>` | int | 1 | Number of concurrent coroutine slots |
+
+### Inflight Semantics
+
+The `--inflight` flag controls how many coroutines run concurrently:
+
+- **`inflight=1`** (default): A single coroutine executes all operations sequentially. Labeled in output as `(serialized overhead baseline)`. This measures coroutine overhead without concurrency benefit.
+- **`inflight>1`**: N coroutines run concurrently via a `StartGate`, each handling `ops/N` requests. Measures true async throughput with scheduler-mediated concurrency.
+
+The inflight=1 baseline is essential for isolating the raw cost of coroutine machinery (suspend/resume, `AsyncOp` handshake, thread pool dispatch) from the throughput gains of pipelining multiple operations.
+
+### Output Format
+
+```
+backend: thread_pool
+workload: random_read
+ops: 10000
+inflight: 1 (serialized overhead baseline)
+throughput: 402717.54 ops/sec
+p50: 1.71 us
+p95: 3.65 us
+p99: 16.58 us
+```
+
+When `inflight>1`, the label drops the baseline suffix:
+```
+inflight: 8
+```
+
+### Usage Examples
+
+```bash
+# Build
+xmake f -m release && xmake build async_bench
+
+# Serialized baseline (single coroutine)
+./build/linux/x86_64/release/async_bench --ops=10000 --inflight=1
+
+# Concurrent sweep — measure throughput scaling with inflight
+for n in 1 2 4 8 16; do
+    echo "=== inflight=$n ==="
+    ./build/linux/x86_64/release/async_bench --ops=10000 --inflight=$n
+done
+
+# Blocking lane backend with high concurrency
+./build/linux/x86_64/release/async_bench --backend=blocking_lane --ops=50000 --inflight=16
+```
+
+---
+
+## 3. `run_benchmark_matrix.sh` — Canonical 9-Variant Matrix
+
+Runs a standardized set of benchmark variants with `perf stat` for hardware counter collection. Variants v1-v5 use `inflight=1` as the serialized overhead baseline; v6-v9 sweep `inflight=16` for async throughput measurement.
 
 ### Usage
 
@@ -181,7 +249,7 @@ SKIP_PERF=1 ./benchmark/run_benchmark_matrix.sh ci_results
 
 ---
 
-## 3. `compare_perf.py` — Results Comparison Tool
+## 4. `compare_perf.py` — Results Comparison Tool
 
 Compares two benchmark runs and produces a markdown report with delta percentages and regression detection.
 
@@ -257,7 +325,7 @@ python3 benchmark/compare_perf.py baseline/ current/ \
 
 ---
 
-## 4. `acceptance_harness.sh` — Before/After Acceptance Harness
+## 5. `acceptance_harness.sh` — Before/After Acceptance Harness
 
 Runs a lightweight set of sync+async variants and produces output compatible with `compare_perf.py`. Designed for quick before/after regression testing during development.
 
@@ -286,7 +354,7 @@ Runs a lightweight set of sync+async variants and produces output compatible wit
 | `async-small` | async | 2 | 2 | 1000 | 100 | 100 | 1 | Fast smoke test |
 | `sync-medium` | sync | 4 | 4 | 5000 | 1000 | 100 | 1 | Medium load |
 | `async-medium` | async | 4 | 4 | 5000 | 1000 | 100 | 1 | Medium load |
-| `async-inflight` | async | 4 | 4 | 5000 | 1000 | 100 | 4 | Inflight contention |
+| `async-inflight` | async | 4 | 4 | 5000 | 1000 | 100 | 4 | Inflight sweep (inflight=4 vs baseline inflight=1) |
 | `async-latency` | async | 2 | 2 | 500 | 100 | 100 | 1 | With p50/p95 collection |
 
 Each run creates a timestamped subdirectory under `--output-dir`, making it safe for repeated runs.
@@ -324,7 +392,7 @@ python3 benchmark/compare_perf.py \
 
 ---
 
-## 5. `profile_workflow.sh` — FlameGraph Profiling Workflow
+## 6. `profile_workflow.sh` — FlameGraph Profiling Workflow
 
 Profiles a single benchmark variant with `perf record` and generates an interactive FlameGraph SVG for hotspot analysis.
 
@@ -391,7 +459,7 @@ firefox evidence/async_mixed_c24w24/flamegraph.svg
 
 ---
 
-## 6. `async_optimization.md` — Optimization Guide
+## 7. `async_optimization.md` — Optimization Guide
 
 See `docs/async_optimization.md` for the comprehensive performance optimization guide that includes:
 
@@ -427,12 +495,18 @@ python3 benchmark/compare_perf.py "$BASELINE" "$CURRENT" \
 ```bash
 # 0. Build WITHOUT PRISM_RUNTIME_METRICS for accurate perf results
 #    Comment out line 14 (`add_defines("PRISM_RUNTIME_METRICS")`) in benchmark/xmake.lua
-xmake f -m release && xmake build kv_bench
+xmake f -m release && xmake build kv_bench async_bench
 
-# 1. Run the full 9-variant matrix
+# 1. Run the full 9-variant matrix (inflight=1 baseline + inflight=16 sweep)
 ./benchmark/run_benchmark_matrix.sh baseline_results
 
-# 2. Pick a hotspot for flamegraph analysis
+# 2. Async microbenchmark inflight sweep
+for n in 1 2 4 8 16 32; do
+    echo "=== inflight=$n ==="
+    ./build/linux/x86_64/release/async_bench --ops=50000 --inflight=$n
+done
+
+# 3. Pick a hotspot for flamegraph analysis
 ./benchmark/profile_workflow.sh \
     --variant v5_disk_backed \
     --bench-args "--run=async --bench=mixed --clients=24 --workers=24 --ops=50000 --value_size=10000 --read_ratio=99 --prefill=1 --no_latency --rounds=1"
@@ -457,7 +531,7 @@ SKIP_PERF=1 ./benchmark/run_benchmark_matrix.sh ci_results
 | `kv_bench_lib.cpp` | C++23 | Benchmark engine (sync/async runners, stats, parsing) |
 | `kv_bench_lib.h` | C++23 | Public benchmark API |
 | `bench_env_wrapper.h` | C++ | Environment wrapper for benchmarks |
-| `async_bench.cpp` | C++23 | Async microbenchmark |
+| `async_bench.cpp` | C++23 | Async microbenchmark (supports `--inflight=N` for concurrent coroutine sweeping) |
 | `executor_microbench.cpp` | C++23 | Executor queue isolation microbenchmark |
 | `function_overhead_bench.cpp` | C++23 | `std::function` vs custom callable overhead |
 | `run_benchmark_matrix.sh` | Bash | 5-variant throughput matrix with perf stat |

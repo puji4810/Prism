@@ -22,7 +22,7 @@
 #   async-small      Async mixed, c2/w2, ops=1000, vs=100
 #   sync-medium      Sync mixed, c4/w4, ops=5000, vs=1000
 #   async-medium     Async mixed, c4/w4, ops=5000, vs=1000
-#   async-inflight   Async mixed, c4/w4, ops=5000, vs=1000, inflight=4
+#   async-inflight   Async mixed, c4/w4, ops=5000, vs=1000, inflight=4 (compare vs async-medium inflight=1 for scaling)
 #   async-latency    Async mixed, c2/w2, ops=500, vs=100 (with p50/p95 collection)
 #
 # Output structure (per-variant directory, compatible with compare_perf.py):
