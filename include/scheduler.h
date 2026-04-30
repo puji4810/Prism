@@ -183,19 +183,23 @@ namespace prism
 			bool DrainRemaining() noexcept;
 
 		private:
-			void Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept;
-			bool TrySteal(ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state);
-
-			std::counting_semaphore<> semaphore_{ 0z };
-			std::jthread thread_{};
-			std::mutex mutex_;
-		struct QueuedJob
+			struct QueuedJob
 			{
 				Job job;
 				bool dispatched{ false };
 				bool stealable{ true };
 				bool stolen{ false };
 			};
+
+			void Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept;
+			bool TrySteal(ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state);
+			bool TryDequeueJob(QueuedJob& out, bool& queue_empty);
+			bool HandleJobCompletion(const QueuedJob& job, bool queue_empty_after,
+			                        ThreadPoolScheduler& scheduler) noexcept;
+
+			std::counting_semaphore<> semaphore_{ 0z };
+			std::jthread thread_{};
+			std::mutex mutex_;
 			std::deque<QueuedJob> queue_;
 			std::atomic<std::size_t> load_{ 0 };
 		};
@@ -227,6 +231,17 @@ namespace prism
 
 		// LazyLoop: Dispatcher thread that processes delayed tasks (lazy_queue_)
 		void LazyLoop();
+
+		// DispatchExpiredTask: push a ready lazy task to a worker or fall back to the priority queue.
+		void DispatchExpiredTask(LazyTask&& task);
+		// PromoteLazyResidueToWorkers: pre-join promotion of delayed tasks so workers can consume them.
+		void PromoteLazyResidueToWorkers();
+		// DrainLazyQueueToEmpty: post-join drain of lazy queue, executing inline when no worker available.
+		void DrainLazyQueueToEmpty(bool& work_remains);
+		// DrainPriorityQueueToEmpty: post-join drain of priority queue, executing inline when no worker available.
+		void DrainPriorityQueueToEmpty(bool& work_remains);
+		// DrainWorkerLocalQueues: drain each worker's remaining local-queue tasks after thread join.
+		void DrainWorkerLocalQueues(bool& work_remains);
 
 		bool IsExitRequested() const noexcept;
 		void Exit() noexcept;
