@@ -40,7 +40,7 @@ Built from `benchmark/kv_bench.cpp` + `benchmark/kv_bench_lib.cpp`. Supports syn
 | `--ops=<n>` | int | 10000 | Operations per client |
 | `--value_size=<n>` | int | 100 | Value size in bytes |
 | `--read_ratio=<n>` | int (0-100) | 0 | Percentage of reads in mixed mode |
-| `--inflight_per_client=<n>` | int | 1 | Outstanding operations per client (async only) |
+| `--inflight_per_client=<n>` | int | 1 | Outstanding operations per client (async only). Use `inflight=1` for serialized baseline; use `inflight_per_client > 1` (e.g., 2, 4, 8, 16) to measure async pipelining benefits. |
 | `--rounds=<n>` | int | 3 | Number of measurement rounds |
 | `--warmup_rounds=<n>` | int | 0 | Warmup rounds before measurement |
 | `--write_buffer_size=<n>` | int | 4MB | MemTable flush threshold |
@@ -53,6 +53,15 @@ Built from `benchmark/kv_bench.cpp` + `benchmark/kv_bench_lib.cpp`. Supports syn
 | `--phase=<mode>` | `full\|prefill_only\|warmup_only\|steady_state\|compaction_overlap_only` | `full` | Profiling phase isolation |
 | `--profile-pause-prefill` | flag | off | Pause VTune/ITT during prefill phase |
 | `--help` | flag | — | Print help |
+
+### Async DB Architecture Notes
+
+`AsyncDB` currently provides an asynchronous interface by wrapping the synchronous `DBImpl` engine and offloading operations to background executors. While this provides coroutine-friendly semantics, it is not yet "true" nonblocking I/O at the storage level.
+
+Performance benefits from the coroutine model primarily come from **pipelining** and **overlapping** I/O operations (especially when using multiple clients or high inflight depths).
+
+- **Serialized Baseline (`inflight_per_client=1`)**: Measures the overhead of the coroutine machinery without any concurrency benefits.
+- **Pipelined Measurement (`inflight_per_client > 1`)**: Recommended sweeps include `{1, 2, 4, 8, 16}`. Pipelining benefits generally cap when the number of outstanding operations saturates the available CPU or read executor worker threads.
 
 ### Building `kv_bench` for Perf Profiling
 

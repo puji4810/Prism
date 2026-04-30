@@ -279,7 +279,7 @@ namespace
 		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
 
 		prism::bench::Config cfg;
-		cfg.clients = 2;
+		cfg.clients = 1;
 		cfg.workers = 2;
 		cfg.ops_per_client = 100;
 		cfg.value_size = 100;
@@ -291,6 +291,7 @@ namespace
 		auto stats = prism::bench::RunAsyncMixed(async_db, scheduler, cfg, keys);
 
 		EXPECT_EQ(stats.max_client_inflight, 1);
+		EXPECT_EQ(stats.max_inflight_observed, 1);
 
 		std::filesystem::remove_all(db_dir);
 	}
@@ -306,7 +307,7 @@ namespace
 		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
 
 		prism::bench::Config cfg;
-		cfg.clients = 2;
+		cfg.clients = 1;
 		cfg.workers = 4;
 		cfg.ops_per_client = 200;
 		cfg.value_size = 100;
@@ -318,10 +319,41 @@ namespace
 		auto stats = prism::bench::RunAsyncMixed(async_db, scheduler, cfg, keys);
 
 		EXPECT_GT(stats.max_client_inflight, 1);
-		EXPECT_GE(stats.max_inflight_observed, static_cast<std::size_t>(cfg.clients));
+		EXPECT_LE(stats.max_client_inflight, static_cast<std::size_t>(cfg.inflight_per_client));
+		EXPECT_EQ(stats.max_inflight_observed, stats.max_client_inflight);
 
 		std::filesystem::remove_all(db_dir);
 	}
+
+	TEST(KVBenchAsyncMatrixTest, InflightFairnessAndSaturation)
+	{
+		std::string db_dir = MakeTestDir();
+		prism::Options options;
+		options.create_if_missing = true;
+		options.write_buffer_size = 4 * 1024 * 1024;
+
+		prism::ThreadPoolScheduler scheduler(4);
+		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+
+		prism::bench::Config cfg;
+		cfg.clients = 2;
+		cfg.workers = 4;
+		cfg.ops_per_client = 500;
+		cfg.value_size = 100;
+		cfg.read_ratio = 0;
+		cfg.inflight_per_client = 4;
+		cfg.no_latency = true;
+
+		auto keys = prism::bench::MakeKeys(cfg.clients, cfg.ops_per_client);
+		auto stats = prism::bench::RunAsyncMixed(async_db, scheduler, cfg, keys);
+
+		EXPECT_LE(stats.max_client_inflight, static_cast<std::size_t>(cfg.inflight_per_client));
+		EXPECT_GT(stats.max_inflight_observed, static_cast<std::size_t>(cfg.inflight_per_client));
+		EXPECT_LE(stats.max_inflight_observed, static_cast<std::size_t>(cfg.clients * cfg.inflight_per_client));
+
+		std::filesystem::remove_all(db_dir);
+	}
+
 
 	TEST(KVBenchAsyncMatrixTest, OutstandingWindowReachesConfiguredDepth)
 	{
