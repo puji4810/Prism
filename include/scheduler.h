@@ -59,8 +59,11 @@ namespace prism
 	//    - LazyLoop wakes up at deadline, pushes directly to a worker when possible
 	//    - Falls back to priority queue (max priority) if direct routing is unsuitable
 	//
-	// 3. SubmitIn(ctx, job): Affinity to specific worker thread
-	//    - Directly pushes to that worker's queue as pinned/non-stealable work
+	// 3. SubmitIn(ctx, job): Strict affinity to specific worker thread
+	//    - When ctx is valid for this scheduler: directly pushes to that worker's local queue
+	//    - Jobs remain stealable (work-stealing still applies even to affinity-pinned tasks)
+	//    - When ctx is invalid or belongs to a different scheduler: falls back to Submit()
+	//      (default priority-0 fast path with least-loaded-worker dispatch)
 	//    - Used for continuation on same thread (cache locality)
 	//
 	// Fallback Dispatch:
@@ -141,9 +144,19 @@ namespace prism
 			SubmitAfter(std::chrono::steady_clock::now() + delay, std::move(job));
 		}
 
-		// Submit job to specific worker thread (for cache locality).
-		// Precondition: ctx must be valid (captured via CaptureContext on a worker thread of this scheduler).
-		// If ctx is invalid or from a different scheduler, the job is submitted via the default priority path.
+		// Submit job with strict same-worker affinity (for cache locality).
+		//
+		// Strict affinity: when ctx was captured from a worker of THIS scheduler instance,
+		// the job is pushed directly to that exact worker's local queue. The job remains
+		// stealable — other workers may steal it under load, but the affinity-push
+		// maximizes the chance the same-worker executes it.
+		//
+		// Fallback: when ctx is invalid, default-constructed, or captured from a different
+		// scheduler instance, the job is submitted via Submit() (priority-0 fast path with
+		// least-loaded-worker dispatch). This fallback guarantees progress; no job is lost.
+		//
+		// During shutdown: only worker re-entrant SubmitIn calls are accepted
+		// (identical to Submit/SubmitAfter policy — see ShouldAcceptSubmitDuringShutdown).
 		void SubmitIn(Context ctx, Job job);
 		// Returns the number of worker threads in the pool.
 		std::size_t WorkerCount() const { return work_threads_.size(); }
