@@ -122,13 +122,44 @@ namespace prism
 		}
 	}
 
+	// ── Policy helpers ─────────────────────────────────────────────────
+
+	bool ThreadPoolScheduler::ShouldUseFastPath(std::size_t priority) noexcept
+	{
+		return priority == 0;
+	}
+
+	bool ThreadPoolScheduler::ShouldAcceptSubmitDuringShutdown() const noexcept
+	{
+		return !IsExitRequested() || (t_current_scheduler == this);
+	}
+
+	bool ThreadPoolScheduler::ShouldPromoteLazyTask(
+	    const LazyTask& task,
+	    std::chrono::steady_clock::time_point now) noexcept
+	{
+		return task.deadline <= now;
+	}
+
+	// ── Mechanics helpers ──────────────────────────────────────────────
+
+	void ThreadPoolScheduler::PushToPriorityQueue(Job job, std::size_t priority, bool wake)
+	{
+		{
+			std::lock_guard lock(priority_mutex_);
+			priority_queue_.push(PriorityTask{ std::move(job), priority });
+		}
+		if (wake)
+		{
+			priority_waiter_.release();
+		}
+	}
+
 	void ThreadPoolScheduler::Submit(Job job, std::size_t priority)
 	{
-		// Debug-only guard: external-thread submission after shutdown is unsupported.
-		// Worker re-entrant submissions during shutdown are supported and drained.
-		assert(!IsExitRequested() || (t_current_scheduler == this));
+		assert(ShouldAcceptSubmitDuringShutdown()); // POLICY: only worker re-entrant submits after exit
 
-		if (priority == 0)
+		if (ShouldUseFastPath(priority)) // POLICY: route to worker-local fast path or priority queue?
 		{
 			if (t_current_scheduler == this)
 			{
@@ -147,18 +178,14 @@ namespace prism
 			}
 		}
 
+		// POLICY: fast path unavailable → fall back to priority-queue dispatch.
 		RuntimeMetrics::Instance().foreground_fallback_submits.fetch_add(1, std::memory_order_relaxed);
-		{
-			std::lock_guard lock(priority_mutex_);
-			priority_queue_.push(PriorityTask{ std::move(job), priority });
-		}
-		priority_waiter_.release();
+		PushToPriorityQueue(std::move(job), priority, /*wake=*/true);
 	}
 
 	void ThreadPoolScheduler::SubmitAfter(std::chrono::steady_clock::time_point deadline, Job job)
 	{
-		// Debug-only guard: external-thread submission after shutdown is unsupported.
-		assert(!IsExitRequested() || (t_current_scheduler == this));
+		assert(ShouldAcceptSubmitDuringShutdown()); // POLICY: only worker re-entrant submits after exit
 
 		{
 			std::lock_guard lock(lazy_mutex_);
@@ -169,9 +196,7 @@ namespace prism
 
 	void ThreadPoolScheduler::SubmitIn(Context ctx, Job job)
 	{
-		// Debug-only guard: external-thread submission after shutdown is unsupported.
-		// Worker re-entrant submissions during shutdown are supported and drained.
-		assert(!IsExitRequested() || (t_current_scheduler == this));
+		assert(ShouldAcceptSubmitDuringShutdown()); // POLICY: only worker re-entrant submits after exit
 
 		// Only honor affinity if the context belongs to this scheduler instance.
 		if (ctx.scheduler_ == this)
@@ -246,11 +271,7 @@ namespace prism
 		const auto worker_index = ChooseLeastLoadedWorker();
 		if (!TryPushToWorker(std::move(task.job), worker_index, false, true))
 		{
-			{
-				std::lock_guard priority_lock(priority_mutex_);
-				priority_queue_.push(PriorityTask{ std::move(task.job), kLazyFallbackPriority });
-			}
-			priority_waiter_.release();
+			PushToPriorityQueue(std::move(task.job), kLazyFallbackPriority, /*wake=*/true);
 		}
 	}
 
@@ -349,7 +370,7 @@ namespace prism
 		}
 	}
 
-	void ThreadPoolScheduler::LazyLoop()
+		void ThreadPoolScheduler::LazyLoop()
 	{
 		while (true)
 		{
@@ -367,11 +388,9 @@ namespace prism
 
 			auto task = lazy_queue_.top();
 			const auto now = std::chrono::steady_clock::now();
-			if (task.deadline <= now)
+			if (ShouldPromoteLazyTask(task, now)) // POLICY: deadline expired?
 			{
-				// Deadline expired: remove from queue and dispatch immediately
 				lazy_queue_.pop();
-				// Wake LazyLoop again if more tasks remain
 				if (!lazy_queue_.empty())
 				{
 					lazy_waiter_.release();
@@ -382,13 +401,10 @@ namespace prism
 			}
 			else
 			{
-				// Not yet ready: wait until deadline or new task insertion wakes us
 				const auto deadline = task.deadline;
 				lock.unlock();
 
-				// Wait with timeout; returns true if woken by new task, false if deadline expired
 				(void)lazy_waiter_.try_acquire_until(deadline);
-				// Unconditionally release to re-enter loop and check top task again
 				lazy_waiter_.release();
 			}
 		}
@@ -546,6 +562,15 @@ namespace prism
 		return true;
 	}
 
+	void ThreadPoolScheduler::WorkThread::RegisterAsIdleWorker(ThreadPoolScheduler& scheduler)
+	{
+		{
+			std::lock_guard lock(scheduler.pending_mutex_);
+			scheduler.pending_list_.push_back(this);
+		}
+		scheduler.priority_waiter_.release();
+	}
+
 	bool ThreadPoolScheduler::WorkThread::HandleJobCompletion(
 	    const QueuedJob& job, bool queue_empty_after,
 	    ThreadPoolScheduler& scheduler) noexcept
@@ -568,6 +593,7 @@ namespace prism
 			RuntimeMetrics::Instance().worker_local_jobs_completed.fetch_add(1, std::memory_order_relaxed);
 		}
 
+		// POLICY: should this worker re-register as idle for dispatcher routing?
 		bool should_reregister = queue_empty_after;
 		if (job.stolen && !should_reregister)
 		{
@@ -577,11 +603,7 @@ namespace prism
 
 		if (should_reregister)
 		{
-			{
-				std::lock_guard lock(scheduler.pending_mutex_);
-				scheduler.pending_list_.push_back(this);
-			}
-			scheduler.priority_waiter_.release();
+			RegisterAsIdleWorker(scheduler); // MECHANICS
 		}
 
 		if (scheduler.IsExitRequested())
