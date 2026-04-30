@@ -400,3 +400,98 @@ TEST(SchedulerShutdownTest, DelayedTaskPromotesDuringShutdownWithFallback)
 	EXPECT_EQ(counter->load(), kNumTasks)
 	    << "Delayed tasks with future deadline were not promoted/executed during shutdown";
 }
+
+// ---------------------------------------------------------------------------
+// NestedDelayedTasksPromotedDuringShutdown
+// A promoted delayed task that itself submits another delayed task during
+// shutdown drain must also have that nested task promoted and executed.
+// This characterizes the re-entrant SubmitAfter safety during drain.
+// ---------------------------------------------------------------------------
+TEST(SchedulerShutdownTest, NestedDelayedTasksPromotedDuringShutdown)
+{
+	auto outer_counter = std::make_shared<std::atomic<int>>(0);
+	auto inner_counter = std::make_shared<std::atomic<int>>(0);
+
+	{
+		ThreadPoolScheduler scheduler(2);
+
+		auto far_future = std::chrono::steady_clock::now() + 30s;
+		scheduler.SubmitAfter(far_future, [&scheduler, outer_counter, inner_counter]() {
+			outer_counter->fetch_add(1, std::memory_order_relaxed);
+			// Re-entrant delayed submission during drain promotion.
+			auto nested_future = std::chrono::steady_clock::now() + 60s;
+			scheduler.SubmitAfter(nested_future, [inner_counter]() {
+				inner_counter->fetch_add(1, std::memory_order_relaxed);
+			});
+		});
+	}
+
+	EXPECT_EQ(outer_counter->load(), 1)
+	    << "Outer delayed task not promoted during shutdown";
+	EXPECT_EQ(inner_counter->load(), 1)
+	    << "Nested delayed task not promoted during shutdown drain";
+}
+
+// ---------------------------------------------------------------------------
+// VeryLargeDelayedTaskBatchPromotedOnShutdown
+// A very large batch of delayed tasks with future deadlines must all be
+// promoted and executed during shutdown, including any heap-level reordering
+// within the lazy_queue_ max-heap.
+// ---------------------------------------------------------------------------
+TEST(SchedulerShutdownTest, VeryLargeDelayedTaskBatchPromotedOnShutdown)
+{
+	auto counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumTasks = 5000;
+
+	{
+		ThreadPoolScheduler scheduler(4);
+
+		auto future = std::chrono::steady_clock::now() + 30s;
+		for (int i = 0; i < kNumTasks; ++i)
+		{
+			scheduler.SubmitAfter(future, [counter]() {
+				counter->fetch_add(1, std::memory_order_relaxed);
+			});
+		}
+	}
+
+	EXPECT_EQ(counter->load(), kNumTasks)
+	    << "Large batch of delayed tasks was not fully promoted/executed during shutdown";
+}
+
+// ---------------------------------------------------------------------------
+// ImmediatePlusDelayedZeroPriorityShutdown
+// Submit a mix of immediate tasks (priority 0, worker-local path) and
+// delayed tasks (future deadline). On shutdown, the delayed tasks must
+// be promoted and executed alongside the immediate tasks. This tests
+// the coordination between worker-local and lazy-queue drain paths.
+// ---------------------------------------------------------------------------
+TEST(SchedulerShutdownTest, ImmediatePlusDelayedZeroPriorityShutdown)
+{
+	auto immediate_counter = std::make_shared<std::atomic<int>>(0);
+	auto delayed_counter = std::make_shared<std::atomic<int>>(0);
+	constexpr int kNumEach = 500;
+
+	{
+		ThreadPoolScheduler scheduler(4);
+
+		for (int i = 0; i < kNumEach; ++i)
+		{
+			scheduler.Submit(
+			    [immediate_counter]() { immediate_counter->fetch_add(1, std::memory_order_relaxed); });
+		}
+
+		auto future = std::chrono::steady_clock::now() + 30s;
+		for (int i = 0; i < kNumEach; ++i)
+		{
+			scheduler.SubmitAfter(future, [delayed_counter]() {
+				delayed_counter->fetch_add(1, std::memory_order_relaxed);
+			});
+		}
+	}
+
+	EXPECT_EQ(immediate_counter->load(), kNumEach)
+	    << "Immediate zero-priority tasks were dropped during mixed shutdown";
+	EXPECT_EQ(delayed_counter->load(), kNumEach)
+	    << "Delayed tasks were not promoted/executed during mixed zero-priority shutdown";
+}
