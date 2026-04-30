@@ -240,6 +240,8 @@ namespace prism
 		// TryDispatch: Find idle worker and assign job. Returns false if no idle workers.
 		// Only consumes `job` on success so callers can safely retry/fallback.
 		bool TryDispatch(Job& job);
+		WorkThread* TryReserveIdleWorker();
+		void ReturnReservedIdleWorker(WorkThread* worker);
 		bool TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable);
 		std::size_t ChooseLeastLoadedWorker() const;
 

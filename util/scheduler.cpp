@@ -254,16 +254,38 @@ namespace prism
 
 	bool ThreadPoolScheduler::TryDispatch(Job& job)
 	{
-		std::lock_guard lock(pending_mutex_);
-		if (pending_list_.empty())
+		auto* worker = TryReserveIdleWorker();
+		if (worker == nullptr)
 		{
 			return false;
 		}
 
-		auto* t = pending_list_.back();
-		pending_list_.pop_back();
-		t->PushDispatched(std::move(job));
+		worker->PushDispatched(std::move(job));
 		return true;
+	}
+
+	ThreadPoolScheduler::WorkThread* ThreadPoolScheduler::TryReserveIdleWorker()
+	{
+		std::lock_guard lock(pending_mutex_);
+		if (pending_list_.empty())
+		{
+			return nullptr;
+		}
+
+		auto* worker = pending_list_.back();
+		pending_list_.pop_back();
+		return worker;
+	}
+
+	void ThreadPoolScheduler::ReturnReservedIdleWorker(WorkThread* worker)
+	{
+		if (worker == nullptr)
+		{
+			return;
+		}
+
+		std::lock_guard lock(pending_mutex_);
+		pending_list_.push_back(worker);
 	}
 
 	void ThreadPoolScheduler::DispatchExpiredTask(LazyTask&& task)
@@ -354,27 +376,36 @@ namespace prism
 				break;
 			}
 
+			auto* worker = TryReserveIdleWorker();
+			if (worker == nullptr)
+			{
+				continue;
+			}
+
 			PriorityTask task;
+			bool has_task = false;
 			{
 				std::lock_guard lock(priority_mutex_);
 				// Over-notification from worker threads may result in empty queue
-				if (priority_queue_.empty())
+				if (!priority_queue_.empty())
 				{
-					continue;
+					task = std::move(const_cast<PriorityTask&>(priority_queue_.top()));
+					priority_queue_.pop();
+					has_task = true;
 				}
-
-				task = std::move(const_cast<PriorityTask&>(priority_queue_.top()));
-				priority_queue_.pop();
 			}
 
-			if (!TryDispatch(task.job))
+			if (!has_task)
 			{
-				PushToPriorityQueue(std::move(task.job), task.priority, /*wake=*/false);
+				ReturnReservedIdleWorker(worker);
+				continue;
 			}
+
+			worker->PushDispatched(std::move(task.job));
 		}
 	}
 
-		void ThreadPoolScheduler::LazyLoop()
+	void ThreadPoolScheduler::LazyLoop()
 	{
 		while (true)
 		{
