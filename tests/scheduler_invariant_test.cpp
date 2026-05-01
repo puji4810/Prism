@@ -57,12 +57,10 @@ TEST(SchedulerInvariantTest, SelfSubmitRunsOnOwnWorker)
 		});
 	});
 
-	ASSERT_TRUE(PollUntil([&] { return done.load(std::memory_order_acquire); }))
-	    << "Timed out waiting for self-submitted job";
+	ASSERT_TRUE(PollUntil([&] { return done.load(std::memory_order_acquire); })) << "Timed out waiting for self-submitted job";
 
 	// The inner job must run on the same worker as the outer job.
-	EXPECT_EQ(outer_tid, inner_tid)
-	    << "Self-submit from worker must run on same worker thread (no dispatcher mediation)";
+	EXPECT_EQ(outer_tid, inner_tid) << "Self-submit from worker must run on same worker thread (no dispatcher mediation)";
 }
 
 // ---------------------------------------------------------------------------
@@ -108,8 +106,7 @@ TEST(SchedulerInvariantTest, SubmitInPinnedTaskStaysOnWorker)
 	ASSERT_EQ(inner_tids.size(), static_cast<std::size_t>(kAffinityJobs));
 	for (std::size_t i = 0; i < inner_tids.size(); ++i)
 	{
-		EXPECT_EQ(inner_tids[i], outer_tid)
-		    << "Affinity job " << i << " ran on wrong worker — pinning invariant violated";
+		EXPECT_EQ(inner_tids[i], outer_tid) << "Affinity job " << i << " ran on wrong worker — pinning invariant violated";
 	}
 }
 
@@ -131,17 +128,13 @@ TEST(SchedulerInvariantTest, NoLostWakeupsAcrossFallbackPaths)
 	// Submit a mix of dispatched and affinity jobs.
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([submit_counter]() {
-			submit_counter->fetch_add(1, std::memory_order_relaxed);
-		});
+		scheduler.Submit([submit_counter]() { submit_counter->fetch_add(1, std::memory_order_relaxed); });
 
 		scheduler.Submit([&scheduler, affinity_counter]() {
 			auto ctx = scheduler.CaptureContext();
 			if (ctx.IsValid())
 			{
-				scheduler.SubmitIn(ctx, [affinity_counter]() {
-					affinity_counter->fetch_add(1, std::memory_order_relaxed);
-				});
+				scheduler.SubmitIn(ctx, [affinity_counter]() { affinity_counter->fetch_add(1, std::memory_order_relaxed); });
 			}
 			else
 			{
@@ -157,8 +150,7 @@ TEST(SchedulerInvariantTest, NoLostWakeupsAcrossFallbackPaths)
 		        && affinity_counter->load(std::memory_order_acquire) == kNumTasks;
 	    },
 	    10s))
-	    << "Lost wakeups: submit=" << submit_counter->load() << " affinity=" << affinity_counter->load()
-	    << " expected=" << kNumTasks;
+	    << "Lost wakeups: submit=" << submit_counter->load() << " affinity=" << affinity_counter->load() << " expected=" << kNumTasks;
 
 	EXPECT_EQ(submit_counter->load(), kNumTasks);
 	EXPECT_EQ(affinity_counter->load(), kNumTasks);
@@ -178,9 +170,7 @@ TEST(SchedulerInvariantTest, ZeroWakeupEmptySchedulerMainSubmit)
 	std::atomic<bool> done{ false };
 
 	// Single job, no other work in the system.
-	scheduler.Submit([&done]() {
-		done.store(true, std::memory_order_release);
-	});
+	scheduler.Submit([&done]() { done.store(true, std::memory_order_release); });
 
 	ASSERT_TRUE(PollUntil([&] { return done.load(std::memory_order_acquire); }))
 	    << "Single main-thread submit to idle scheduler never completed";
@@ -204,12 +194,10 @@ TEST(SchedulerInvariantTest, PriorityTasksAllCompleteNoStarvation)
 
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit(
-		    [counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 10));
+		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 10));
 	}
 
-	ASSERT_TRUE(PollUntil(
-	    [&] { return counter->load(std::memory_order_acquire) == kNumTasks; }, 10s))
+	ASSERT_TRUE(PollUntil([&] { return counter->load(std::memory_order_acquire) == kNumTasks; }, 10s))
 	    << "Priority tasks not all completed: " << counter->load() << "/" << kNumTasks;
 	EXPECT_EQ(counter->load(), kNumTasks);
 }
@@ -234,8 +222,7 @@ TEST(SchedulerInvariantTest, SamePriorityTasksAllComplete)
 		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kPriority);
 	}
 
-	ASSERT_TRUE(PollUntil(
-	    [&] { return counter->load(std::memory_order_acquire) == kNumTasks; }, 10s))
+	ASSERT_TRUE(PollUntil([&] { return counter->load(std::memory_order_acquire) == kNumTasks; }, 10s))
 	    << "Same-priority tasks not all completed: " << counter->load() << "/" << kNumTasks;
 	EXPECT_EQ(counter->load(), kNumTasks);
 }
@@ -261,9 +248,7 @@ TEST(SchedulerInvariantTest, ConcurrentPrioritySubmissionPreservesProgress)
 		threads.emplace_back([&scheduler, counter, t]() {
 			for (int i = 0; i < kPerThread; ++i)
 			{
-				scheduler.Submit(
-				    [counter]() { counter->fetch_add(1, std::memory_order_relaxed); },
-				    static_cast<std::size_t>((i + t) % 10));
+				scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>((i + t) % 10));
 			}
 		});
 	}
@@ -272,8 +257,7 @@ TEST(SchedulerInvariantTest, ConcurrentPrioritySubmissionPreservesProgress)
 		th.join();
 
 	const int expected = kThreads * kPerThread;
-	ASSERT_TRUE(PollUntil(
-	    [&] { return counter->load(std::memory_order_acquire) == expected; }, 10s))
+	ASSERT_TRUE(PollUntil([&] { return counter->load(std::memory_order_acquire) == expected; }, 10s))
 	    << "Concurrent priority submits lost tasks: " << counter->load() << "/" << expected;
 	EXPECT_EQ(counter->load(), expected);
 }
@@ -306,8 +290,7 @@ TEST(SchedulerInvariantTest, HighPriorityTasksProgressUnderConcurrentLoad)
 	}
 
 	const int expected = kHighPriority + kLowPriority;
-	ASSERT_TRUE(PollUntil(
-	    [&] { return counter->load(std::memory_order_acquire) == expected; }, 15s))
+	ASSERT_TRUE(PollUntil([&] { return counter->load(std::memory_order_acquire) == expected; }, 15s))
 	    << "Mixed high/low priority tasks not all completed: " << counter->load() << "/" << expected;
 	EXPECT_EQ(counter->load(), expected);
 }

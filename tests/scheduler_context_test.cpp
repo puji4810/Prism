@@ -259,8 +259,7 @@ TEST(SchedulerContextTest, HighVolumeSubmitInAllComplete)
 	ASSERT_TRUE(PollUntil([&] { return done.load(std::memory_order_acquire) == kNumJobs; }, 10s))
 	    << "High-volume SubmitIn: only " << done.load() << "/" << kNumJobs << " completed";
 	EXPECT_EQ(done.load(), kNumJobs);
-	EXPECT_EQ(wrong_thread.load(), 0)
-	    << "SubmitIn affinity jobs ran on wrong worker thread (" << wrong_thread.load() << " times)";
+	EXPECT_EQ(wrong_thread.load(), 0) << "SubmitIn affinity jobs ran on wrong worker thread (" << wrong_thread.load() << " times)";
 }
 
 // ---------------------------------------------------------------------------
@@ -295,8 +294,7 @@ TEST(SchedulerContextTest, SubmitInOutOfRangeWorkerIndexFallsBack)
 	// This test primarily verifies the fallback path on ctx mismatch doesn't crash.
 	std::atomic<bool> ran{ false };
 	scheduler.SubmitIn(valid_ctx, [&ran]() { ran.store(true, std::memory_order_release); });
-	EXPECT_TRUE(PollUntil([&] { return ran.load(std::memory_order_acquire); }))
-	    << "SubmitIn with valid context: job must execute";
+	EXPECT_TRUE(PollUntil([&] { return ran.load(std::memory_order_acquire); })) << "SubmitIn with valid context: job must execute";
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +311,5 @@ TEST(SchedulerContextTest, CaptureContextFromExternalThreadIsInvalid)
 	});
 	external.join();
 
-	EXPECT_TRUE(ctx_invalid.load())
-	    << "CaptureContext from a non-worker, non-destructor thread must return invalid context";
+	EXPECT_TRUE(ctx_invalid.load()) << "CaptureContext from a non-worker, non-destructor thread must return invalid context";
 }

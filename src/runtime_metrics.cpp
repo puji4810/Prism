@@ -45,10 +45,10 @@ namespace prism
 
 	void RuntimeMetrics::PrintMetrics() const noexcept
 	{
-		auto read_in_flight = blocking_jobs_submitted.load(std::memory_order_relaxed) -
-		                      blocking_jobs_completed.load(std::memory_order_relaxed);
-		auto compaction_in_flight = compaction_queue_jobs_submitted.load(std::memory_order_relaxed) -
-		                            compaction_queue_jobs_completed.load(std::memory_order_relaxed);
+		auto read_in_flight
+		    = blocking_jobs_submitted.load(std::memory_order_relaxed) - blocking_jobs_completed.load(std::memory_order_relaxed);
+		auto compaction_in_flight = compaction_queue_jobs_submitted.load(std::memory_order_relaxed)
+		    - compaction_queue_jobs_completed.load(std::memory_order_relaxed);
 
 		std::fprintf(stderr,
 		    "--- RuntimeMetrics ---\n"
@@ -87,45 +87,38 @@ namespace prism
 		    "worker_local_jobs_completed:%lu\n"
 		    "stolen_jobs_completed:      %lu\n",
 		    static_cast<unsigned long>(blocking_jobs_submitted.load(std::memory_order_relaxed)),
-		    static_cast<unsigned long>(blocking_jobs_completed.load(std::memory_order_relaxed)),
-		    static_cast<unsigned long>(read_in_flight),
+		    static_cast<unsigned long>(blocking_jobs_completed.load(std::memory_order_relaxed)), static_cast<unsigned long>(read_in_flight),
 		    static_cast<unsigned long>(blocking_peak_queue_depth.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(blocking_enqueue_wait_total_us.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(blocking_exec_time_total_us.load(std::memory_order_relaxed)),
-		    blocking_jobs_completed > 0
-		        ? static_cast<double>(blocking_enqueue_wait_total_us.load(std::memory_order_relaxed)) /
-		              static_cast<double>(blocking_jobs_completed.load(std::memory_order_relaxed))
-		        : 0.0,
-		    blocking_jobs_completed > 0
-		        ? static_cast<double>(blocking_exec_time_total_us.load(std::memory_order_relaxed)) /
-		              static_cast<double>(blocking_jobs_completed.load(std::memory_order_relaxed))
-		        : 0.0,
+		    blocking_jobs_completed > 0 ? static_cast<double>(blocking_enqueue_wait_total_us.load(std::memory_order_relaxed))
+		            / static_cast<double>(blocking_jobs_completed.load(std::memory_order_relaxed))
+		                                : 0.0,
+		    blocking_jobs_completed > 0 ? static_cast<double>(blocking_exec_time_total_us.load(std::memory_order_relaxed))
+		            / static_cast<double>(blocking_jobs_completed.load(std::memory_order_relaxed))
+		                                : 0.0,
 		    static_cast<unsigned long>(compaction_queue_jobs_submitted.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(compaction_queue_jobs_completed.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(compaction_in_flight),
 		    static_cast<unsigned long>(compaction_peak_queue_depth.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(compaction_enqueue_wait_total_us.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(compaction_exec_time_total_us.load(std::memory_order_relaxed)),
-		    compaction_queue_jobs_completed > 0
-		        ? static_cast<double>(compaction_enqueue_wait_total_us.load(std::memory_order_relaxed)) /
-		              static_cast<double>(compaction_queue_jobs_completed.load(std::memory_order_relaxed))
-		        : 0.0,
-		    compaction_queue_jobs_completed > 0
-		        ? static_cast<double>(compaction_exec_time_total_us.load(std::memory_order_relaxed)) /
-		              static_cast<double>(compaction_queue_jobs_completed.load(std::memory_order_relaxed))
-		        : 0.0,
+		    compaction_queue_jobs_completed > 0 ? static_cast<double>(compaction_enqueue_wait_total_us.load(std::memory_order_relaxed))
+		            / static_cast<double>(compaction_queue_jobs_completed.load(std::memory_order_relaxed))
+		                                        : 0.0,
+		    compaction_queue_jobs_completed > 0 ? static_cast<double>(compaction_exec_time_total_us.load(std::memory_order_relaxed))
+		            / static_cast<double>(compaction_queue_jobs_completed.load(std::memory_order_relaxed))
+		                                        : 0.0,
 		    static_cast<unsigned long>(continuation_count.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(continuation_delay_total_us.load(std::memory_order_relaxed)),
-		    continuation_count > 0
-		        ? static_cast<double>(continuation_delay_total_us.load(std::memory_order_relaxed)) /
-		              static_cast<double>(continuation_count.load(std::memory_order_relaxed))
-		        : 0.0,
+		    continuation_count > 0 ? static_cast<double>(continuation_delay_total_us.load(std::memory_order_relaxed))
+		            / static_cast<double>(continuation_count.load(std::memory_order_relaxed))
+		                           : 0.0,
 		    static_cast<unsigned long>(get_async_db_op_count.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(get_async_db_op_total_us.load(std::memory_order_relaxed)),
-		    get_async_db_op_count > 0
-		        ? static_cast<double>(get_async_db_op_total_us.load(std::memory_order_relaxed)) /
-		              static_cast<double>(get_async_db_op_count.load(std::memory_order_relaxed))
-		        : 0.0,
+		    get_async_db_op_count > 0 ? static_cast<double>(get_async_db_op_total_us.load(std::memory_order_relaxed))
+		            / static_cast<double>(get_async_db_op_count.load(std::memory_order_relaxed))
+		                              : 0.0,
 		    static_cast<unsigned long>(compaction_jobs_submitted.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(compaction_jobs_completed.load(std::memory_order_relaxed)),
 		    active_compaction_lane.load(std::memory_order_relaxed),

@@ -18,17 +18,11 @@ namespace prism
 	{
 	}
 
-	void StopSource::RequestStop() noexcept
-	{
-		state_->stop_requested.store(true, std::memory_order_release);
-	}
+	void StopSource::RequestStop() noexcept { state_->stop_requested.store(true, std::memory_order_release); }
 
-	bool StopSource::StopRequested() const noexcept
-	{
-		return state_->stop_requested.load(std::memory_order_acquire);
-	}
+	bool StopSource::StopRequested() const noexcept { return state_->stop_requested.load(std::memory_order_acquire); }
 
-	StopToken StopSource::Token() const { return Token(StopToken{}); }
+	StopToken StopSource::Token() const { return Token(StopToken{ }); }
 
 	StopToken StopSource::Token(StopToken parent) const
 	{
@@ -65,13 +59,13 @@ namespace prism
 	void Quarantine::StoreCancelled()
 	{
 		std::lock_guard lock(mutex_);
-		entries_.push_back(Entry{ EntryKind::kCancelled, std::any{} });
+		entries_.push_back(Entry{ EntryKind::kCancelled, std::any{ } });
 	}
 
 	void Quarantine::StoreUnit()
 	{
 		std::lock_guard lock(mutex_);
-		entries_.push_back(Entry{ EntryKind::kUnit, std::any{} });
+		entries_.push_back(Entry{ EntryKind::kUnit, std::any{ } });
 	}
 
 	void Quarantine::StoreException(std::exception_ptr exception)
@@ -90,7 +84,7 @@ namespace prism
 	{
 		std::lock_guard lock(mutex_);
 		std::size_t count = 0;
-		for (const auto& entry: entries_)
+		for (const auto& entry : entries_)
 		{
 			if (entry.kind == kind)
 			{

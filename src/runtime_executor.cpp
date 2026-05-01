@@ -174,7 +174,7 @@ namespace prism
 		}
 		cv_.notify_all();
 
-		for (auto& worker: workers_)
+		for (auto& worker : workers_)
 		{
 			if (!worker.joinable())
 			{
@@ -197,12 +197,11 @@ namespace prism
 			RecordLaneSubmit(lane_, current_depth);
 			queue_.push_back([lane = lane_, submit_time, work = std::move(work)]() mutable {
 				auto exec_start = std::chrono::steady_clock::now();
-				auto wait_us = static_cast<uint64_t>(
-				    std::chrono::duration_cast<std::chrono::microseconds>(exec_start - submit_time).count());
+				auto wait_us
+				    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_start - submit_time).count());
 				work();
 				auto exec_end = std::chrono::steady_clock::now();
-				auto exec_us = static_cast<uint64_t>(
-				    std::chrono::duration_cast<std::chrono::microseconds>(exec_end - exec_start).count());
+				auto exec_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_end - exec_start).count());
 				RecordLaneCompletion(lane, wait_us, exec_us);
 			});
 		}
@@ -225,9 +224,8 @@ namespace prism
 	bool BlockingExecutor::IsCurrentWorker() const noexcept
 	{
 		const auto current_thread_id = std::this_thread::get_id();
-		return std::any_of(workers_.begin(), workers_.end(), [current_thread_id](const std::jthread& worker) {
-			return worker.joinable() && worker.get_id() == current_thread_id;
-		});
+		return std::any_of(workers_.begin(), workers_.end(),
+		    [current_thread_id](const std::jthread& worker) { return worker.joinable() && worker.get_id() == current_thread_id; });
 	}
 
 	void BlockingExecutor::WorkerLoop()

@@ -252,8 +252,7 @@ TEST(SchedulerShutdownTest, RetiredCloseWorkDrainedDuringShutdown)
 	}
 
 	// All tasks must be drained: kNumCloseTasks delayed + 1 affinity continuation.
-	EXPECT_EQ(close_counter->load(), kNumCloseTasks + 1)
-	    << "Retired-close modeled tasks were not fully drained on shutdown";
+	EXPECT_EQ(close_counter->load(), kNumCloseTasks + 1) << "Retired-close modeled tasks were not fully drained on shutdown";
 }
 
 // ---------------------------------------------------------------------------
@@ -294,8 +293,7 @@ TEST(SchedulerShutdownTest, AllSubmissionPathsDrainedOnShutdown)
 			ASSERT_TRUE(ctx.IsValid());
 			for (int i = 0; i < kNumEach; ++i)
 			{
-				scheduler.SubmitIn(ctx,
-				    [affinity_counter]() { affinity_counter->fetch_add(1, std::memory_order_relaxed); });
+				scheduler.SubmitIn(ctx, [affinity_counter]() { affinity_counter->fetch_add(1, std::memory_order_relaxed); });
 			}
 		});
 	}
@@ -362,16 +360,13 @@ TEST(SchedulerShutdownTest, WorkerLocalReentrantSubmitDuringShutdownDrain)
 				outer_counter->fetch_add(1, std::memory_order_relaxed);
 				// Re-entrant submit: worker submits a child job during its own execution.
 				// During shutdown drain, this child must also be drained.
-				scheduler.Submit([inner_counter]() {
-					inner_counter->fetch_add(1, std::memory_order_relaxed);
-				});
+				scheduler.Submit([inner_counter]() { inner_counter->fetch_add(1, std::memory_order_relaxed); });
 			});
 		}
 	}
 
 	EXPECT_EQ(outer_counter->load(), kOuter) << "Outer tasks were dropped";
-	EXPECT_EQ(inner_counter->load(), kOuter)
-	    << "Inner re-entrant tasks were dropped during shutdown drain";
+	EXPECT_EQ(inner_counter->load(), kOuter) << "Inner re-entrant tasks were dropped during shutdown drain";
 }
 
 // ---------------------------------------------------------------------------
@@ -391,14 +386,11 @@ TEST(SchedulerShutdownTest, DelayedTaskPromotesDuringShutdownWithFallback)
 		auto future = std::chrono::steady_clock::now() + 30s;
 		for (int i = 0; i < kNumTasks; ++i)
 		{
-			scheduler.SubmitAfter(future, [counter]() {
-				counter->fetch_add(1, std::memory_order_relaxed);
-			});
+			scheduler.SubmitAfter(future, [counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
 		}
 	}
 
-	EXPECT_EQ(counter->load(), kNumTasks)
-	    << "Delayed tasks with future deadline were not promoted/executed during shutdown";
+	EXPECT_EQ(counter->load(), kNumTasks) << "Delayed tasks with future deadline were not promoted/executed during shutdown";
 }
 
 // ---------------------------------------------------------------------------
@@ -420,16 +412,12 @@ TEST(SchedulerShutdownTest, NestedDelayedTasksPromotedDuringShutdown)
 			outer_counter->fetch_add(1, std::memory_order_relaxed);
 			// Re-entrant delayed submission during drain promotion.
 			auto nested_future = std::chrono::steady_clock::now() + 60s;
-			scheduler.SubmitAfter(nested_future, [inner_counter]() {
-				inner_counter->fetch_add(1, std::memory_order_relaxed);
-			});
+			scheduler.SubmitAfter(nested_future, [inner_counter]() { inner_counter->fetch_add(1, std::memory_order_relaxed); });
 		});
 	}
 
-	EXPECT_EQ(outer_counter->load(), 1)
-	    << "Outer delayed task not promoted during shutdown";
-	EXPECT_EQ(inner_counter->load(), 1)
-	    << "Nested delayed task not promoted during shutdown drain";
+	EXPECT_EQ(outer_counter->load(), 1) << "Outer delayed task not promoted during shutdown";
+	EXPECT_EQ(inner_counter->load(), 1) << "Nested delayed task not promoted during shutdown drain";
 }
 
 // ---------------------------------------------------------------------------
@@ -449,14 +437,11 @@ TEST(SchedulerShutdownTest, VeryLargeDelayedTaskBatchPromotedOnShutdown)
 		auto future = std::chrono::steady_clock::now() + 30s;
 		for (int i = 0; i < kNumTasks; ++i)
 		{
-			scheduler.SubmitAfter(future, [counter]() {
-				counter->fetch_add(1, std::memory_order_relaxed);
-			});
+			scheduler.SubmitAfter(future, [counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
 		}
 	}
 
-	EXPECT_EQ(counter->load(), kNumTasks)
-	    << "Large batch of delayed tasks was not fully promoted/executed during shutdown";
+	EXPECT_EQ(counter->load(), kNumTasks) << "Large batch of delayed tasks was not fully promoted/executed during shutdown";
 }
 
 // ---------------------------------------------------------------------------
@@ -477,21 +462,16 @@ TEST(SchedulerShutdownTest, ImmediatePlusDelayedZeroPriorityShutdown)
 
 		for (int i = 0; i < kNumEach; ++i)
 		{
-			scheduler.Submit(
-			    [immediate_counter]() { immediate_counter->fetch_add(1, std::memory_order_relaxed); });
+			scheduler.Submit([immediate_counter]() { immediate_counter->fetch_add(1, std::memory_order_relaxed); });
 		}
 
 		auto future = std::chrono::steady_clock::now() + 30s;
 		for (int i = 0; i < kNumEach; ++i)
 		{
-			scheduler.SubmitAfter(future, [delayed_counter]() {
-				delayed_counter->fetch_add(1, std::memory_order_relaxed);
-			});
+			scheduler.SubmitAfter(future, [delayed_counter]() { delayed_counter->fetch_add(1, std::memory_order_relaxed); });
 		}
 	}
 
-	EXPECT_EQ(immediate_counter->load(), kNumEach)
-	    << "Immediate zero-priority tasks were dropped during mixed shutdown";
-	EXPECT_EQ(delayed_counter->load(), kNumEach)
-	    << "Delayed tasks were not promoted/executed during mixed zero-priority shutdown";
+	EXPECT_EQ(immediate_counter->load(), kNumEach) << "Immediate zero-priority tasks were dropped during mixed shutdown";
+	EXPECT_EQ(delayed_counter->load(), kNumEach) << "Delayed tasks were not promoted/executed during mixed zero-priority shutdown";
 }

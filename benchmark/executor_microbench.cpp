@@ -60,8 +60,7 @@ namespace prism::bench
 
 	void RunExecutorMicrobench(int num_workers, int num_tasks)
 	{
-		BlockingExecutor executor(static_cast<std::size_t>(num_workers),
-		    BlockingExecutorLane::kGeneric);
+		BlockingExecutor executor(static_cast<std::size_t>(num_workers), BlockingExecutorLane::kGeneric);
 		ExecutorBenchStats stats;
 		std::atomic<uint64_t> counter{ 0 };
 		std::atomic<uint64_t> in_flight{ 0 };
@@ -83,10 +82,8 @@ namespace prism::bench
 
 			executor.Submit([submit_time, &stats, &in_flight, &counter] {
 				auto exec_time = Clock::now();
-				auto delay_us = static_cast<uint64_t>(
-				    std::chrono::duration_cast<std::chrono::microseconds>(
-				        exec_time - submit_time)
-				        .count());
+				auto delay_us
+				    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_time - submit_time).count());
 
 				AtomicMin(stats.delay_min_us, delay_us);
 				AtomicMax(stats.delay_max_us, delay_us);
@@ -98,16 +95,13 @@ namespace prism::bench
 			});
 		}
 
-		while (stats.exec_count.load(std::memory_order_relaxed) <
-		       static_cast<uint64_t>(num_tasks))
+		while (stats.exec_count.load(std::memory_order_relaxed) < static_cast<uint64_t>(num_tasks))
 		{
 			std::this_thread::yield();
 		}
 
 		auto bench_end = Clock::now();
-		auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-		                    bench_end - bench_start)
-		                    .count();
+		auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(bench_end - bench_start).count();
 
 		uint64_t submits = stats.submit_count.load(std::memory_order_relaxed);
 		uint64_t execs = stats.exec_count.load(std::memory_order_relaxed);
@@ -115,29 +109,21 @@ namespace prism::bench
 		uint64_t qd_min = stats.queue_depth_min.load(std::memory_order_relaxed);
 		uint64_t qd_max = stats.queue_depth_max.load(std::memory_order_relaxed);
 		uint64_t qd_sum = stats.queue_depth_sum.load(std::memory_order_relaxed);
-		double qd_avg =
-		    submits > 0 ? static_cast<double>(qd_sum) / static_cast<double>(submits) : 0.0;
+		double qd_avg = submits > 0 ? static_cast<double>(qd_sum) / static_cast<double>(submits) : 0.0;
 
 		uint64_t d_min = stats.delay_min_us.load(std::memory_order_relaxed);
 		uint64_t d_max = stats.delay_max_us.load(std::memory_order_relaxed);
 		uint64_t d_sum = stats.delay_sum_us.load(std::memory_order_relaxed);
-		double d_avg =
-		    execs > 0 ? static_cast<double>(d_sum) / static_cast<double>(execs) : 0.0;
+		double d_avg = execs > 0 ? static_cast<double>(d_sum) / static_cast<double>(execs) : 0.0;
 
-		std::printf(
-		    "workers=%d tasks=%d | submits=%lu execs=%lu | qd_min=%lu qd_max=%lu "
-		    "qd_avg=%.1f | delay_min=%lu delay_max=%lu delay_avg=%.1f\n",
-		    num_workers, num_tasks, static_cast<unsigned long>(submits),
-		    static_cast<unsigned long>(execs), static_cast<unsigned long>(qd_min),
-		    static_cast<unsigned long>(qd_max), qd_avg,
-		    static_cast<unsigned long>(d_min), static_cast<unsigned long>(d_max),
-		    d_avg);
+		std::printf("workers=%d tasks=%d | submits=%lu execs=%lu | qd_min=%lu qd_max=%lu "
+		            "qd_avg=%.1f | delay_min=%lu delay_max=%lu delay_avg=%.1f\n",
+		    num_workers, num_tasks, static_cast<unsigned long>(submits), static_cast<unsigned long>(execs),
+		    static_cast<unsigned long>(qd_min), static_cast<unsigned long>(qd_max), qd_avg, static_cast<unsigned long>(d_min),
+		    static_cast<unsigned long>(d_max), d_avg);
 
-		std::printf("counter=%lu  total_us=%lu  tasks/us=%.3f\n",
-		    static_cast<unsigned long>(counter.load(std::memory_order_relaxed)),
-		    static_cast<unsigned long>(total_us),
-		    total_us > 0 ? static_cast<double>(num_tasks) / static_cast<double>(total_us)
-		                 : 0.0);
+		std::printf("counter=%lu  total_us=%lu  tasks/us=%.3f\n", static_cast<unsigned long>(counter.load(std::memory_order_relaxed)),
+		    static_cast<unsigned long>(total_us), total_us > 0 ? static_cast<double>(num_tasks) / static_cast<double>(total_us) : 0.0);
 	}
 
 } // namespace prism::bench

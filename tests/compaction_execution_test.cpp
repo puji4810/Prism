@@ -357,10 +357,11 @@ namespace prism
 		AddL0CompactionFillersBeforeTarget("snap_mid", "z_anchor");
 
 		// Add target file LAST so L0 picker chooses it first (L0 ordered by descending file number).
-		AddTableFileLocked(0, {
-			Entry{ "snap_key", 2, kTypeValue, "new_val" },
-			Entry{ "snap_key", 1, kTypeValue, "old_val" },
-		});
+		AddTableFileLocked(0,
+		    {
+		        Entry{ "snap_key", 2, kTypeValue, "new_val" },
+		        Entry{ "snap_key", 1, kTypeValue, "old_val" },
+		    });
 
 		Status s = RunPickedCompaction();
 		ASSERT_TRUE(s.ok()) << s.ToString();
@@ -403,9 +404,10 @@ namespace prism
 		Open(options);
 
 		// Place base-level data at L2 so a future compaction could invoke IsBaseLevelForKey.
-		AddTableFileLocked(2, {
-			Entry{ "del_key", 1, kTypeValue, "base_val" },
-		});
+		AddTableFileLocked(2,
+		    {
+		        Entry{ "del_key", 1, kTypeValue, "base_val" },
+		    });
 
 		// Pin snapshot at sequence 1.
 		SetSequence(2);
@@ -417,10 +419,11 @@ namespace prism
 		AddL0CompactionFillersBeforeTarget("del_mid", "z_anchor");
 
 		// Add tombstone target LAST.
-		AddTableFileLocked(0, {
-			Entry{ "del_key", 2, kTypeDeletion, "" },
-			Entry{ "z_anchor", 1, kTypeValue, "z" },
-		});
+		AddTableFileLocked(0,
+		    {
+		        Entry{ "del_key", 2, kTypeDeletion, "" },
+		        Entry{ "z_anchor", 1, kTypeValue, "z" },
+		    });
 
 		Status s = RunPickedCompaction();
 		ASSERT_TRUE(s.ok()) << s.ToString();
@@ -464,10 +467,11 @@ namespace prism
 		SetSequence(3);
 
 		AddL0CompactionFillersBeforeTarget("reclaim_mid", "z_anchor");
-		AddTableFileLocked(0, {
-			Entry{ "reclaim_key", 2, kTypeValue, "new_val" },
-			Entry{ "reclaim_key", 1, kTypeValue, "old_val" },
-		});
+		AddTableFileLocked(0,
+		    {
+		        Entry{ "reclaim_key", 2, kTypeValue, "new_val" },
+		        Entry{ "reclaim_key", 1, kTypeValue, "old_val" },
+		    });
 
 		Status s = RunPickedCompaction();
 		ASSERT_TRUE(s.ok()) << "phase 1 compaction failed: " << s.ToString();
@@ -501,11 +505,8 @@ namespace prism
 		ASSERT_TRUE(s.ok()) << "phase 2 compaction failed: " << s.ToString();
 
 		auto get_result = impl_->Get("reclaim_key");
-		ASSERT_TRUE(get_result.has_value())
-		    << "reclaim_key should be readable after reclamation; error: "
-		    << get_result.error().ToString();
-		EXPECT_EQ("newest_val", get_result.value())
-		    << "old values at seq 1 and 2 should have been reclaimed";
+		ASSERT_TRUE(get_result.has_value()) << "reclaim_key should be readable after reclamation; error: " << get_result.error().ToString();
+		EXPECT_EQ("newest_val", get_result.value()) << "old values at seq 1 and 2 should have been reclaimed";
 	}
 
 	// ── Error recovery ─────────────────────────────────────────────────────────
@@ -548,16 +549,14 @@ namespace prism
 		ASSERT_TRUE(s.ok()) << "compaction failed to recover: " << s.ToString();
 
 		// The second compaction should consume ALL 4 L0 files and produce L1 output.
-		EXPECT_LT(static_cast<int>(impl_->TEST_LevelFilesCopy(0).size()), 4)
-		    << "L0 files should decrease after recovery compaction";
+		EXPECT_LT(static_cast<int>(impl_->TEST_LevelFilesCopy(0).size()), 4) << "L0 files should decrease after recovery compaction";
 		EXPECT_GE(static_cast<int>(impl_->TEST_LevelFilesCopy(1).size()), 1)
 		    << "Recovery compaction should produce at least one L1 output file";
 
 		// Verify that the compacted data is accessible in the output level.
 		{
 			const std::vector<ParsedLevelEntry> entries = ReadLevelEntriesForKey(1, "k");
-			EXPECT_GE(static_cast<int>(entries.size()), 1)
-			    << "key 'k' should be present in L1 after recovery compaction";
+			EXPECT_GE(static_cast<int>(entries.size()), 1) << "key 'k' should be present in L1 after recovery compaction";
 		}
 	}
 

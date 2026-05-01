@@ -278,8 +278,7 @@ namespace prism::tests
 		sched.blocking.RunOne();
 
 		EXPECT_TRUE(sched.blocking.Empty());
-		EXPECT_TRUE(sched.continuation.Empty())
-		    << "hot-path resume should not bounce through a continuation queue";
+		EXPECT_TRUE(sched.continuation.Empty()) << "hot-path resume should not bounce through a continuation queue";
 
 		auto result = task.SyncWaitFor(std::chrono::milliseconds(1));
 		ASSERT_TRUE(result.has_value());

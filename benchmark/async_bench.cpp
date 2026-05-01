@@ -64,7 +64,7 @@ namespace prism::bench
 				std::exception_ptr exception;
 
 				Task get_return_object() { return Task(std::coroutine_handle<promise_type>::from_promise(*this)); }
-				std::suspend_never initial_suspend() noexcept { return {}; }
+				std::suspend_never initial_suspend() noexcept { return { }; }
 				auto final_suspend() noexcept
 				{
 					struct Awaiter
@@ -88,7 +88,7 @@ namespace prism::bench
 			Task(Task&& other) noexcept
 			    : handle_(other.handle_)
 			{
-				other.handle_ = {};
+				other.handle_ = { };
 			}
 
 			Task(const Task&) = delete;
@@ -122,9 +122,8 @@ namespace prism::bench
 			{
 				std::fprintf(stderr, "error: %.*s\n", static_cast<int>(error.size()), error.data());
 			}
-			std::fprintf(stderr,
-			    "usage: %s [--backend=thread_pool|blocking_lane] [--workload=random_read] [--ops=N] [--inflight=N]\n",
-			    argv0);
+			std::fprintf(
+			    stderr, "usage: %s [--backend=thread_pool|blocking_lane] [--workload=random_read] [--ops=N] [--inflight=N]\n", argv0);
 			std::exit(1);
 		}
 
@@ -182,8 +181,7 @@ namespace prism::bench
 				}
 				else if (arg.starts_with("--inflight="))
 				{
-					const auto val = static_cast<int>(ParseSize(
-					    arg.substr(std::string_view("--inflight=").size()), argv[0]));
+					const auto val = static_cast<int>(ParseSize(arg.substr(std::string_view("--inflight=").size()), argv[0]));
 					cfg.inflight = (val < 1) ? 1 : val;
 				}
 				else
@@ -309,8 +307,7 @@ namespace prism::bench
 						throw std::runtime_error(read_result.error().ToString());
 					}
 					bytes_read += read_result.value();
-					latencies_us.push_back(
-					    std::chrono::duration<double, std::micro>(end - start).count());
+					latencies_us.push_back(std::chrono::duration<double, std::micro>(end - start).count());
 				}
 
 				if (bytes_read == 0)
@@ -327,8 +324,7 @@ namespace prism::bench
 		{
 			const std::size_t base = total / static_cast<std::size_t>(num_slots);
 			const std::size_t remainder = total % static_cast<std::size_t>(num_slots);
-			return static_cast<std::size_t>(slot_id) * base
-			    + std::min(static_cast<std::size_t>(slot_id), remainder);
+			return static_cast<std::size_t>(slot_id) * base + std::min(static_cast<std::size_t>(slot_id), remainder);
 		}
 
 		std::size_t SlotCount(std::size_t total, int num_slots, int slot_id)
@@ -338,11 +334,8 @@ namespace prism::bench
 			return base + (static_cast<std::size_t>(slot_id) < remainder ? 1 : 0);
 		}
 
-		std::vector<double> RunRandomReadBenchmarkConcurrent(
-		    ThreadPoolScheduler& scheduler,
-		    const std::vector<AsyncRandomAccessFile>& files,
-		    const std::vector<ReadRequest>& requests,
-		    int inflight)
+		std::vector<double> RunRandomReadBenchmarkConcurrent(ThreadPoolScheduler& scheduler,
+		    const std::vector<AsyncRandomAccessFile>& files, const std::vector<ReadRequest>& requests, int inflight)
 		{
 			StartGate gate;
 			DoneState done(inflight);
@@ -371,24 +364,21 @@ namespace prism::bench
 						{
 							const auto& request = requests[start + i];
 							const auto t0 = Clock::now();
-							auto result = co_await files[request.file_index].ReadAtAsync(
-							    request.offset, std::span<std::byte>(scratch));
+							auto result = co_await files[request.file_index].ReadAtAsync(request.offset, std::span<std::byte>(scratch));
 							const auto t1 = Clock::now();
 							if (!result.has_value())
 							{
 								throw std::runtime_error(result.error().ToString());
 							}
 							local_bytes += result.value();
-							local_lat.push_back(
-							    std::chrono::duration<double, std::micro>(t1 - t0).count());
+							local_lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
 						}
 
 						bytes_read.fetch_add(local_bytes, std::memory_order_relaxed);
 
 						{
 							std::lock_guard lock(lat_mutex);
-							all_latencies.insert(all_latencies.end(), local_lat.begin(),
-							    local_lat.end());
+							all_latencies.insert(all_latencies.end(), local_lat.begin(), local_lat.end());
 						}
 					}
 					catch (...)

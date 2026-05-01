@@ -755,25 +755,20 @@ TEST_F(ManifestRecoveryTest, SnapshotIsEphemeralAndRejectedAfterReopen)
 	ro.snapshot_handle = stale;
 
 	auto get_res = db().Get(ro, "snap_key");
-	EXPECT_FALSE(get_res.has_value())
-	    << "Get with stale snapshot should fail, but returned: " << get_res.value();
-	EXPECT_TRUE(get_res.error().IsInvalidArgument())
-	    << "expected InvalidArgument from Get, got: " << get_res.error().ToString();
+	EXPECT_FALSE(get_res.has_value()) << "Get with stale snapshot should fail, but returned: " << get_res.value();
+	EXPECT_TRUE(get_res.error().IsInvalidArgument()) << "expected InvalidArgument from Get, got: " << get_res.error().ToString();
 
 	// ── Rejection via NewIterator ─────────────────────────────────────────────
 	// NewIterator wraps the error in a NewErrorIterator; Valid() is false and
 	// status() carries the same InvalidArgument.
 	auto iter = db().NewIterator(ro);
-	EXPECT_FALSE(iter->Valid())
-	    << "iterator with stale snapshot should not be valid";
-	EXPECT_TRUE(iter->status().IsInvalidArgument())
-	    << "expected InvalidArgument on iterator status, got: " << iter->status().ToString();
+	EXPECT_FALSE(iter->Valid()) << "iterator with stale snapshot should not be valid";
+	EXPECT_TRUE(iter->status().IsInvalidArgument()) << "expected InvalidArgument on iterator status, got: " << iter->status().ToString();
 
 	// ── Normal read without snapshot succeeds ─────────────────────────────────
 	// The key was persisted before the close; reopening recovers it via WAL/SST.
 	auto plain_res = db().Get("snap_key");
-	ASSERT_TRUE(plain_res.has_value())
-	    << "plain Get (no snapshot) should find snap_key after reopen";
+	ASSERT_TRUE(plain_res.has_value()) << "plain Get (no snapshot) should find snap_key after reopen";
 	EXPECT_EQ("snap_val", plain_res.value());
 
 	// stale goes out of scope here; SnapshotState::~SnapshotState calls
@@ -814,20 +809,17 @@ TEST_F(ManifestRecoveryTest, ReopenRejectsAllStaleHandlesDeterministically)
 	// Get with stale snapshot → InvalidArgument.
 	auto get_res = db().Get(ro, "stale_key");
 	EXPECT_FALSE(get_res.has_value()) << "Get with stale snapshot should fail";
-	EXPECT_TRUE(get_res.error().IsInvalidArgument())
-	    << "expected InvalidArgument, got: " << get_res.error().ToString();
+	EXPECT_TRUE(get_res.error().IsInvalidArgument()) << "expected InvalidArgument, got: " << get_res.error().ToString();
 
 	// Second Get with same stale snapshot → same error (deterministic).
 	auto get_res2 = db().Get(ro, "stale_key2");
 	EXPECT_FALSE(get_res2.has_value());
-	EXPECT_TRUE(get_res2.error().IsInvalidArgument())
-	    << "repeated stale-snapshot Get must return same error code";
+	EXPECT_TRUE(get_res2.error().IsInvalidArgument()) << "repeated stale-snapshot Get must return same error code";
 
 	// NewIterator with stale snapshot → error iterator.
 	auto iter = db().NewIterator(ro);
 	EXPECT_FALSE(iter->Valid()) << "iterator with stale snapshot should not be valid";
-	EXPECT_TRUE(iter->status().IsInvalidArgument())
-	    << "expected InvalidArgument on iterator, got: " << iter->status().ToString();
+	EXPECT_TRUE(iter->status().IsInvalidArgument()) << "expected InvalidArgument on iterator, got: " << iter->status().ToString();
 
 	// Plain read (no snapshot) must succeed – data persisted before close.
 	auto plain = db().Get("stale_key");

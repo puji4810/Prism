@@ -769,7 +769,6 @@ namespace prism
 		void SleepForMicroseconds(int micros) override { std::this_thread::sleep_for(std::chrono::microseconds(micros)); }
 
 	private:
-
 		Limiter fd_limiter_;
 		Limiter mmap_limiter_;
 

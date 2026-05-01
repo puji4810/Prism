@@ -206,28 +206,22 @@ TEST(SchedulerExceptionsTest, CaughtExceptionDoesNotAffectScheduler)
 
 	// Wait for it to complete, then submit more work.
 	auto start = std::chrono::steady_clock::now();
-	while (before_counter.load(std::memory_order_acquire) == 0
-	       && std::chrono::steady_clock::now() - start < 5s)
+	while (before_counter.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() - start < 5s)
 		std::this_thread::yield();
 
-	ASSERT_EQ(before_counter.load(), 1)
-	    << "Task that caught its own exception did not complete";
+	ASSERT_EQ(before_counter.load(), 1) << "Task that caught its own exception did not complete";
 
 	for (int i = 0; i < 50; ++i)
 	{
-		scheduler.Submit([&after_counter]() {
-			after_counter.fetch_add(1, std::memory_order_relaxed);
-		});
+		scheduler.Submit([&after_counter]() { after_counter.fetch_add(1, std::memory_order_relaxed); });
 	}
 
 	start = std::chrono::steady_clock::now();
-	while (after_counter.load(std::memory_order_acquire) < 50
-	       && std::chrono::steady_clock::now() - start < 5s)
+	while (after_counter.load(std::memory_order_acquire) < 50 && std::chrono::steady_clock::now() - start < 5s)
 		std::this_thread::yield();
 
-	EXPECT_EQ(after_counter.load(), 50)
-	    << "Scheduler unable to process tasks after internally caught exception: "
-	    << after_counter.load() << "/50";
+	EXPECT_EQ(after_counter.load(), 50) << "Scheduler unable to process tasks after internally caught exception: " << after_counter.load()
+	                                    << "/50";
 }
 
 // ---------------------------------------------------------------------------
@@ -259,29 +253,23 @@ TEST(SchedulerExceptionsTest, MultipleWorkersHandleInternalExceptions)
 	}
 
 	auto start = std::chrono::steady_clock::now();
-	while (exception_tasks_done.load(std::memory_order_acquire) < kNumExceptionTasks
-	       && std::chrono::steady_clock::now() - start < 5s)
+	while (exception_tasks_done.load(std::memory_order_acquire) < kNumExceptionTasks && std::chrono::steady_clock::now() - start < 5s)
 		std::this_thread::yield();
 
-	ASSERT_EQ(exception_tasks_done.load(), kNumExceptionTasks)
-	    << "Exception-handling tasks did not all complete";
+	ASSERT_EQ(exception_tasks_done.load(), kNumExceptionTasks) << "Exception-handling tasks did not all complete";
 
 	// Submit follow-up work to verify scheduler health.
 	for (int i = 0; i < 200; ++i)
 	{
-		scheduler.Submit([&followup_tasks_done]() {
-			followup_tasks_done.fetch_add(1, std::memory_order_relaxed);
-		});
+		scheduler.Submit([&followup_tasks_done]() { followup_tasks_done.fetch_add(1, std::memory_order_relaxed); });
 	}
 
 	start = std::chrono::steady_clock::now();
-	while (followup_tasks_done.load(std::memory_order_acquire) < 200
-	       && std::chrono::steady_clock::now() - start < 5s)
+	while (followup_tasks_done.load(std::memory_order_acquire) < 200 && std::chrono::steady_clock::now() - start < 5s)
 		std::this_thread::yield();
 
-	EXPECT_EQ(followup_tasks_done.load(), 200)
-	    << "Scheduler unhealthy after multiple workers handled internal exceptions: "
-	    << followup_tasks_done.load() << "/200";
+	EXPECT_EQ(followup_tasks_done.load(), 200) << "Scheduler unhealthy after multiple workers handled internal exceptions: "
+	                                           << followup_tasks_done.load() << "/200";
 }
 
 // ---------------------------------------------------------------------------
@@ -324,12 +312,9 @@ TEST(SchedulerExceptionsTest, AffinityJobCaughtExceptionWorkerRemainsHealthy)
 	});
 
 	auto start = std::chrono::steady_clock::now();
-	while (inner_done.load(std::memory_order_acquire) < 1
-	       && std::chrono::steady_clock::now() - start < 5s)
+	while (inner_done.load(std::memory_order_acquire) < 1 && std::chrono::steady_clock::now() - start < 5s)
 		std::this_thread::yield();
 
-	EXPECT_EQ(inner_done.load(), 1)
-	    << "Follow-up affinity task did not complete after caught exception";
-	EXPECT_EQ(outer_tid, inner_tid)
-	    << "Affinity worker changed after internally caught exception";
+	EXPECT_EQ(inner_done.load(), 1) << "Follow-up affinity task did not complete after caught exception";
+	EXPECT_EQ(outer_tid, inner_tid) << "Affinity worker changed after internally caught exception";
 }

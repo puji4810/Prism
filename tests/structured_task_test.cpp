@@ -162,9 +162,7 @@ TEST(StructuredTaskTest, NestedScopesObserveParentStopPropagation)
 	std::atomic<bool> child_saw_stop{ false };
 
 	parent_source.RequestStop();
-	child_scope.Submit([&](StopToken token) {
-		child_saw_stop.store(token.CheckStop(), std::memory_order_release);
-	});
+	child_scope.Submit([&](StopToken token) { child_saw_stop.store(token.CheckStop(), std::memory_order_release); });
 
 	child_scope.Join();
 	EXPECT_TRUE(child_scope.StopRequested());
