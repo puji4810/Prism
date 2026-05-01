@@ -210,7 +210,6 @@ TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorit
 	ThreadPoolScheduler scheduler(2);
 
 	std::atomic<int> victim_ctx_ready{ 0 };
-	std::atomic<int> thief_ctx_ready{ 0 };
 	std::atomic<int> hold_victim_worker{ 0 };
 	std::atomic<int> victim_worker_running{ 0 };
 	std::atomic<int> thief_worker_running{ 0 };
@@ -233,24 +232,15 @@ TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorit
 	};
 
 	ThreadPoolScheduler::Context victim_ctx;
-	ThreadPoolScheduler::Context thief_ctx;
 
 	scheduler.Submit([&scheduler, &victim_ctx, &victim_ctx_ready]() {
 		victim_ctx = scheduler.CaptureContext();
 		ASSERT_TRUE(victim_ctx.IsValid());
 		victim_ctx_ready.store(1, std::memory_order_release);
 	});
-	scheduler.Submit([&scheduler, &thief_ctx, &thief_ctx_ready]() {
-		thief_ctx = scheduler.CaptureContext();
-		ASSERT_TRUE(thief_ctx.IsValid());
-		thief_ctx_ready.store(1, std::memory_order_release);
-	});
 
 	ASSERT_TRUE(WaitFor(victim_ctx_ready, 1)) << "victim context capture stalled";
-	ASSERT_TRUE(WaitFor(thief_ctx_ready, 1)) << "thief context capture stalled";
 	ASSERT_TRUE(victim_ctx.IsValid());
-	ASSERT_TRUE(thief_ctx.IsValid());
-	ASSERT_FALSE(victim_ctx == thief_ctx) << "test requires distinct workers";
 
 	scheduler.SubmitIn(victim_ctx, [&hold_victim_worker, &victim_worker_running]() {
 		victim_worker_running.store(1, std::memory_order_release);

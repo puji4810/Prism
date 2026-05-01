@@ -15,7 +15,7 @@ The Prism architecture is divided into three primary layers: the User API, the C
 
 - `Database::Open(...)` returns the move-only synchronous handle.
 - `AsyncDB::OpenAsync(...)` returns an awaitable that yields the async handle.
-- `Database::CaptureSnapshot()` and `AsyncDB::CaptureSnapshot()` return a cheap-copy `Snapshot` handle.
+- `Database::CaptureSnapshot()` and `AsyncDB::CaptureSnapshot()` return a cheap-copy `Snapshot` handle declared in `include/snapshot.h`.
 - Snapshot reads pass that handle back through the `snapshot_handle` field on `ReadOptions` by value.
 
 ```mermaid
