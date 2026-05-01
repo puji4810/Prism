@@ -6,7 +6,7 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
 
 - `Database` is the synchronous move-only handle returned by `Database::Open(...)`.
 - `AsyncDB` is the coroutine-friendly wrapper returned by `AsyncDB::OpenAsync(...)`.
-- `Snapshot` is a cheap-copy RAII handle captured with `CaptureSnapshot()` and stored by value in the `snapshot_handle` field on `ReadOptions`.
+- `Snapshot` is a cheap-copy RAII handle declared in `include/snapshot.h`, captured with `CaptureSnapshot()`, and stored by value in the `snapshot_handle` field on `ReadOptions`.
 
 ## 📚 Documentation Index
 

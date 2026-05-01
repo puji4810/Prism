@@ -514,10 +514,11 @@ TEST_F(ObsoleteFilesTest, ShutdownDuringActiveGetsIsSafe)
 	ASSERT_TRUE(WaitUntil([&] { return in_flight.load(std::memory_order_acquire) > 0; }, std::chrono::milliseconds(500)));
 
 	stop.store(true, std::memory_order_release);
-	db.reset();
 
 	for (auto& thread : threads)
 	{
 		thread.join();
 	}
+	EXPECT_EQ(in_flight.load(std::memory_order_acquire), 0);
+	db.reset();
 }

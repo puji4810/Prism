@@ -225,7 +225,11 @@ namespace prism
 		// TEST_F body as a *subclass* of the fixture, and friendship is not
 		// inherited in C++, so direct `impl_->sequence_ = n` from test bodies is
 		// ill-formed. Delegating through this fixture method works correctly.
-		void SetSequence(SequenceNumber s) { impl_->sequence_ = s; }
+		void SetSequence(SequenceNumber s)
+		{
+			impl_->sequence_ = s;
+			impl_->visible_sequence_.store(s > 0 ? s - 1 : 0, std::memory_order_release);
+		}
 
 		std::string dbname_ = "test_compaction_execution_db";
 		std::unique_ptr<DBImpl> db_;

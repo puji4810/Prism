@@ -221,7 +221,7 @@ Database writes (appends to logs or SSTables) must be strictly ordered. `AsyncWr
 ### Lifecycle and Usage
 
 - **Opening**: Use `AsyncDB::OpenAsync(scheduler, options, dbname)` which returns an `AsyncOp<Result<AsyncDB>>`.
-- **Snapshots**: Call `db.CaptureSnapshot()` to obtain a synchronous RAII `Snapshot` handle. This handle is cheap to copy and can be passed into `ReadOptions` for async reads.
+- **Snapshots**: Call `db.CaptureSnapshot()` to obtain a synchronous RAII `Snapshot` handle declared in `include/snapshot.h`. This handle is cheap to copy and can be passed into `ReadOptions` for async reads.
 - **Operations**: `GetAsync`, `PutAsync`, `DeleteAsync`, and `WriteAsync` are the primary entry points.
 
 ### Implementation (Offload Model)
