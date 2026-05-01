@@ -461,15 +461,15 @@ namespace prism::bench
 		{
 			const std::size_t base = total_ops / static_cast<std::size_t>(num_slots);
 			const std::size_t remainder = total_ops % static_cast<std::size_t>(num_slots);
-			return static_cast<std::size_t>(slot_id) * base
-			    + std::min(static_cast<std::size_t>(slot_id), remainder);
+			return static_cast<std::size_t>(slot_id) * base + std::min(static_cast<std::size_t>(slot_id), remainder);
 		}
 	} // namespace
 
 	Detached RunAsyncMixedClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count, std::string value,
-	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
-	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight)
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
+	    std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
+	    std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
@@ -519,9 +519,8 @@ namespace prism::bench
 
 	Detached RunAsyncDiskReadClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
 	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
-	    std::vector<uint64_t>& lat,
-	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
-	    std::atomic<std::size_t>& client_max_inflight)
+	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
+	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
@@ -592,9 +591,8 @@ namespace prism::bench
 				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
 				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
 				RunAsyncMixedClient(db, gate, done, cfg, keys, c, slot, start_index, op_count, value,
-				    lat[static_cast<std::size_t>(slot_idx)],
-				    global_inflight, global_max_inflight, client_inflight[static_cast<std::size_t>(c)],
-				    client_max_inflight[static_cast<std::size_t>(c)]);
+				    lat[static_cast<std::size_t>(slot_idx)], global_inflight, global_max_inflight,
+				    client_inflight[static_cast<std::size_t>(c)], client_max_inflight[static_cast<std::size_t>(c)]);
 				++slot_idx;
 			}
 		}
@@ -665,8 +663,7 @@ namespace prism::bench
 			{
 				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
 				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
-				RunAsyncDiskReadClient(db, gate, done, cfg, keys, c, slot, start_index, op_count,
-				    lat[static_cast<std::size_t>(slot_idx)],
+				RunAsyncDiskReadClient(db, gate, done, cfg, keys, c, slot, start_index, op_count, lat[static_cast<std::size_t>(slot_idx)],
 				    global_inflight, global_max_inflight, client_inflight[static_cast<std::size_t>(c)],
 				    client_max_inflight[static_cast<std::size_t>(c)]);
 				++slot_idx;
@@ -711,9 +708,8 @@ namespace prism::bench
 
 	Detached RunAsyncSstReadPipelineClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
 	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
-	    std::vector<uint64_t>& lat,
-	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
-	    std::atomic<std::size_t>& client_max_inflight)
+	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
+	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
@@ -788,9 +784,8 @@ namespace prism::bench
 				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
 				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
 				RunAsyncSstReadPipelineClient(db, gate, done, cfg, keys, c, slot, start_index, op_count,
-				    lat[static_cast<std::size_t>(slot_idx)],
-				    global_inflight, global_max_inflight, client_inflight[static_cast<std::size_t>(c)],
-				    client_max_inflight[static_cast<std::size_t>(c)]);
+				    lat[static_cast<std::size_t>(slot_idx)], global_inflight, global_max_inflight,
+				    client_inflight[static_cast<std::size_t>(c)], client_max_inflight[static_cast<std::size_t>(c)]);
 				++slot_idx;
 			}
 		}
@@ -833,9 +828,8 @@ namespace prism::bench
 
 	Detached RunAsyncCompactionOverlapReaderClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
 	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
-	    std::vector<uint64_t>& lat,
-	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
-	    std::atomic<std::size_t>& client_max_inflight)
+	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
+	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
@@ -879,8 +873,8 @@ namespace prism::bench
 	}
 
 	Detached RunAsyncCompactionOverlapWriterClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg, int client_id,
-	    int slot_id, std::size_t start_index, std::size_t op_count, std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
-	    std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
+	    int slot_id, std::size_t start_index, std::size_t op_count, std::string value, std::vector<uint64_t>& lat,
+	    std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
 	    std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
@@ -1021,9 +1015,10 @@ namespace prism::bench
 	}
 
 	Detached RunAsyncDurabilityWriteClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
-	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count, std::string value,
-	    std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight, std::atomic<std::size_t>& global_max_inflight,
-	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight)
+	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
+	    std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
+	    std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
+	    std::atomic<std::size_t>& client_max_inflight)
 	{
 		try
 		{
@@ -1181,8 +1176,7 @@ namespace prism::bench
 				            "bg_sleeps=%d\n",
 				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
 				    stats.seconds, ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0,
-				    scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync,
-				    stats.bg_sleeps);
+				    scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync, stats.bg_sleeps);
 			}
 			else
 			{

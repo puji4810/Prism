@@ -872,14 +872,12 @@ TEST_F(DBTest, SnapshotSurvivesFlushAndCompactionUntilRelease)
 	snap_opts.snapshot_handle = snap;
 	auto snap_result = db->Get(snap_opts, "snap_key");
 	ASSERT_TRUE(snap_result.has_value()) << snap_result.error().ToString();
-	EXPECT_EQ("snap_value", snap_result.value())
-	    << "Snapshot read must survive flush and compaction";
+	EXPECT_EQ("snap_value", snap_result.value()) << "Snapshot read must survive flush and compaction";
 
 	// 6. Non-snapshot read must return the latest overwritten value.
 	auto current_result = db->Get("snap_key");
 	ASSERT_TRUE(current_result.has_value()) << current_result.error().ToString();
-	EXPECT_EQ("new_value", current_result.value())
-	    << "Current read must return latest value after compaction";
+	EXPECT_EQ("new_value", current_result.value()) << "Current read must return latest value after compaction";
 
 	// 7. Release the snapshot; the snapshot list should now be empty.
 	snap = Snapshot();
@@ -940,7 +938,9 @@ TEST_F(DBTest, UnsnapshottedReadObservesCommittedStateNotReservedSequence)
 	for (int w = 0; w < kWriters; ++w)
 	{
 		threads.emplace_back([&, w] {
-			while (!go.load(std::memory_order_acquire)) {}
+			while (!go.load(std::memory_order_acquire))
+			{
+			}
 			for (int i = 0; i < kKeysPerWriter; ++i)
 			{
 				ASSERT_TRUE(db.Put(key_for(w, i), val_for(w, i)).ok());
@@ -951,7 +951,9 @@ TEST_F(DBTest, UnsnapshottedReadObservesCommittedStateNotReservedSequence)
 	for (int r = 0; r < kReaders; ++r)
 	{
 		threads.emplace_back([&] {
-			while (!go.load(std::memory_order_acquire)) {}
+			while (!go.load(std::memory_order_acquire))
+			{
+			}
 			while (!writers_done.load(std::memory_order_acquire))
 			{
 				for (int w = 0; w < kWriters; ++w)
@@ -961,9 +963,8 @@ TEST_F(DBTest, UnsnapshottedReadObservesCommittedStateNotReservedSequence)
 						auto result = db.Get(key_for(w, i));
 						if (result.has_value())
 						{
-							EXPECT_EQ(result.value(), val_for(w, i))
-							    << "Read returned a value that was never written – "
-							    << "possible reserved-sequence leak";
+							EXPECT_EQ(result.value(), val_for(w, i)) << "Read returned a value that was never written – "
+							                                         << "possible reserved-sequence leak";
 						}
 						else
 						{
@@ -976,9 +977,11 @@ TEST_F(DBTest, UnsnapshottedReadObservesCommittedStateNotReservedSequence)
 	}
 
 	go.store(true, std::memory_order_release);
-	for (int i = 0; i < kWriters; ++i) threads[i].join();
+	for (int i = 0; i < kWriters; ++i)
+		threads[i].join();
 	writers_done.store(true, std::memory_order_release);
-	for (int i = kWriters; i < kWriters + kReaders; ++i) threads[i].join();
+	for (int i = kWriters; i < kWriters + kReaders; ++i)
+		threads[i].join();
 
 	// Final verification: all keys readable.
 	for (int w = 0; w < kWriters; ++w)
@@ -1036,8 +1039,7 @@ TEST_F(DBTest, GetIteratorVisibilityAlignmentNoSnapshot)
 		{
 			int kidx = std::stoi(key.substr(6));
 			ASSERT_LT(kidx, 50);
-			EXPECT_EQ(it->value().ToString(), get_values[kidx])
-			    << "Iterator and Get() disagree on value for " << key;
+			EXPECT_EQ(it->value().ToString(), get_values[kidx]) << "Iterator and Get() disagree on value for " << key;
 			++idx;
 		}
 		it->Next();
@@ -1149,8 +1151,7 @@ TEST_F(DBTest, GetSurvivesMemtableRotationRace)
 	ASSERT_NE(impl->TEST_CurrentSuperVersion(), nullptr);
 
 	rotation_done.store(true, std::memory_order_release);
-	ASSERT_TRUE(WaitUntil(
-	    [&] { return post_rotation_reads.load(std::memory_order_acquire) >= 200; }, std::chrono::milliseconds(2000)));
+	ASSERT_TRUE(WaitUntil([&] { return post_rotation_reads.load(std::memory_order_acquire) >= 200; }, std::chrono::milliseconds(2000)));
 
 	stop.store(true, std::memory_order_release);
 	reader.join();
@@ -1223,8 +1224,7 @@ TEST_F(DBTest, GetSurvivesCompactionVersionTurnoverRace)
 	ASSERT_NE(impl->TEST_CurrentSuperVersion(), initial_sv) << "Flush install should publish a new SuperVersion";
 
 	turnover_done.store(true, std::memory_order_release);
-	ASSERT_TRUE(WaitUntil(
-	    [&] { return post_turnover_reads.load(std::memory_order_acquire) >= 200; }, std::chrono::milliseconds(2000)));
+	ASSERT_TRUE(WaitUntil([&] { return post_turnover_reads.load(std::memory_order_acquire) >= 200; }, std::chrono::milliseconds(2000)));
 
 	stop.store(true, std::memory_order_release);
 	reader.join();

@@ -124,19 +124,14 @@ namespace prism
 
 	// ── Policy helpers ─────────────────────────────────────────────────
 
-	bool ThreadPoolScheduler::ShouldUseFastPath(std::size_t priority) noexcept
-	{
-		return priority == 0;
-	}
+	bool ThreadPoolScheduler::ShouldUseFastPath(std::size_t priority) noexcept { return priority == 0; }
 
 	bool ThreadPoolScheduler::ShouldAcceptSubmitDuringShutdown() const noexcept
 	{
 		return !IsExitRequested() || (t_current_scheduler == this);
 	}
 
-	bool ThreadPoolScheduler::ShouldPromoteLazyTask(
-	    const LazyTask& task,
-	    std::chrono::steady_clock::time_point now) noexcept
+	bool ThreadPoolScheduler::ShouldPromoteLazyTask(const LazyTask& task, std::chrono::steady_clock::time_point now) noexcept
 	{
 		return task.deadline <= now;
 	}
@@ -512,15 +507,11 @@ namespace prism
 		semaphore_.release();
 	}
 
-	std::size_t ThreadPoolScheduler::WorkThread::Load() const noexcept
-	{
-		return load_.load(std::memory_order_relaxed);
-	}
+	std::size_t ThreadPoolScheduler::WorkThread::Load() const noexcept { return load_.load(std::memory_order_relaxed); }
 
 	void ThreadPoolScheduler::WorkThread::Wake() { semaphore_.release(); }
 
-	bool ThreadPoolScheduler::WorkThread::TrySteal(
-	    ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state)
+	bool ThreadPoolScheduler::WorkThread::TrySteal(ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state)
 	{
 		RuntimeMetrics::Instance().steal_attempts.fetch_add(1, std::memory_order_relaxed);
 
@@ -607,8 +598,7 @@ namespace prism
 	}
 
 	bool ThreadPoolScheduler::WorkThread::HandleJobCompletion(
-	    const QueuedJob& job, bool queue_empty_after,
-	    ThreadPoolScheduler& scheduler) noexcept
+	    const QueuedJob& job, bool queue_empty_after, ThreadPoolScheduler& scheduler) noexcept
 	{
 		try
 		{

@@ -396,7 +396,7 @@ TEST_F(AsyncDBTest, SnapshotDestructionAfterDBWrapperTeardownIsSafe)
 
 		// Overwriting snap calls SnapshotState::~SnapshotState() → registry->Release().
 		// This must not crash or trigger sanitizer errors even though the DB is gone.
-		snap = Snapshot{};
+		snap = Snapshot{ };
 
 		SUCCEED();
 		co_return;

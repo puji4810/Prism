@@ -121,8 +121,7 @@ TEST(SchedulerStressTest, MixedAffinityAndStolenWorkCompletesAll)
 		std::this_thread::yield();
 	}
 
-	EXPECT_EQ(counter->load(), kNumTasks * 2)
-	    << "Mixed Submit + SubmitIn must all complete exactly once";
+	EXPECT_EQ(counter->load(), kNumTasks * 2) << "Mixed Submit + SubmitIn must all complete exactly once";
 }
 
 // ---------------------------------------------------------------------------
@@ -149,12 +148,10 @@ TEST(SchedulerStressTest, StolenWorkProgressAssertions)
 	while (counter->load() < kNumTasks && std::chrono::steady_clock::now() - start < 10s)
 		std::this_thread::yield();
 
-	EXPECT_EQ(counter->load(), kNumTasks)
-	    << "Not all stealable tasks completed: " << counter->load() << "/" << kNumTasks;
+	EXPECT_EQ(counter->load(), kNumTasks) << "Not all stealable tasks completed: " << counter->load() << "/" << kNumTasks;
 
 	// Verify that some jobs were completed (whether local or stolen).
-	const auto total_completed =
-	    prism::RuntimeMetrics::Instance().worker_local_jobs_completed.load(std::memory_order_relaxed)
+	const auto total_completed = prism::RuntimeMetrics::Instance().worker_local_jobs_completed.load(std::memory_order_relaxed)
 	    + prism::RuntimeMetrics::Instance().stolen_jobs_completed.load(std::memory_order_relaxed);
 
 	EXPECT_GE(total_completed, static_cast<uint64_t>(kNumTasks))
@@ -163,17 +160,13 @@ TEST(SchedulerStressTest, StolenWorkProgressAssertions)
 	// With 4 workers and 5000 tasks, stealing should occur at least some of the time.
 	// This is a characterization: if steal_attempts == 0, that's noteworthy but not
 	// necessarily a bug (can happen under very fast task completion).
-	const auto steal_attempts =
-	    prism::RuntimeMetrics::Instance().steal_attempts.load(std::memory_order_relaxed);
-	const auto steal_successes =
-	    prism::RuntimeMetrics::Instance().steal_successes.load(std::memory_order_relaxed);
+	const auto steal_attempts = prism::RuntimeMetrics::Instance().steal_attempts.load(std::memory_order_relaxed);
+	const auto steal_successes = prism::RuntimeMetrics::Instance().steal_successes.load(std::memory_order_relaxed);
 
 	// Record the observed stealing behavior for characterization purposes.
 	// No hard assertion on steal count since it depends on timing.
-	SUCCEED() << "Characterization: steal_attempts=" << steal_attempts
-	          << " steal_successes=" << steal_successes
-	          << " stolen_jobs_completed="
-	          << prism::RuntimeMetrics::Instance().stolen_jobs_completed.load(std::memory_order_relaxed);
+	SUCCEED() << "Characterization: steal_attempts=" << steal_attempts << " steal_successes=" << steal_successes
+	          << " stolen_jobs_completed=" << prism::RuntimeMetrics::Instance().stolen_jobs_completed.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,17 +186,13 @@ TEST(SchedulerStressTest, HighConcurrencyStolenWorkAllCompletes)
 	// Mix of stealable (direct Submit) and pinned (SubmitIn from worker).
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([counter]() {
-			counter->fetch_add(1, std::memory_order_relaxed);
-		});
+		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
 
 		scheduler.Submit([&scheduler, counter]() {
 			auto ctx = scheduler.CaptureContext();
 			if (ctx.IsValid())
 			{
-				scheduler.SubmitIn(ctx, [counter]() {
-					counter->fetch_add(1, std::memory_order_relaxed);
-				});
+				scheduler.SubmitIn(ctx, [counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
 			}
 			else
 			{
@@ -216,15 +205,12 @@ TEST(SchedulerStressTest, HighConcurrencyStolenWorkAllCompletes)
 	while (counter->load() < kNumTasks * 2 && std::chrono::steady_clock::now() - start < 15s)
 		std::this_thread::yield();
 
-	EXPECT_EQ(counter->load(), kNumTasks * 2)
-	    << "High-concurrency stolen+affinity work incomplete: "
-	    << counter->load() << "/" << (kNumTasks * 2);
+	EXPECT_EQ(counter->load(), kNumTasks * 2) << "High-concurrency stolen+affinity work incomplete: " << counter->load() << "/"
+	                                          << (kNumTasks * 2);
 
-	const auto total_completed =
-	    prism::RuntimeMetrics::Instance().worker_local_jobs_completed.load(std::memory_order_relaxed)
+	const auto total_completed = prism::RuntimeMetrics::Instance().worker_local_jobs_completed.load(std::memory_order_relaxed)
 	    + prism::RuntimeMetrics::Instance().stolen_jobs_completed.load(std::memory_order_relaxed);
 
 	EXPECT_GE(total_completed, static_cast<uint64_t>(kNumTasks * 2))
-	    << "Total completed jobs (" << total_completed << ") less than submitted ("
-	    << (kNumTasks * 2) << ")";
+	    << "Total completed jobs (" << total_completed << ") less than submitted (" << (kNumTasks * 2) << ")";
 }

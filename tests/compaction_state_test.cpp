@@ -42,10 +42,7 @@ protected:
 		std::filesystem::remove_all(dbname_);
 	}
 
-	void TearDown() override
-	{
-		std::filesystem::remove_all(dbname_);
-	}
+	void TearDown() override { std::filesystem::remove_all(dbname_); }
 };
 
 TEST_F(CompactionStateTest, QuiescentOnOpen)
@@ -77,11 +74,7 @@ TEST_F(CompactionStateTest, FlushInFlightAfterFill)
 		}
 	}
 
-	bool saw_flush = WaitUntil(
-	    [&db] {
-		    return db->GetCompactionState().flush_in_flight;
-	    },
-	    std::chrono::milliseconds(500));
+	bool saw_flush = WaitUntil([&db] { return db->GetCompactionState().flush_in_flight; }, std::chrono::milliseconds(500));
 
 	if (!saw_flush)
 	{
@@ -107,11 +100,7 @@ TEST_F(CompactionStateTest, CompactionQuiescesAfterActivity)
 				break;
 			}
 		}
-		ASSERT_TRUE(WaitUntil(
-		    [&db] {
-			    return !db->TEST_HasImmutableMemTable();
-		    },
-		    std::chrono::seconds(5)));
+		ASSERT_TRUE(WaitUntil([&db] { return !db->TEST_HasImmutableMemTable(); }, std::chrono::seconds(5)));
 	}
 
 	ASSERT_TRUE(WaitUntil(

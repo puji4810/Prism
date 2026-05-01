@@ -64,8 +64,7 @@ namespace prism
 		RuntimeMetrics::Instance().active_compaction_lane.store(1, std::memory_order_relaxed);
 		++db_->background_compaction_start_count_;
 		auto stop_token = GetStopToken();
-		while (db_->hold_background_compaction_ && !db_->shutting_down_.load(std::memory_order_acquire) &&
-		       !stop_token.StopRequested())
+		while (db_->hold_background_compaction_ && !db_->shutting_down_.load(std::memory_order_acquire) && !stop_token.StopRequested())
 		{
 			db_->background_work_finished_signal_.wait(lock);
 		}
@@ -83,8 +82,8 @@ namespace prism
 		RuntimeMetrics::Instance().active_compaction_lane.store(0, std::memory_order_relaxed);
 		RuntimeMetrics::Instance().compaction_jobs_completed.fetch_add(1, std::memory_order_relaxed);
 		db_->background_compaction_finish_count_.fetch_add(1, std::memory_order_release);
-		if (!stop_source_.StopRequested() && !db_->shutting_down_.load(std::memory_order_acquire) && db_->bg_error_.ok() &&
-		    NeedsBackgroundWork())
+		if (!stop_source_.StopRequested() && !db_->shutting_down_.load(std::memory_order_acquire) && db_->bg_error_.ok()
+		    && NeedsBackgroundWork())
 		{
 			work_requested_ = true;
 		}
@@ -96,8 +95,5 @@ namespace prism
 		TrySubmitLocked();
 	}
 
-	bool CompactionController::HasInFlightWork() const
-	{
-		return lane_active_;
-	}
+	bool CompactionController::HasInFlightWork() const { return lane_active_; }
 } // namespace prism

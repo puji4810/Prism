@@ -197,7 +197,6 @@ TEST(SchedulerPendingRegressionTest, WorkerReregistersAfterDispatchedJob)
 	ASSERT_TRUE(WaitFor(step, 2)) << "worker did not re-register after dispatched job (zombie)";
 }
 
-
 // ---------------------------------------------------------------------------
 // TEST 4: Worker re-registers after draining a stolen batch to empty
 //
@@ -266,22 +265,16 @@ TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorit
 
 	hold_victim_worker.store(1, std::memory_order_release);
 
-	scheduler.Submit([&priority_done]() {
-		priority_done.fetch_add(1, std::memory_order_release);
-	}, 1);
+	scheduler.Submit([&priority_done]() { priority_done.fetch_add(1, std::memory_order_release); }, 1);
 
-	ASSERT_TRUE(WaitFor(thief_worker_running, 1, 5s))
-		<< "expected thief worker to start executing stolen batch";
+	ASSERT_TRUE(WaitFor(thief_worker_running, 1, 5s)) << "expected thief worker to start executing stolen batch";
 
 	release_stolen_batch.store(1, std::memory_order_release);
 
 	ASSERT_TRUE(WaitFor(stolen_done, kStolenBatch, 5s)) << "stolen batch did not fully drain";
-	ASSERT_TRUE(WaitFor(priority_done, 1, 5s))
-		<< "priority work stalled after stolen batch drained to idle";
+	ASSERT_TRUE(WaitFor(priority_done, 1, 5s)) << "priority work stalled after stolen batch drained to idle";
 
-	scheduler.Submit([&final_job_done]() {
-		final_job_done.fetch_add(1, std::memory_order_release);
-	}, 2);
+	scheduler.Submit([&final_job_done]() { final_job_done.fetch_add(1, std::memory_order_release); }, 2);
 	ASSERT_TRUE(WaitFor(final_job_done, 1, 5s)) << "scheduler did not remain dispatchable after regression scenario";
 }
 
@@ -337,22 +330,17 @@ TEST(SchedulerPendingRegressionTest, IdleWorkersWakeOnNewSubmissions)
 	// Drain the scheduler: submit a batch, wait for completion.
 	for (int i = 0; i < 100; ++i)
 	{
-		scheduler.Submit([&first_batch]() {
-			first_batch.fetch_add(1, std::memory_order_relaxed);
-		});
+		scheduler.Submit([&first_batch]() { first_batch.fetch_add(1, std::memory_order_relaxed); });
 	}
 	ASSERT_TRUE(WaitFor(first_batch, 100, 5s)) << "First batch did not complete";
 
 	// Workers should now be idle. Submit a second batch.
 	for (int i = 0; i < 100; ++i)
 	{
-		scheduler.Submit([&second_batch]() {
-			second_batch.fetch_add(1, std::memory_order_relaxed);
-		});
+		scheduler.Submit([&second_batch]() { second_batch.fetch_add(1, std::memory_order_relaxed); });
 	}
 
-	ASSERT_TRUE(WaitFor(second_batch, 100, 5s))
-	    << "Idle workers did not wake for second batch: " << second_batch.load() << "/100";
+	ASSERT_TRUE(WaitFor(second_batch, 100, 5s)) << "Idle workers did not wake for second batch: " << second_batch.load() << "/100";
 }
 
 // ---------------------------------------------------------------------------
@@ -374,12 +362,9 @@ TEST(SchedulerPendingRegressionTest, ProgressiveBatchCyclesNoZombie)
 		std::atomic<int> counter{ 0 };
 		for (int i = 0; i < kPerCycle; ++i)
 		{
-			scheduler.Submit([&counter]() {
-				counter.fetch_add(1, std::memory_order_relaxed);
-			});
+			scheduler.Submit([&counter]() { counter.fetch_add(1, std::memory_order_relaxed); });
 		}
-		ASSERT_TRUE(WaitFor(counter, kPerCycle, 10s))
-		    << "Cycle " << cycle << " stalled at " << counter.load() << "/" << kPerCycle;
+		ASSERT_TRUE(WaitFor(counter, kPerCycle, 10s)) << "Cycle " << cycle << " stalled at " << counter.load() << "/" << kPerCycle;
 	}
 
 	// Final health check: single affinity submission still routes correctly.
@@ -388,13 +373,10 @@ TEST(SchedulerPendingRegressionTest, ProgressiveBatchCyclesNoZombie)
 		auto ctx = scheduler.CaptureContext();
 		if (ctx.IsValid())
 		{
-			scheduler.SubmitIn(ctx, [&health]() {
-				health.fetch_add(1, std::memory_order_relaxed);
-			});
+			scheduler.SubmitIn(ctx, [&health]() { health.fetch_add(1, std::memory_order_relaxed); });
 		}
 	});
-	ASSERT_TRUE(WaitFor(health, 1, 5s))
-	    << "Scheduler unhealthy after batch cycles: affinity path broken";
+	ASSERT_TRUE(WaitFor(health, 1, 5s)) << "Scheduler unhealthy after batch cycles: affinity path broken";
 }
 
 // ---------------------------------------------------------------------------
@@ -415,25 +397,18 @@ TEST(SchedulerPendingRegressionTest, MixedPriorityLazyWakeupProgress)
 
 	for (int i = 0; i < kImmediate; ++i)
 	{
-		scheduler.Submit([&counter]() {
-			counter.fetch_add(1, std::memory_order_relaxed);
-		});
+		scheduler.Submit([&counter]() { counter.fetch_add(1, std::memory_order_relaxed); });
 	}
 	for (int i = 0; i < kPriority; ++i)
 	{
-		scheduler.Submit([&counter]() {
-			counter.fetch_add(1, std::memory_order_relaxed);
-		}, static_cast<std::size_t>(i % 5 + 1));
+		scheduler.Submit([&counter]() { counter.fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 5 + 1));
 	}
 	auto past = std::chrono::steady_clock::now() - 1s;
 	for (int i = 0; i < kDelayed; ++i)
 	{
-		scheduler.SubmitAfter(past, [&counter]() {
-			counter.fetch_add(1, std::memory_order_relaxed);
-		});
+		scheduler.SubmitAfter(past, [&counter]() { counter.fetch_add(1, std::memory_order_relaxed); });
 	}
 
 	const int expected = kImmediate + kPriority + kDelayed;
-	ASSERT_TRUE(WaitFor(counter, expected, 15s))
-	    << "Mixed priority/lazy wakeup: " << counter.load() << "/" << expected << " completed";
+	ASSERT_TRUE(WaitFor(counter, expected, 15s)) << "Mixed priority/lazy wakeup: " << counter.load() << "/" << expected << " completed";
 }

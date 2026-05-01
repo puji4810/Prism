@@ -159,9 +159,8 @@ namespace
 			InternalKey internal_key(entry.user_key, entry.sequence, entry.type);
 			encoded.push_back(EncodedEntry{ internal_key.Encode().ToString(), entry.value, internal_key });
 		}
-		std::sort(encoded.begin(), encoded.end(), [&icmp](const EncodedEntry& lhs, const EncodedEntry& rhs) {
-			return icmp.Compare(lhs.key, rhs.key) < 0;
-		});
+		std::sort(encoded.begin(), encoded.end(),
+		    [&icmp](const EncodedEntry& lhs, const EncodedEntry& rhs) { return icmp.Compare(lhs.key, rhs.key) < 0; });
 
 		const uint64_t file_number = db->TEST_NewFileNumber();
 		const std::string filename = TableFileName(dbname, file_number);
@@ -184,14 +183,10 @@ namespace
 
 	void AddCompactionInputs(DBImpl* db)
 	{
-		AddTableFile(db, db->TEST_DBName(), 0,
-		    { TableEntry{ "a", 1, kTypeValue, "va0" }, TableEntry{ "d", 1, kTypeValue, "vd0" } });
-		AddTableFile(db, db->TEST_DBName(), 0,
-		    { TableEntry{ "b", 1, kTypeValue, "vb1" }, TableEntry{ "e", 1, kTypeValue, "ve1" } });
-		AddTableFile(db, db->TEST_DBName(), 0,
-		    { TableEntry{ "c", 1, kTypeValue, "vc2" }, TableEntry{ "f", 1, kTypeValue, "vf2" } });
-		AddTableFile(db, db->TEST_DBName(), 0,
-		    { TableEntry{ "d", 0, kTypeValue, "vd3" }, TableEntry{ "g", 1, kTypeValue, "vg3" } });
+		AddTableFile(db, db->TEST_DBName(), 0, { TableEntry{ "a", 1, kTypeValue, "va0" }, TableEntry{ "d", 1, kTypeValue, "vd0" } });
+		AddTableFile(db, db->TEST_DBName(), 0, { TableEntry{ "b", 1, kTypeValue, "vb1" }, TableEntry{ "e", 1, kTypeValue, "ve1" } });
+		AddTableFile(db, db->TEST_DBName(), 0, { TableEntry{ "c", 1, kTypeValue, "vc2" }, TableEntry{ "f", 1, kTypeValue, "vf2" } });
+		AddTableFile(db, db->TEST_DBName(), 0, { TableEntry{ "d", 0, kTypeValue, "vd3" }, TableEntry{ "g", 1, kTypeValue, "vg3" } });
 	}
 }
 

@@ -68,8 +68,8 @@ namespace prism::bench
 		auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 		auto avg_ns = total_ns / static_cast<uint64_t>(iterations);
 
-		std::printf("  %-45s %8lu ns/op  (total %lu ns over %d iters)\n", name,
-		    static_cast<unsigned long>(avg_ns), static_cast<unsigned long>(total_ns), iterations);
+		std::printf("  %-45s %8lu ns/op  (total %lu ns over %d iters)\n", name, static_cast<unsigned long>(avg_ns),
+		    static_cast<unsigned long>(total_ns), iterations);
 
 		return avg_ns;
 	}
@@ -97,9 +97,7 @@ namespace prism::bench
 		// ---------------------------------------------------------------
 		{
 			std::function<void()> f;
-			Measure("1a. std::function() default ctor", kIterations, [&]() {
-				f = std::function<void()>();
-			});
+			Measure("1a. std::function() default ctor", kIterations, [&]() { f = std::function<void()>(); });
 		}
 
 		{
@@ -165,9 +163,7 @@ namespace prism::bench
 			for (int i = 0; i < 10000; ++i)
 				f();
 
-			Measure("4. std::function::operator() virtual dispatch", kIterations, [&]() {
-				f();
-			});
+			Measure("4. std::function::operator() virtual dispatch", kIterations, [&]() { f(); });
 		}
 
 		{
@@ -178,9 +174,7 @@ namespace prism::bench
 			for (int i = 0; i < 10000; ++i)
 				f();
 
-			Measure("5. large-capture function::operator() (heap-backed)", kIterations, [&]() {
-				f();
-			});
+			Measure("5. large-capture function::operator() (heap-backed)", kIterations, [&]() { f(); });
 		}
 
 		// ---------------------------------------------------------------
@@ -198,9 +192,7 @@ namespace prism::bench
 
 			for (int i = 0; i < 10000; ++i)
 			{
-				exec.Submit([p, &count] {
-					count.fetch_add(1, std::memory_order_relaxed);
-				});
+				exec.Submit([p, &count] { count.fetch_add(1, std::memory_order_relaxed); });
 			}
 
 			// Drain
@@ -213,9 +205,7 @@ namespace prism::bench
 			constexpr int kSubmitIters = 100000;
 			for (int i = 0; i < kSubmitIters; ++i)
 			{
-				exec.Submit([p, &count] {
-					count.fetch_add(1, std::memory_order_relaxed);
-				});
+				exec.Submit([p, &count] { count.fetch_add(1, std::memory_order_relaxed); });
 			}
 
 			// Wait for completion
@@ -226,8 +216,7 @@ namespace prism::bench
 			auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 			auto avg_ns = total_ns / kSubmitIters;
 
-			std::printf("  %-45s %8lu ns/op  (SBO capture, submit + exec round-trip)\n",
-			    "6a. BlockingExecutor submit-exec (small cap.)",
+			std::printf("  %-45s %8lu ns/op  (SBO capture, submit + exec round-trip)\n", "6a. BlockingExecutor submit-exec (small cap.)",
 			    static_cast<unsigned long>(avg_ns));
 		}
 
@@ -243,9 +232,7 @@ namespace prism::bench
 
 			for (int i = 0; i < 10000; ++i)
 			{
-				exec.Submit([cap, &count] {
-					count.fetch_add(1, std::memory_order_relaxed);
-				});
+				exec.Submit([cap, &count] { count.fetch_add(1, std::memory_order_relaxed); });
 			}
 			while (count.load() < 10000)
 				std::this_thread::yield();
@@ -256,9 +243,7 @@ namespace prism::bench
 			constexpr int kSubmitIters = 50000;
 			for (int i = 0; i < kSubmitIters; ++i)
 			{
-				exec.Submit([cap, &count] {
-					count.fetch_add(1, std::memory_order_relaxed);
-				});
+				exec.Submit([cap, &count] { count.fetch_add(1, std::memory_order_relaxed); });
 			}
 
 			while (count.load() < kSubmitIters)
@@ -268,8 +253,7 @@ namespace prism::bench
 			auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 			auto avg_ns = total_ns / kSubmitIters;
 
-			std::printf("  %-45s %8lu ns/op  (HEAP capture, submit + exec round-trip)\n",
-			    "6b. BlockingExecutor submit-exec (large cap.)",
+			std::printf("  %-45s %8lu ns/op  (HEAP capture, submit + exec round-trip)\n", "6b. BlockingExecutor submit-exec (large cap.)",
 			    static_cast<unsigned long>(avg_ns));
 		}
 
@@ -293,9 +277,7 @@ namespace prism::bench
 			{
 				exec.Submit([cap, &count, &exec] {
 					// Simulate: work executes, then submits continuation
-					exec.Submit([&count] {
-						count.fetch_add(1, std::memory_order_relaxed);
-					});
+					exec.Submit([&count] { count.fetch_add(1, std::memory_order_relaxed); });
 				});
 			}
 			while (count.load() < 10000)
@@ -306,11 +288,7 @@ namespace prism::bench
 
 			for (int i = 0; i < kHotIters; ++i)
 			{
-				exec.Submit([cap, &count, &exec] {
-					exec.Submit([&count] {
-						count.fetch_add(1, std::memory_order_relaxed);
-					});
-				});
+				exec.Submit([cap, &count, &exec] { exec.Submit([&count] { count.fetch_add(1, std::memory_order_relaxed); }); });
 			}
 
 			while (count.load() < kHotIters)
@@ -320,8 +298,8 @@ namespace prism::bench
 			auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 			auto avg_ns = total_ns / kHotIters;
 
-			std::printf("  %-45s %8lu ns/op  (work(HEAP) + cont(SBO) full cycle)\n",
-			    "7.  Full GetAsync cycle (2 functions)", static_cast<unsigned long>(avg_ns));
+			std::printf("  %-45s %8lu ns/op  (work(HEAP) + cont(SBO) full cycle)\n", "7.  Full GetAsync cycle (2 functions)",
+			    static_cast<unsigned long>(avg_ns));
 		}
 
 		std::printf("\n=== End of std::function Overhead Microbenchmark ===\n");

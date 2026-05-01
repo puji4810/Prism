@@ -453,14 +453,16 @@ TEST_F(ObsoleteFilesTest, ConcurrentGetAndIteratorRefBalanceAfterTurnover)
 		for (int i = 0; i < 200; ++i)
 		{
 			Status s = db->Put("turnover_" + std::to_string(i), std::string(128, 't'));
-			if (!s.ok()) break;
+			if (!s.ok())
+				break;
 		}
 	});
 
 	// Wait for writer to finish, then stop readers.
 	threads.back().join();
 	stop.store(true, std::memory_order_release);
-	for (int i = 0; i < kGetThreads; ++i) threads[i].join();
+	for (int i = 0; i < kGetThreads; ++i)
+		threads[i].join();
 
 	// Refs must still be elevated by the iterators.
 	int refs_mid = impl->TEST_CurrentVersionRefs();

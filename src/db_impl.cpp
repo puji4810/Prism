@@ -1837,10 +1837,10 @@ namespace prism
 		return Write(write_options, std::move(batch));
 	}
 
-		Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
-		{
-			// Phase 1: Acquire a pinned read view lock-free via the published SuperVersion.
-			SuperVersion* sv = super_version_.load(std::memory_order_acquire);
+	Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
+	{
+		// Phase 1: Acquire a pinned read view lock-free via the published SuperVersion.
+		SuperVersion* sv = super_version_.load(std::memory_order_acquire);
 		if (sv == nullptr)
 		{
 			return std::unexpected(Status::Corruption("database not initialized"));
@@ -2002,9 +2002,9 @@ namespace prism
 		return Status::OK();
 	}
 
-		std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& read_options)
-		{
-			SuperVersion* sv = super_version_.load(std::memory_order_acquire);
+	std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& read_options)
+	{
+		SuperVersion* sv = super_version_.load(std::memory_order_acquire);
 		if (sv == nullptr)
 		{
 			return std::unique_ptr<Iterator>(NewErrorIterator(Status::Corruption("database not initialized")));

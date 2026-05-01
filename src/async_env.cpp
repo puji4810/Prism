@@ -13,10 +13,10 @@ namespace prism
 			IScheduler* scheduler;
 		};
 
-			// RuntimeBundle& RuntimeFrom(const std::shared_ptr<void>& runtime)
-			// {
-			// 	return *static_cast<RuntimeBundle*>(runtime.get());
-			// }
+		// RuntimeBundle& RuntimeFrom(const std::shared_ptr<void>& runtime)
+		// {
+		// 	return *static_cast<RuntimeBundle*>(runtime.get());
+		// }
 
 		AsyncEnvBackend BackendSelect(RuntimeBundle& runtime)
 		{
@@ -50,28 +50,25 @@ namespace prism
 		auto runtime = runtime_;
 		auto backend = BackendSelect(*runtime);
 		return AsyncOp<Result<std::size_t>>(
-		    *backend.scheduler, [file = file_, offset, dst]() -> Result<std::size_t> {
-			    return file->ReadAt(offset, dst);
-		    });
+		    *backend.scheduler, [file = file_, offset, dst]() -> Result<std::size_t> { return file->ReadAt(offset, dst); });
 	}
 
 	AsyncOp<Result<std::string>> AsyncRandomAccessFile::ReadAtStringAsync(uint64_t offset, std::size_t n) const
 	{
 		auto runtime = runtime_;
 		auto backend = BackendSelect(*runtime);
-		return AsyncOp<Result<std::string>>(
-		    *backend.scheduler, [file = file_, offset, n]() -> Result<std::string> {
-			    std::string buf;
-			    buf.resize(n);
-			    auto bytes = std::as_writable_bytes(std::span(buf));
-			    Result<std::size_t> r = file->ReadAt(offset, bytes);
-			    if (!r.has_value())
-			    {
-				    return std::unexpected(r.error());
-			    }
-			    buf.resize(r.value());
-			    return buf;
-		    });
+		return AsyncOp<Result<std::string>>(*backend.scheduler, [file = file_, offset, n]() -> Result<std::string> {
+			std::string buf;
+			buf.resize(n);
+			auto bytes = std::as_writable_bytes(std::span(buf));
+			Result<std::size_t> r = file->ReadAt(offset, bytes);
+			if (!r.has_value())
+			{
+				return std::unexpected(r.error());
+			}
+			buf.resize(r.value());
+			return buf;
+		});
 	}
 
 	AsyncWritableFile::AsyncWritableFile(ThreadPoolScheduler& scheduler, std::unique_ptr<WritableFile> file)

@@ -359,7 +359,8 @@ TEST_F(CompactionTest, IteratorAndGetBothSurviveVersionTurnover)
 	for (int i = 0; i < 8; ++i)
 	{
 		Status s = impl->TEST_RunBackgroundCompactionOnce();
-		if (!s.ok()) break;
+		if (!s.ok())
+			break;
 	}
 
 	// Iterator must still see its original view.
@@ -371,8 +372,7 @@ TEST_F(CompactionTest, IteratorAndGetBothSurviveVersionTurnover)
 		if (key.substr(0, 9) == "turnover_")
 		{
 			int idx = std::stoi(key.substr(9));
-			EXPECT_EQ(iter->value().ToString(), "old_" + std::to_string(idx))
-			    << "Iterator must see original value after version turnover";
+			EXPECT_EQ(iter->value().ToString(), "old_" + std::to_string(idx)) << "Iterator must see original value after version turnover";
 		}
 		++count;
 		iter->Next();

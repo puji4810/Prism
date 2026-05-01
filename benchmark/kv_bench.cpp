@@ -18,8 +18,8 @@
 #if __has_include(<ittnotify.h>)
 #include <ittnotify.h>
 #else
-inline void __itt_pause(void) {}
-inline void __itt_resume(void) {}
+inline void __itt_pause(void) { }
+inline void __itt_resume(void) { }
 #endif
 
 namespace prism::bench
@@ -59,9 +59,11 @@ namespace prism::bench
 		    = (cfg.prefill == 1) || (cfg.prefill == -1 && (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0));
 		if (should_prefill_sync)
 		{
-			if (cfg.profile_pause_prefill) __itt_pause();
+			if (cfg.profile_pause_prefill)
+				__itt_pause();
 			Prefill(db, keys, cfg.ops_per_client, cfg.value_size);
-			if (cfg.profile_pause_prefill) __itt_resume();
+			if (cfg.profile_pause_prefill)
+				__itt_resume();
 		}
 
 		if (cfg.mode == BenchMode::kDiskRead)
@@ -182,19 +184,22 @@ namespace prism::bench
 
 		if (should_prefill)
 		{
-			if (cfg.profile_pause_prefill) __itt_pause();
+			if (cfg.profile_pause_prefill)
+				__itt_pause();
 			Options prefill_options = options;
 			prefill_options.env = env_to_use;
 			auto pre = Database::Open(prefill_options, dir);
 			if (!pre.has_value())
 			{
 				std::fprintf(stderr, "async prefill open failed: %s\n", pre.error().ToString().c_str());
-				if (cfg.profile_pause_prefill) __itt_resume();
+				if (cfg.profile_pause_prefill)
+					__itt_resume();
 				return;
 			}
 			auto pre_db = std::move(pre.value());
 			Prefill(pre_db, keys, cfg.ops_per_client, cfg.value_size);
-			if (cfg.profile_pause_prefill) __itt_resume();
+			if (cfg.profile_pause_prefill)
+				__itt_resume();
 		}
 
 		auto open_sem = std::binary_semaphore(0);
@@ -208,8 +213,8 @@ namespace prism::bench
 			std::rethrow_exception(open_exc);
 		}
 
-		std::printf("phase=%s scheduler_threads=%zu inflight_per_client=%d\n", PhaseName(cfg.phase).c_str(),
-		    scheduler.WorkerCount(), cfg.inflight_per_client);
+		std::printf("phase=%s scheduler_threads=%zu inflight_per_client=%d\n", PhaseName(cfg.phase).c_str(), scheduler.WorkerCount(),
+		    cfg.inflight_per_client);
 
 		// prefill-only: prefill already done above, return early
 		if (cfg.phase == PhaseMode::kPrefillOnly)
@@ -264,24 +269,18 @@ namespace prism::bench
 		if (cfg.phase == PhaseMode::kSteadyState)
 		{
 			const auto cs = dbi->GetCompactionState();
-			std::printf(
-			    "phase=steady-state compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
-			    " compaction_start_count=%lu compaction_finish_count=%lu\n",
-			    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight),
-			    static_cast<int>(cs.write_stalled),
-			    static_cast<unsigned long>(cs.compaction_start_count),
-			    static_cast<unsigned long>(cs.compaction_finish_count));
+			std::printf("phase=steady-state compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
+			            " compaction_start_count=%lu compaction_finish_count=%lu\n",
+			    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight), static_cast<int>(cs.write_stalled),
+			    static_cast<unsigned long>(cs.compaction_start_count), static_cast<unsigned long>(cs.compaction_finish_count));
 		}
 		else if (cfg.phase == PhaseMode::kCompactionOverlapOnly)
 		{
 			const auto cs = dbi->GetCompactionState();
-			std::printf(
-			    "phase=compaction-overlap-only compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
-			    " compaction_start_count=%lu compaction_finish_count=%lu\n",
-			    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight),
-			    static_cast<int>(cs.write_stalled),
-			    static_cast<unsigned long>(cs.compaction_start_count),
-			    static_cast<unsigned long>(cs.compaction_finish_count));
+			std::printf("phase=compaction-overlap-only compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
+			            " compaction_start_count=%lu compaction_finish_count=%lu\n",
+			    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight), static_cast<int>(cs.write_stalled),
+			    static_cast<unsigned long>(cs.compaction_start_count), static_cast<unsigned long>(cs.compaction_finish_count));
 		}
 
 		std::vector<uint64_t> all_lat;
@@ -391,9 +390,9 @@ int main(int argc, char** argv)
 	Config cfg = ParseArgs(argc, argv);
 	const auto keys = MakeKeys(cfg.clients, cfg.ops_per_client);
 
-	std::printf("config: run=%s bench=%s phase=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n",
-	    RunName(cfg).c_str(), BenchName(cfg.mode).c_str(), PhaseName(cfg.phase).c_str(), cfg.clients, cfg.workers,
-	    cfg.ops_per_client, cfg.value_size, cfg.read_ratio);
+	std::printf("config: run=%s bench=%s phase=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n", RunName(cfg).c_str(),
+	    BenchName(cfg.mode).c_str(), PhaseName(cfg.phase).c_str(), cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size,
+	    cfg.read_ratio);
 
 	if (cfg.do_sync)
 	{

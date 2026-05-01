@@ -48,8 +48,8 @@ namespace prism
 #elif defined(__NR_io_uring_setup)
 			return static_cast<int>(::syscall(__NR_io_uring_setup, entries, params));
 #else
-			(void) entries;
-			(void) params;
+			(void)entries;
+			(void)params;
 			errno = ENOSYS;
 			return -1;
 #endif
@@ -64,10 +64,10 @@ namespace prism
 #elif defined(__NR_io_uring_enter)
 				const int result = static_cast<int>(::syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete, flags, nullptr, 0));
 #else
-				(void) ring_fd;
-				(void) to_submit;
-				(void) min_complete;
-				(void) flags;
+				(void)ring_fd;
+				(void)to_submit;
+				(void)min_complete;
+				(void)flags;
 				errno = ENOSYS;
 				return -1;
 #endif
@@ -78,10 +78,7 @@ namespace prism
 			}
 		}
 
-		std::uint32_t LoadAcquire(std::uint32_t* value)
-		{
-			return std::atomic_ref<std::uint32_t>(*value).load(std::memory_order_acquire);
-		}
+		std::uint32_t LoadAcquire(std::uint32_t* value) { return std::atomic_ref<std::uint32_t>(*value).load(std::memory_order_acquire); }
 
 		void StoreRelease(std::uint32_t* value, std::uint32_t desired)
 		{
@@ -90,17 +87,14 @@ namespace prism
 
 		bool ReadOpcodeSupported()
 		{
-		#ifndef IORING_OP_READ
+#ifndef IORING_OP_READ
 			return false;
-		#else
+#else
 			return KernelVersionAtLeast(5, 6);
-		#endif
+#endif
 		}
 
-		bool ShouldFallbackFromCompletion(int result)
-		{
-			return result == -EINVAL || result == -EOPNOTSUPP || result == -ENOSYS;
-		}
+		bool ShouldFallbackFromCompletion(int result) { return result == -EINVAL || result == -EOPNOTSUPP || result == -ENOSYS; }
 
 		int BlockingReadAt(int fd, void* buf, unsigned nbytes, off_t offset)
 		{
@@ -118,15 +112,9 @@ namespace prism
 			}
 		}
 #else
-		int BlockingReadAt(int, void*, unsigned, off_t)
-		{
-			return -ENOSYS;
-		}
+		int BlockingReadAt(int, void*, unsigned, off_t) { return -ENOSYS; }
 
-		bool ShouldFallbackFromCompletion(int)
-		{
-			return true;
-		}
+		bool ShouldFallbackFromCompletion(int) { return true; }
 #endif
 	} // namespace
 
@@ -197,12 +185,7 @@ namespace prism
 		}
 		else
 		{
-			cq_ring_ptr_ = ::mmap(nullptr,
-			    cq_ring_size_,
-			    PROT_READ | PROT_WRITE,
-			    MAP_SHARED | MAP_POPULATE,
-			    ring_fd_,
-			    IORING_OFF_CQ_RING);
+			cq_ring_ptr_ = ::mmap(nullptr, cq_ring_size_, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring_fd_, IORING_OFF_CQ_RING);
 			if (cq_ring_ptr_ == MAP_FAILED)
 			{
 				cq_ring_ptr_ = nullptr;
@@ -232,7 +215,7 @@ namespace prism
 		sqes_ = reinterpret_cast<::io_uring_sqe*>(sqes_ptr_);
 		cqes_ = reinterpret_cast<::io_uring_cqe*>(static_cast<char*>(cq_ring_ptr_) + params.cq_off.cqes);
 #else
-		(void) entries;
+		(void)entries;
 		init_failed_ = true;
 #endif
 	}
@@ -274,14 +257,14 @@ namespace prism
 	bool IoReactor::SubmitRead(int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data)
 	{
 #ifdef __linux__
-	#ifndef IORING_OP_READ
-		(void) fd;
-		(void) buf;
-		(void) nbytes;
-		(void) offset;
-		(void) user_data;
+#ifndef IORING_OP_READ
+		(void)fd;
+		(void)buf;
+		(void)nbytes;
+		(void)offset;
+		(void)user_data;
 		return false;
-	#else
+#else
 		std::lock_guard lock(mutex_);
 		if (!IsValid() || !ReadOpcodeSupported())
 		{
@@ -313,13 +296,13 @@ namespace prism
 			return false;
 		}
 		return true;
-	#endif
+#endif
 #else
-		(void) fd;
-		(void) buf;
-		(void) nbytes;
-		(void) offset;
-		(void) user_data;
+		(void)fd;
+		(void)buf;
+		(void)nbytes;
+		(void)offset;
+		(void)user_data;
 		return false;
 #endif
 	}
@@ -358,8 +341,8 @@ namespace prism
 			}
 		}
 #else
-		(void) user_data;
-		(void) res;
+		(void)user_data;
+		(void)res;
 		return 0;
 #endif
 	}
@@ -468,9 +451,7 @@ namespace prism
 		}
 	}
 
-	IoReadDispatcher::IoReadDispatcher(BlockingExecutor& blocking_executor,
-	    IoCapability capability,
-	    std::unique_ptr<IIoReactor> reactor)
+	IoReadDispatcher::IoReadDispatcher(BlockingExecutor& blocking_executor, IoCapability capability, std::unique_ptr<IIoReactor> reactor)
 	    : blocking_executor_(&blocking_executor)
 	    , capability_(capability)
 	    , reactor_(std::move(reactor))
@@ -486,12 +467,8 @@ namespace prism
 		return capability_ == IoCapability::kSupported && reactor_ != nullptr && reactor_->IsValid();
 	}
 
-	void IoReadDispatcher::SubmitRead(int fd,
-	    void* buf,
-	    unsigned nbytes,
-	    off_t offset,
-	    uint64_t user_data,
-	    std::function<void(uint64_t, int)> completion)
+	void IoReadDispatcher::SubmitRead(
+	    int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data, std::function<void(uint64_t, int)> completion)
 	{
 		if (!HasReactor())
 		{
@@ -533,12 +510,8 @@ namespace prism
 		RuntimeMetrics::Instance().fallback_to_blocking_count.fetch_add(kFallbackIncrement, std::memory_order_relaxed);
 	}
 
-	void IoReadDispatcher::SubmitBlockingRead(int fd,
-	    void* buf,
-	    unsigned nbytes,
-	    off_t offset,
-	    uint64_t user_data,
-	    std::function<void(uint64_t, int)> completion)
+	void IoReadDispatcher::SubmitBlockingRead(
+	    int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data, std::function<void(uint64_t, int)> completion)
 	{
 		blocking_executor_->Submit([fd, buf, nbytes, offset, user_data, completion = std::move(completion)]() mutable {
 			if (completion)
