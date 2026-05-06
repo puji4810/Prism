@@ -1,4 +1,4 @@
-#include "../src/runtime_executor.h"
+#include "../src/async_runtime.h"
 #include "../src/task_scope.h"
 
 #include <atomic>
@@ -99,7 +99,7 @@ TEST(StructuredTaskTest, RuntimeBundleConstructsAndDrainsResources)
 
 		runtime.read_executor.Submit([&] { blocking_done.release(); });
 		runtime.serial_lane.Submit([&] { serial_done.release(); });
-		runtime.cpu_executor->Submit([&] { cpu_done.release(); });
+		runtime.cpu_executor.Submit([&] { cpu_done.release(); });
 
 		ASSERT_TRUE(blocking_done.try_acquire_for(5s));
 		ASSERT_TRUE(serial_done.try_acquire_for(5s));

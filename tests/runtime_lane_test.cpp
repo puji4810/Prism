@@ -9,7 +9,7 @@
 // silently collapse the read and compaction lanes back into a single executor
 // will fail one or more of these tests.
 
-#include "runtime_executor.h"
+#include "async_runtime.h"
 #include "compaction_controller.h"
 
 #include "db_impl.h"
@@ -66,8 +66,8 @@ namespace prism::tests
 	// Test 1: Read Lane Isolation Verification
 	//
 	// Confirms that read_executor and compaction_executor are distinct objects
-	// and that runtime_scheduler.BlockingScheduler() routes to the read lane,
-	// NOT the compaction lane.
+	// and that read_scheduler self-routes both blocking and continuation,
+	// while compaction_scheduler and serial_scheduler also self-route.
 	// ===========================================================================
 	TEST(RuntimeLaneTest, ReadAndCompactionExecutorsAreSeparate)
 	{
@@ -76,21 +76,20 @@ namespace prism::tests
 
 		EXPECT_NE(&runtime.read_executor, &runtime.compaction_executor);
 
-		IScheduler* blocking = runtime.runtime_scheduler.BlockingScheduler();
-		EXPECT_EQ(blocking, &runtime.read_scheduler);
-		EXPECT_NE(blocking, &runtime.compaction_scheduler);
-		EXPECT_EQ(runtime.runtime_scheduler.ContinuationScheduler(), &runtime.cpu_scheduler);
+		EXPECT_EQ(runtime.read_scheduler.BlockingScheduler(), &runtime.read_scheduler);
+		EXPECT_EQ(runtime.read_scheduler.ContinuationScheduler(), &runtime.read_scheduler);
 		EXPECT_EQ(runtime.foreground_db_scheduler.BlockingScheduler(), &runtime.foreground_db_scheduler);
 		EXPECT_EQ(runtime.foreground_db_scheduler.ContinuationScheduler(), &runtime.foreground_db_scheduler);
 		EXPECT_EQ(runtime.cpu_scheduler.BlockingScheduler(), &runtime.cpu_scheduler);
 		EXPECT_EQ(runtime.cpu_scheduler.ContinuationScheduler(), &runtime.cpu_scheduler);
-		EXPECT_EQ(runtime.read_scheduler.ContinuationScheduler(), &runtime.read_scheduler);
+		EXPECT_EQ(runtime.compaction_scheduler.BlockingScheduler(), &runtime.compaction_scheduler);
 		EXPECT_EQ(runtime.compaction_scheduler.ContinuationScheduler(), &runtime.compaction_scheduler);
+		EXPECT_EQ(runtime.serial_scheduler.BlockingScheduler(), &runtime.serial_scheduler);
 		EXPECT_EQ(runtime.serial_scheduler.ContinuationScheduler(), &runtime.serial_scheduler);
 
 		{
 			std::binary_semaphore done(0);
-			blocking->Submit([&done] { done.release(); });
+			runtime.read_scheduler.Submit([&done] { done.release(); });
 			EXPECT_TRUE(done.try_acquire_for(5s));
 		}
 
@@ -126,7 +125,7 @@ namespace prism::tests
 		ASSERT_TRUE(compaction_started.try_acquire_for(5s));
 
 		std::binary_semaphore read_done(0);
-		runtime.runtime_scheduler.BlockingScheduler()->Submit([&read_done] { read_done.release(); });
+		runtime.read_scheduler.Submit([&read_done] { read_done.release(); });
 
 		EXPECT_TRUE(read_done.try_acquire_for(5s)) << "foreground read was blocked behind compaction — lane isolation broken";
 
@@ -293,7 +292,7 @@ namespace prism::tests
 
 		for (int i = 0; i < kNumWorkItems; ++i)
 		{
-			runtime.runtime_scheduler.BlockingScheduler()->Submit([&read_counter, i, &read_all_done, kNumWorkItems] {
+			runtime.read_scheduler.Submit([&read_counter, i, &read_all_done, kNumWorkItems] {
 				read_counter.fetch_add(i, std::memory_order_relaxed);
 				if (i == kNumWorkItems - 1)
 				{

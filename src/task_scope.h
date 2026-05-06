@@ -1,7 +1,7 @@
 #ifndef PRISM_TASK_SCOPE_H
 #define PRISM_TASK_SCOPE_H
 
-#include "runtime_executor.h"
+#include "async_runtime.h"
 #include "runtime_metrics.h"
 
 #include <any>

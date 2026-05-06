@@ -29,11 +29,16 @@ namespace prism
 		// Thread-safe. Must be callable from any thread.
 		virtual void Submit(Job job, std::size_t priority = 0) = 0;
 
-		// Routing hooks used by AsyncOp to split work execution from coroutine resumption.
-		// BlockingScheduler()  — returns the scheduler where the actual work (I/O, CPU) is submitted.
-		// ContinuationScheduler() — returns the scheduler where the coroutine is resumed after work.
-		// Default (inherited) implementation returns `this`, routing both through the same scheduler.
-		// Test doubles and ExecutorSchedulerAdapter override these to split blocking/continuation lanes.
+		// Routing hooks that decouple work dispatch from coroutine resumption routing.
+		// BlockingScheduler() — returns the scheduler where actual work (I/O, CPU) is submitted.
+		//   AsyncOp calls BlockingScheduler() to dispatch blocking work to the thread pool.
+		// ContinuationScheduler() — available for explicit split-lane scenarios; used by
+		//   ExecutorSchedulerAdapter and standalone adapter tests. Production AsyncOp does
+		//   NOT queue continuations through ContinuationScheduler — coroutine resumption
+		//   happens inline on the worker that completed the work.
+		// Default (inherited) implementation returns `this`, routing both through the same
+		// scheduler. Test doubles and ExecutorSchedulerAdapter override these to route
+		// blocking and continuation lanes separately.
 		virtual IScheduler* BlockingScheduler() noexcept { return this; }
 		virtual IScheduler* ContinuationScheduler() noexcept { return this; }
 	};
