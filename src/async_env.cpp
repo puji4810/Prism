@@ -1,6 +1,6 @@
 #include "async_env.h"
 
-#include "runtime_executor.h"
+#include "async_runtime.h"
 #include <mutex>
 #include <utility>
 
@@ -24,8 +24,8 @@ namespace prism
 			{
 			case AsyncEnvBackendMode::kThreadPool:
 				// Legacy benchmark/config alias. Older callers still use the historical
-				// "thread_pool" name, but AsyncEnv no longer needs the legacy
-				// runtime_scheduler adapter hop to preserve file-I/O isolation.
+				// "thread_pool" name; all modes now route directly to
+				// read_scheduler for file-I/O isolation.
 				return { &runtime.read_scheduler };
 			case AsyncEnvBackendMode::kBlockingLane:
 				return { &runtime.read_scheduler };

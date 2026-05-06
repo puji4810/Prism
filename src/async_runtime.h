@@ -1,5 +1,5 @@
-#ifndef PRISM_RUNTIME_EXECUTOR_H
-#define PRISM_RUNTIME_EXECUTOR_H
+#ifndef PRISM_ASYNC_RUNTIME_H
+#define PRISM_ASYNC_RUNTIME_H
 
 #include "scheduler.h"
 
@@ -37,7 +37,7 @@ namespace prism
 		kCompaction,
 	};
 
-	// A thread pool executor that uses a ThreadPoolScheduler to execute continuations
+	// A thread pool executor that uses a ThreadPoolScheduler to execute CPU-bound work
 	// Works in ThreadPoolExecutor are CPU bound
 	// which with no blocking
 	class ThreadPoolExecutor final: public IContinuationExecutor
@@ -80,8 +80,8 @@ namespace prism
 		std::vector<std::jthread> workers_;
 	};
 
-	// A FIFO lane that executes continuations serially
-	// Executes continuations in order
+	// A FIFO lane that executes submitted work serially
+	// Executes work in submission order
 	class SerialLane final: public IContinuationExecutor
 	{
 	public:
@@ -136,12 +136,8 @@ namespace prism
 	//   SerialLane — 1 FIFO worker for ordered file writes
 	//
 	// Scheduler routing:
-	//   foreground_db_scheduler.Submit(job) → cpu_executor_impl → ThreadPoolScheduler::Submit(job, 0)
+	//   foreground_db_scheduler.Submit(job) → cpu_executor → ThreadPoolScheduler::Submit(job, 0)
 	//     (worker-local fast path / stealing-enabled shared CPU pool)
-	//   runtime_scheduler.Submit(job) → cpu_executor_impl → ThreadPoolScheduler
-	//   runtime_scheduler.BlockingScheduler() → read_scheduler → read_executor
-	//   runtime_scheduler.ContinuationScheduler() → cpu_scheduler → cpu_executor_impl
-	//     (available for explicit continuations; AsyncOp resumes inline after work completion)
 	//   read_scheduler.Submit(job) → read_executor
 	//   compaction_scheduler.Submit(job) → compaction_executor
 	//   serial_scheduler.Submit(job) → serial_lane
@@ -162,10 +158,8 @@ namespace prism
 
 		// -- Physical executors (IContinuationExecutor, owns or wraps threads) --
 
-		// cpu_executor_impl wraps the shared ThreadPoolScheduler for CPU-bound continuations.
-		// cpu_executor is just a pointer alias to cpu_executor_impl for external access.
-		ThreadPoolExecutor cpu_executor_impl;
-		IContinuationExecutor* cpu_executor;
+		// cpu_executor wraps the shared ThreadPoolScheduler for CPU-bound continuations.
+		ThreadPoolExecutor cpu_executor;
 
 		// timer_source points to the same ThreadPoolScheduler, used as a registry key
 		// by AcquireRuntimeBundle(). Named "timer_source" because ThreadPoolScheduler
@@ -199,18 +193,11 @@ namespace prism
 		ExecutorSchedulerAdapter read_scheduler;
 
 		// compaction_scheduler: wraps compaction_executor. Used only for explicit
-		// direct background work submission, not runtime_scheduler routing.
+		// direct background work submission to the isolated compaction lane.
 		ExecutorSchedulerAdapter compaction_scheduler;
 
 		// serial_scheduler: wraps serial_lane for ordered writes.
 		ExecutorSchedulerAdapter serial_scheduler;
-
-		// runtime_scheduler: legacy split-routing adapter. Direct Submit() stays on the
-		// shared CPU pool, BlockingScheduler() redirects blocking work to read_scheduler,
-		// and explicit continuations resolve back to cpu_scheduler. AsyncDB and AsyncEnv
-		// no longer use this adapter; it remains only for explicit legacy callers and
-		// routing tests that verify the split-lane contract.
-		ExecutorSchedulerAdapter runtime_scheduler;
 
 		// foreground_db_scheduler: wraps cpu_executor_impl and keeps both blocking work and
 		// continuations on the shared thread pool. AsyncDB foreground operations use this

@@ -1,7 +1,7 @@
 #ifndef PRISM_COMPACTION_CONTROLLER_H
 #define PRISM_COMPACTION_CONTROLLER_H
 
-#include "runtime_executor.h"
+#include "async_runtime.h"
 #include "task_scope.h"
 
 namespace prism

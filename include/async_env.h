@@ -12,7 +12,7 @@
 #include <string>
 
 // Forward-declared to avoid exposing internal runtime types in public header.
-// Defined in src/runtime_executor.h; included in src/async_env.cpp.
+// Defined in src/async_runtime.h; included in src/async_env.cpp.
 namespace prism { struct RuntimeBundle; }
 
 namespace prism

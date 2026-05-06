@@ -440,7 +440,7 @@ serial_scheduler.Submit(job)
   FIFO-ordered writes: AppendAsync, FlushAsync, SyncAsync, CloseAsync
 ```
 
-Compaction does not go through `runtime_scheduler`. The `CompactionController` submits directly to `compaction_executor` so that background merge work never competes with the read lane or CPU pool.
+Compaction uses the dedicated `compaction_scheduler` (backed by a single-threaded `compaction_executor`). The `CompactionController` submits directly to `compaction_executor` so that background merge work never competes with the read lane or CPU pool.
 
 ### Why Reads and Compaction Are Isolated
 

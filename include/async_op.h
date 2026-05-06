@@ -125,8 +125,7 @@ namespace prism
 					{
 						auto resume_time = std::chrono::steady_clock::now();
 						auto delay_us = static_cast<uint64_t>(
-						    std::chrono::duration_cast<std::chrono::microseconds>(resume_time - st->suspend_time)
-						        .count());
+						    std::chrono::duration_cast<std::chrono::microseconds>(resume_time - st->suspend_time).count());
 						auto& rm = RuntimeMetrics::Instance();
 						rm.continuation_delay_total_us.fetch_add(delay_us, std::memory_order_relaxed);
 						rm.continuation_count.fetch_add(1, std::memory_order_relaxed);
@@ -235,8 +234,7 @@ namespace prism
 					{
 						auto resume_time = std::chrono::steady_clock::now();
 						auto delay_us = static_cast<uint64_t>(
-						    std::chrono::duration_cast<std::chrono::microseconds>(resume_time - st->suspend_time)
-						        .count());
+						    std::chrono::duration_cast<std::chrono::microseconds>(resume_time - st->suspend_time).count());
 						auto& rm = RuntimeMetrics::Instance();
 						rm.continuation_delay_total_us.fetch_add(delay_us, std::memory_order_relaxed);
 						rm.continuation_count.fetch_add(1, std::memory_order_relaxed);

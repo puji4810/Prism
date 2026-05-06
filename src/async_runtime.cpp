@@ -1,4 +1,4 @@
-#include "runtime_executor.h"
+#include "async_runtime.h"
 
 #include "runtime_metrics.h"
 
@@ -340,18 +340,16 @@ namespace prism
 	IScheduler* ExecutorSchedulerAdapter::ContinuationScheduler() noexcept { return continuation_scheduler_; }
 
 	RuntimeBundle::RuntimeBundle(ThreadPoolScheduler& scheduler)
-	    : cpu_executor_impl(scheduler)
-	    , cpu_executor(&cpu_executor_impl)
+	    : cpu_executor(scheduler)
 	    , timer_source(&scheduler)
 	    , read_executor(kReadExecutorThreadCount, BlockingExecutorLane::kRead)
 	    , compaction_executor(1, BlockingExecutorLane::kCompaction)
 	    , serial_lane()
-	    , cpu_scheduler(cpu_executor_impl)
+	    , cpu_scheduler(cpu_executor)
 	    , read_scheduler(read_executor)
 	    , compaction_scheduler(compaction_executor)
 	    , serial_scheduler(serial_lane)
-	    , runtime_scheduler(cpu_executor_impl, &read_scheduler, &cpu_scheduler)
-	    , foreground_db_scheduler(cpu_executor_impl)
+	    , foreground_db_scheduler(cpu_executor)
 	{
 	}
 

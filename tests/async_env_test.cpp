@@ -1,6 +1,7 @@
 #include "async_env.h"
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <future>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "coro_task.h"
+#include "async_runtime.h"
 #include "env.h"
 #include "slice.h"
 
@@ -412,4 +414,56 @@ TEST_F(AsyncEnvTest, AsyncWritableFileMoveAndDestroySafety)
 	auto read_res = rf.value()->ReadAt(0, std::as_writable_bytes(std::span(content)));
 	ASSERT_TRUE(read_res.has_value());
 	EXPECT_EQ(content, "moved_data");
+}
+
+// Characterize that all three AsyncEnvBackendMode values (kDefault,
+// kThreadPool, kBlockingLane) route through BackendSelect directly to
+// read_scheduler. Each mode
+// executes a metadata operation (CreateDirAsync) and a factory operation
+// (NewRandomAccessFileAsync), both of which internally call BackendSelect.
+TEST_F(AsyncEnvTest, BackendModeSelection)
+{
+	constexpr AsyncEnvBackendMode kModes[] = {
+		AsyncEnvBackendMode::kDefault,
+		AsyncEnvBackendMode::kThreadPool,
+		AsyncEnvBackendMode::kBlockingLane,
+	};
+
+	for (const auto mode : kModes)
+	{
+		ThreadPoolScheduler scheduler(4);
+		auto runtime = AcquireRuntimeBundle(scheduler);
+		runtime->async_env_backend = mode;
+
+		AsyncEnv async_env(scheduler, env_);
+
+		// Metadata op: CreateDirAsync routes through BackendSelect.
+		const std::string dir_path = TestFile("mode_" + std::to_string(static_cast<int>(mode)));
+		auto mkdir_task = [&]() -> Task<void> {
+			auto s = co_await async_env.CreateDirAsync(dir_path);
+			EXPECT_TRUE(s.ok()) << "Mode " << static_cast<int>(mode)
+			                    << " CreateDirAsync: " << s.ToString();
+		}();
+		mkdir_task.SyncWait();
+
+		// Factory op: write a file synchronously, then open it via
+		// NewRandomAccessFileAsync which also routes through BackendSelect.
+		const std::string file_path = dir_path + "/data.txt";
+		{
+			auto wf = env_->NewWritableFile(file_path);
+			ASSERT_TRUE(wf.has_value());
+			auto s = wf.value()->Append(Slice("backend_mode_test"));
+			ASSERT_TRUE(s.ok());
+			s = wf.value()->Close();
+			ASSERT_TRUE(s.ok());
+		}
+
+		auto read_task = [&]() -> Task<void> {
+			auto raf_res = co_await async_env.NewRandomAccessFileAsync(file_path);
+			EXPECT_TRUE(raf_res.has_value())
+			    << "Mode " << static_cast<int>(mode)
+			    << " NewRandomAccessFileAsync: " << raf_res.error().ToString();
+		}();
+		read_task.SyncWait();
+	}
 }
