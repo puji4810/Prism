@@ -66,10 +66,10 @@ namespace prism
 						if (stopping_ && queue_.empty())
 						{
 							return;
-						}
-						runtime = queue_.front();
-						queue_.pop_front();
 					}
+					runtime = queue_.front();
+					queue_.pop_front();
+				}
 					delete runtime;
 				}
 			}
@@ -343,6 +343,7 @@ namespace prism
 	    : cpu_executor(scheduler)
 	    , timer_source(&scheduler)
 	    , read_executor(kReadExecutorThreadCount, BlockingExecutorLane::kRead)
+	    , io_dispatcher(read_executor)
 	    , compaction_executor(1, BlockingExecutorLane::kCompaction)
 	    , serial_lane()
 	    , cpu_scheduler(cpu_executor)

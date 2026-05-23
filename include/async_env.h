@@ -17,7 +17,7 @@ namespace prism { struct RuntimeBundle; }
 
 namespace prism
 {
-	class IoReactor;
+	class IoDispatcher;
 
 	// AsyncRandomAccessFile: Asynchronous wrapper for random-access file reads.
 	//
@@ -56,7 +56,7 @@ namespace prism
 	private:
 		std::shared_ptr<RuntimeBundle> runtime_;
 		std::shared_ptr<RandomAccessFile> file_;
-		IoReactor* reactor_{ nullptr };
+		IoDispatcher* dispatcher_{ nullptr };
 	};
 
 	// AsyncWritableFile: Asynchronous wrapper for writable files (append-only).
@@ -100,10 +100,10 @@ namespace prism
 	//
 	// Current Implementation:
 	// - Wraps synchronous Env operations in thread pool tasks
-	// - Random-access file factories may select the reactor-backed read path when available
-	// - Write-side file creation plus metadata ops stay on blocking workers; append/flush/sync/close
-	//   remain serialized on AsyncWritableFile's dedicated lane
-	// - Reactor offload for write-side operations is intentionally deferred
+	// - Random-access reads use the reactor-backed path when a permanent file descriptor
+	//   and io_uring are available, otherwise they fall back to the blocking read lane
+	// - Write-side file creation plus metadata ops stay on blocking workers; AppendAsync
+	//   uses the reactor path when possible while Flush/Sync/Close remain serialized.
 	//
 	// Future Migration Path:
 	// - Replace with io_uring (Linux) / kqueue (BSD) / IOCP (Windows)
