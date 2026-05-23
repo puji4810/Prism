@@ -112,6 +112,7 @@ namespace prism::bench
 		int rounds = 3;
 		BenchMode mode = BenchMode::kMixed;
 		PhaseMode phase = PhaseMode::kFull;
+		std::size_t key_space_per_client = 0; // 0=match ops_per_client
 		std::size_t write_buffer_size = 4 * 1024 * 1024;
 		bool do_sync = true;
 		bool do_async = true;
@@ -119,7 +120,7 @@ namespace prism::bench
 		int warmup_rounds = 0;
 		bool no_latency = false;
 		int prefill = -1; // -1=auto, 0=off, 1=force
-		bool profile_pause_prefill = false; // pause VTune/ITT during prefill
+		bool profile_pause_prefill = false; // pause VTune/ITT/perf during prefill
 		std::string db_dir = "";
 		bool keep_db = false;
 		int max_client_inflight = 0; // populated by runners
@@ -140,7 +141,8 @@ namespace prism::bench
 	uint64_t PercentileNs(std::vector<uint64_t> v, double p);
 
 	// Prefill helper
-	void Prefill(Database& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size);
+	void Prefill(Database& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size,
+	    bool pause_profiling = false);
 
 	// Sync benchmark runners
 	Stats RunSyncMixed(Database& db, const Config& cfg, const std::vector<std::vector<std::string>>& keys);

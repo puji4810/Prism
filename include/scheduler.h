@@ -74,8 +74,9 @@ namespace prism
 	// Fallback Dispatch:
 	// - Each worker has its own queue (mutex-protected deque)
 	// - Each worker tracks an approximate atomic load counter for fast external balancing
-	// - Workers re-enter pending_list_ only for fallback/background dispatch
-	// - QueuedJob tracks dispatch/pinning metadata; `dispatched` preserves pending-list invariants
+	// - Workers re-enter pending_list_ only for fallback/background dispatch jobs
+	// - QueuedJob tracks dispatch/pinning metadata; `dispatched` marks jobs that came
+	//   through the dispatcher and therefore may need pending-list bookkeeping
 	//
 	// - Shutdown Protocol:
 	// - Exit() sets exit_flag_, wakes all threads.
@@ -168,7 +169,7 @@ namespace prism
 
 	private:
 		// WorkThread: Worker with its own task queue.
-		// Consumes tasks from its queue, re-enters pending_list_ when idle.
+		// Consumes tasks from its queue, re-enters pending_list_ only for dispatched jobs when idle.
 		class WorkThread
 		{
 		public:
