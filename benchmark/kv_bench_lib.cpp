@@ -10,9 +10,61 @@
 #include <random>
 #include <stdexcept>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 namespace prism::bench
 {
+	namespace
+	{
+#ifdef __linux__
+		void PausePerfEvents()
+		{
+			(void)::prctl(PR_TASK_PERF_EVENTS_DISABLE, 0, 0, 0, 0);
+		}
+
+		void ResumePerfEvents()
+		{
+			(void)::prctl(PR_TASK_PERF_EVENTS_ENABLE, 0, 0, 0, 0);
+		}
+#else
+		void PausePerfEvents() {}
+		void ResumePerfEvents() {}
+#endif
+
+		struct ScopedPerfPause
+		{
+			explicit ScopedPerfPause(bool enabled)
+			    : enabled(enabled)
+			{
+				if (enabled)
+				{
+					PausePerfEvents();
+				}
+			}
+
+			~ScopedPerfPause()
+			{
+				if (enabled)
+				{
+					ResumePerfEvents();
+				}
+			}
+
+			ScopedPerfPause(const ScopedPerfPause&) = delete;
+			ScopedPerfPause& operator=(const ScopedPerfPause&) = delete;
+
+			bool enabled;
+		};
+
+		const std::string& KeyForOp(const std::vector<std::vector<std::string>>& keys, int client_id, std::size_t op_index)
+		{
+			const auto& client_keys = keys[static_cast<std::size_t>(client_id)];
+			return client_keys[op_index % client_keys.size()];
+		}
+	}
+
 	uint64_t NowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
 
 	std::string MakeTempDir(std::string_view tag)
@@ -126,19 +178,94 @@ namespace prism::bench
 		return v[idx];
 	}
 
-	void Prefill(Database& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size)
+	void Prefill(Database& db, const std::vector<std::vector<std::string>>& keys, std::size_t ops_per_client, std::size_t value_size,
+	    bool pause_profiling)
 	{
+		(void)ops_per_client;
 		const std::string value = MakeValue(value_size);
-		for (std::size_t t = 0; t < keys.size(); ++t)
-		{
-			for (std::size_t i = 0; i < ops_per_client; ++i)
+		const unsigned hw_threads = std::thread::hardware_concurrency();
+		const std::size_t thread_count = std::max<std::size_t>(
+		    1, std::min<std::size_t>(keys.size(), static_cast<std::size_t>(hw_threads == 0 ? 1 : hw_threads)));
+		const std::size_t clients_per_thread = (keys.size() + thread_count - 1) / thread_count;
+		const std::size_t batch_size = 256;
+
+		std::atomic<bool> stop{ false };
+		std::mutex error_mutex;
+		std::exception_ptr error;
+		std::vector<std::thread> workers;
+		workers.reserve(thread_count);
+
+		auto store_error = [&](std::exception_ptr ex) {
+			bool expected = false;
+			if (stop.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 			{
-				Status s = db.Put(WriteOptions(), Slice(keys[t][i]), Slice(value));
-				if (!s.ok())
-				{
-					throw std::runtime_error(s.ToString());
-				}
+				std::lock_guard lock(error_mutex);
+				error = std::move(ex);
 			}
+		};
+
+		for (std::size_t thread_index = 0; thread_index < thread_count; ++thread_index)
+		{
+			const std::size_t begin_client = thread_index * clients_per_thread;
+			const std::size_t end_client = std::min(keys.size(), begin_client + clients_per_thread);
+			if (begin_client >= end_client)
+			{
+				continue;
+			}
+
+			workers.emplace_back([&, begin_client, end_client] {
+				ScopedPerfPause pause_guard(pause_profiling);
+				try
+				{
+					WriteOptions write_options;
+					WriteBatch batch;
+					std::size_t batch_count = 0;
+
+					auto flush = [&]() {
+						if (batch_count == 0)
+						{
+							return;
+						}
+						Status s = db.Write(write_options, std::move(batch));
+						if (!s.ok())
+						{
+							throw std::runtime_error(s.ToString());
+						}
+						batch = WriteBatch();
+						batch_count = 0;
+					};
+
+					for (std::size_t t = begin_client; t < end_client && !stop.load(std::memory_order_acquire); ++t)
+					{
+						const auto& client_keys = keys[t];
+						for (std::size_t i = 0; i < client_keys.size() && !stop.load(std::memory_order_acquire); ++i)
+						{
+							batch.Put(client_keys[i], value);
+							++batch_count;
+							if (batch_count >= batch_size)
+							{
+								flush();
+							}
+						}
+					}
+
+					flush();
+				}
+				catch (...)
+				{
+					store_error(std::current_exception());
+				}
+			});
+		}
+
+		for (auto& worker : workers)
+		{
+			worker.join();
+		}
+
+		if (error)
+		{
+			std::rethrow_exception(error);
 		}
 	}
 
@@ -191,7 +318,7 @@ namespace prism::bench
 					const uint64_t begin = NowNs();
 					if (do_read)
 					{
-						auto r = db.Get(ReadOptions(), Slice(keys[static_cast<std::size_t>(t)][i]));
+						auto r = db.Get(ReadOptions(), Slice(KeyForOp(keys, t, i)));
 						if (r.has_value())
 						{
 							local_sink += r.value().size();
@@ -199,7 +326,7 @@ namespace prism::bench
 					}
 					else
 					{
-						Status s = db.Put(WriteOptions(), Slice(keys[static_cast<std::size_t>(t)][i]), Slice(value));
+						Status s = db.Put(WriteOptions(), Slice(KeyForOp(keys, t, i)), Slice(value));
 						if (s.ok())
 						{
 							local_sink += 1;
@@ -288,7 +415,7 @@ namespace prism::bench
 				for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
 				{
 					const uint64_t begin = NowNs();
-					auto r = db.Get(ReadOptions(), Slice(keys[static_cast<std::size_t>(t)][i]));
+					auto r = db.Get(ReadOptions(), Slice(KeyForOp(keys, t, i)));
 					if (r.has_value())
 					{
 						local_sink += r.value().size();
@@ -382,7 +509,7 @@ namespace prism::bench
 				for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
 				{
 					const uint64_t begin = NowNs();
-					Status s = db.Put(write_opts, Slice(keys[static_cast<std::size_t>(t)][i]), Slice(value));
+					Status s = db.Put(write_opts, Slice(KeyForOp(keys, t, i)), Slice(value));
 					if (s.ok())
 					{
 						local_sink += 1;
@@ -463,6 +590,7 @@ namespace prism::bench
 			const std::size_t remainder = total_ops % static_cast<std::size_t>(num_slots);
 			return static_cast<std::size_t>(slot_id) * base + std::min(static_cast<std::size_t>(slot_id), remainder);
 		}
+
 	} // namespace
 
 	Detached RunAsyncMixedClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
@@ -492,11 +620,11 @@ namespace prism::bench
 
 				if (do_read)
 				{
-					(void)co_await db.GetAsync(ReadOptions(), keys[static_cast<std::size_t>(client_id)][i]);
+					(void)co_await db.GetAsync(ReadOptions(), KeyForOp(keys, client_id, i));
 				}
 				else
 				{
-					(void)co_await db.PutAsync(WriteOptions(), keys[static_cast<std::size_t>(client_id)][i], value);
+					(void)co_await db.PutAsync(WriteOptions(), KeyForOp(keys, client_id, i), value);
 				}
 
 				RecordInflightLeave(global_inflight);
@@ -540,7 +668,7 @@ namespace prism::bench
 				RecordInflightEnter(global_inflight, global_max_inflight);
 				RecordInflightEnter(client_inflight, client_max_inflight);
 
-				(void)co_await db.GetAsync(ReadOptions(), keys[static_cast<std::size_t>(client_id)][i]);
+				(void)co_await db.GetAsync(ReadOptions(), KeyForOp(keys, client_id, i));
 
 				RecordInflightLeave(global_inflight);
 				RecordInflightLeave(client_inflight);
@@ -733,7 +861,7 @@ namespace prism::bench
 				RecordInflightEnter(global_inflight, global_max_inflight);
 				RecordInflightEnter(client_inflight, client_max_inflight);
 
-				(void)co_await db.GetAsync(read_opts, keys[static_cast<std::size_t>(client_id)][i]);
+				(void)co_await db.GetAsync(read_opts, KeyForOp(keys, client_id, i));
 
 				RecordInflightLeave(global_inflight);
 				RecordInflightLeave(client_inflight);
@@ -852,7 +980,7 @@ namespace prism::bench
 				RecordInflightEnter(global_inflight, global_max_inflight);
 				RecordInflightEnter(client_inflight, client_max_inflight);
 
-				(void)co_await db.GetAsync(read_opts, keys[static_cast<std::size_t>(client_id)][i]);
+				(void)co_await db.GetAsync(read_opts, KeyForOp(keys, client_id, i));
 
 				RecordInflightLeave(global_inflight);
 				RecordInflightLeave(client_inflight);
@@ -1041,7 +1169,7 @@ namespace prism::bench
 				RecordInflightEnter(global_inflight, global_max_inflight);
 				RecordInflightEnter(client_inflight, client_max_inflight);
 
-				(void)co_await db.PutAsync(write_opts, keys[static_cast<std::size_t>(client_id)][i], value);
+				(void)co_await db.PutAsync(write_opts, KeyForOp(keys, client_id, i), value);
 
 				RecordInflightLeave(global_inflight);
 				RecordInflightLeave(client_inflight);
@@ -1140,6 +1268,7 @@ namespace prism::bench
 		const double total_ops = static_cast<double>(cfg.clients) * static_cast<double>(cfg.ops_per_client);
 		const double ops_per_sec = total_ops / stats.seconds;
 		const std::string scenario = BenchName(cfg.mode);
+		const std::size_t key_space = cfg.key_space_per_client == 0 ? cfg.ops_per_client : cfg.key_space_per_client;
 
 		// Determine if read_ratio is meaningful for this benchmark mode
 		const bool read_ratio_meaningful = (cfg.mode == BenchMode::kMixed || cfg.mode == BenchMode::kDiskRead);
@@ -1148,21 +1277,21 @@ namespace prism::bench
 		{
 			if (read_ratio_meaningful)
 			{
-				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f "
+				std::printf("%s r=%d clients=%d workers=%d ops=%zu key_space=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f "
 				            "scenario=%s inflight_cfg=%d max_inflight=%zu max_client_inflight=%zu write_sync=%d "
 				            "bg_sleeps=%d\n",
-				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
-				    stats.seconds, ops_per_sec, scenario.c_str(), cfg.inflight_per_client, max_inflight, stats.max_client_inflight,
-				    stats.write_sync, stats.bg_sleeps);
+				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, key_space,
+				    cfg.value_size, cfg.read_ratio, stats.seconds, ops_per_sec, scenario.c_str(), cfg.inflight_per_client,
+				    max_inflight, stats.max_client_inflight, stats.write_sync, stats.bg_sleeps);
 			}
 			else
 			{
-				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=ignored time=%.3fs ops/s=%.0f "
+				std::printf("%s r=%d clients=%d workers=%d ops=%zu key_space=%zu value=%zu read_ratio=ignored time=%.3fs ops/s=%.0f "
 				            "scenario=%s inflight_cfg=%d max_inflight=%zu max_client_inflight=%zu write_sync=%d "
 				            "bg_sleeps=%d\n",
-				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, stats.seconds,
-				    ops_per_sec, scenario.c_str(), cfg.inflight_per_client, max_inflight, stats.max_client_inflight, stats.write_sync,
-				    stats.bg_sleeps);
+				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, key_space,
+				    cfg.value_size, stats.seconds, ops_per_sec, scenario.c_str(), cfg.inflight_per_client, max_inflight,
+				    stats.max_client_inflight, stats.write_sync, stats.bg_sleeps);
 			}
 		}
 		else
@@ -1171,21 +1300,23 @@ namespace prism::bench
 			const uint64_t p95_ns = PercentileNs(stats.latency_ns, 0.95);
 			if (read_ratio_meaningful)
 			{
-				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f max_inflight=%zu "
+				std::printf("%s r=%d clients=%d workers=%d ops=%zu key_space=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f max_inflight=%zu "
 				            "p50_us=%.2f p95_us=%.2f scenario=%s inflight_cfg=%d max_client_inflight=%zu write_sync=%d "
 				            "bg_sleeps=%d\n",
-				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
-				    stats.seconds, ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0,
-				    scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync, stats.bg_sleeps);
+				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, key_space,
+				    cfg.value_size, cfg.read_ratio, stats.seconds, ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0,
+				    static_cast<double>(p95_ns) / 1000.0, scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight,
+				    stats.write_sync, stats.bg_sleeps);
 			}
 			else
 			{
-				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=ignored time=%.3fs ops/s=%.0f max_inflight=%zu "
+				std::printf("%s r=%d clients=%d workers=%d ops=%zu key_space=%zu value=%zu read_ratio=ignored time=%.3fs ops/s=%.0f max_inflight=%zu "
 				            "p50_us=%.2f p95_us=%.2f scenario=%s inflight_cfg=%d max_client_inflight=%zu write_sync=%d "
 				            "bg_sleeps=%d\n",
-				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, stats.seconds,
-				    ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0, scenario.c_str(),
-				    cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync, stats.bg_sleeps);
+				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, key_space,
+				    cfg.value_size, stats.seconds, ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0,
+				    static_cast<double>(p95_ns) / 1000.0, scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight,
+				    stats.write_sync, stats.bg_sleeps);
 			}
 		}
 	}
@@ -1253,6 +1384,7 @@ namespace prism::bench
 				std::printf("  --clients=<n>                Number of concurrent clients (default: 4)\n");
 				std::printf("  --workers=<n>                Number of worker threads (default: 4)\n");
 				std::printf("  --ops=<n>                    Operations per client (default: 10000)\n");
+				std::printf("  --key_space=<n>              Distinct keys per client; reads wrap inside it (default: ops)\n");
 				std::printf("  --value_size=<n>             Value size in bytes (default: 100)\n");
 				std::printf("  --read_ratio=<n>             Read ratio 0-100 (default: 0)\n");
 				std::printf("  --rounds=<n>                 Number of rounds (default: 3)\n");
@@ -1263,7 +1395,7 @@ namespace prism::bench
 				std::printf("  --warmup_rounds=<n>          Warmup rounds before measurement (default: 0)\n");
 				std::printf("  --no_latency                 Skip p50/p95 latency collection (default: off)\n");
 				std::printf("  --prefill=<-1|0|1>           Prefill: -1=auto, 0=off, 1=force (default: -1)\n");
-				std::printf("  --profile-pause-prefill      Pause VTune/ITT profiling during prefill (default: off)\n");
+				std::printf("  --profile-pause-prefill      Pause VTune/ITT/perf during prefill (default: off)\n");
 				std::printf("  --phase=<mode>               Profiling phase (default: full)\n");
 				std::printf("                               Modes: full, prefill-only, warmup-only,\n");
 				std::printf("                                      steady-state, compaction-overlap-only\n");
@@ -1293,6 +1425,7 @@ namespace prism::bench
 			parse_int("--workers=", cfg.workers);
 			parse_int("--rounds=", cfg.rounds);
 			parse_size("--ops=", cfg.ops_per_client);
+			parse_size("--key_space=", cfg.key_space_per_client);
 			parse_size("--value_size=", cfg.value_size);
 			parse_size("--write_buffer_size=", cfg.write_buffer_size);
 			parse_int("--read_ratio=", cfg.read_ratio);
@@ -1444,6 +1577,14 @@ namespace prism::bench
 		if (cfg.rounds <= 0)
 		{
 			cfg.rounds = 1;
+		}
+		if (cfg.ops_per_client == 0)
+		{
+			cfg.ops_per_client = 1;
+		}
+		if (cfg.key_space_per_client == 0)
+		{
+			cfg.key_space_per_client = cfg.ops_per_client;
 		}
 		if (cfg.read_ratio < 0)
 		{

@@ -286,7 +286,7 @@ namespace prism
 	void ThreadPoolScheduler::DispatchExpiredTask(LazyTask&& task)
 	{
 		const auto worker_index = ChooseLeastLoadedWorker();
-		if (!TryPushToWorker(std::move(task.job), worker_index, false, true))
+		if (!TryPushToWorker(std::move(task.job), worker_index, true, true))
 		{
 			PushToPriorityQueue(std::move(task.job), kLazyFallbackPriority, /*wake=*/true);
 		}
@@ -298,7 +298,7 @@ namespace prism
 		{
 			auto task = lazy_queue_.top();
 			lazy_queue_.pop();
-			if (!TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), false, true))
+			if (!TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), true, true))
 			{
 				std::lock_guard lock(priority_mutex_);
 				priority_queue_.push(PriorityTask{ std::move(task.job), kLazyFallbackPriority });
@@ -618,9 +618,11 @@ namespace prism
 			RuntimeMetrics::Instance().worker_local_jobs_completed.fetch_add(1, std::memory_order_relaxed);
 		}
 
-		// POLICY: should this worker re-register as idle for dispatcher routing?
-		bool should_reregister = queue_empty_after;
-		if (job.stolen && !should_reregister)
+		// Only dispatched jobs participate in the idle-worker registry.
+		// Fast-path affinity/local submissions stay on the worker queue and do not need
+		// to bounce through pending_list_.
+		bool should_reregister = job.dispatched && queue_empty_after;
+		if (job.dispatched && !should_reregister)
 		{
 			std::lock_guard lock(mutex_);
 			should_reregister = queue_.empty();
