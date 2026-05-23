@@ -4,6 +4,7 @@
 #include "async_env.h"
 #include "coro_task.h"
 #include "env.h"
+#include "../src/runtime_metrics.h"
 
 #include "gtest/gtest.h"
 
@@ -68,7 +69,9 @@ namespace
 	std::filesystem::path UniqueTestDir()
 	{
 		const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-		return std::filesystem::temp_directory_path() / ("io_reactor_test-" + std::to_string(stamp));
+		std::filesystem::path name{ "io_reactor_test-" };
+		name += std::to_string(stamp);
+		return std::filesystem::temp_directory_path() / name;
 	}
 
 	void WriteAll(int fd, std::string_view contents)
@@ -137,6 +140,47 @@ TEST(IoReactorTest, IoReactorBasicReadCompletes)
 	EXPECT_EQ(std::string_view(buffer.data(), contents.size()), contents);
 }
 
+TEST(IoReactorTest, IoReactorBasicWriteCompletes)
+{
+	if (IoReactor::Probe() == IoCapability::kUnavailable)
+	{
+		GTEST_SKIP() << "io_uring unavailable on this runtime";
+	}
+
+	IoReactor reactor;
+	ASSERT_TRUE(reactor.IsValid());
+
+	const auto test_dir = UniqueTestDir();
+	const ScopedRemoveAll cleanup(test_dir);
+	ASSERT_FALSE(test_dir.empty());
+	ASSERT_TRUE(std::filesystem::create_directories(test_dir) || std::filesystem::exists(test_dir));
+
+	const auto file_path = test_dir / "reactor-write.txt";
+	ScopedFd write_fd(::open(file_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644));
+	ASSERT_GE(write_fd.get(), 0) << std::strerror(errno);
+
+	const std::string contents = "reactor-write-path";
+	constexpr uint64_t kUserData = 77;
+	if (!reactor.SubmitWrite(write_fd.get(), contents.data(), contents.size(), 0, kUserData))
+	{
+		GTEST_SKIP() << "io_uring write opcode unavailable on this kernel";
+	}
+
+	uint64_t user_data = 0;
+	int result = 0;
+	ASSERT_EQ(reactor.WaitCompletion(&user_data, &result), 1);
+	EXPECT_EQ(user_data, kUserData);
+	ASSERT_GE(result, 0);
+	EXPECT_EQ(result, static_cast<int>(contents.size()));
+
+	ScopedFd read_fd(::open(file_path.c_str(), O_RDONLY));
+	ASSERT_GE(read_fd.get(), 0) << std::strerror(errno);
+	std::array<char, 64> buffer{ };
+	const ssize_t read_size = ::read(read_fd.get(), buffer.data(), buffer.size());
+	ASSERT_GE(read_size, 0) << std::strerror(errno);
+	EXPECT_EQ(std::string_view(buffer.data(), static_cast<std::size_t>(read_size)), contents);
+}
+
 TEST(IoReactorTest, IoReactorMoveSemantics)
 {
 	if (IoReactor::Probe() == IoCapability::kUnavailable)
@@ -162,9 +206,8 @@ TEST(IoReactorTest, AsyncRandomAccessFileUsesReactorBackend)
 
 	ThreadPoolScheduler scheduler(4);
 	auto runtime = AcquireRuntimeBundle(scheduler);
-	IoReactor reactor;
-	ASSERT_TRUE(reactor.IsValid());
-	runtime->io_reactor = &reactor;
+	ASSERT_TRUE(runtime->io_dispatcher.HasReactor());
+	RuntimeMetrics::Instance().Reset();
 
 	Env* env = Env::Default();
 	const auto test_dir = UniqueTestDir();
@@ -194,5 +237,57 @@ TEST(IoReactorTest, AsyncRandomAccessFileUsesReactorBackend)
 	}();
 
 	EXPECT_EQ(task.SyncWait(), contents);
-	runtime->io_reactor = nullptr;
+	EXPECT_EQ(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 0u);
+}
+
+TEST(IoReactorTest, AsyncWritableFileUsesReactorBackend)
+{
+	if (IoReactor::Probe() == IoCapability::kUnavailable)
+	{
+		GTEST_SKIP() << "io_uring unavailable on this runtime";
+	}
+
+	ThreadPoolScheduler scheduler(4);
+	auto runtime = AcquireRuntimeBundle(scheduler);
+	ASSERT_TRUE(runtime->io_dispatcher.HasReactor());
+	RuntimeMetrics::Instance().Reset();
+
+	Env* env = Env::Default();
+	const auto test_dir = UniqueTestDir();
+	const ScopedRemoveAll cleanup(test_dir);
+	ASSERT_FALSE(test_dir.empty());
+	ASSERT_TRUE(std::filesystem::create_directories(test_dir) || std::filesystem::exists(test_dir));
+
+	const auto file_path = test_dir / "async_env_reactor_write.txt";
+	const std::string first = "async-";
+	const std::string second = "write-reactor";
+
+	auto file_result = env->NewWritableFile(file_path.string());
+	ASSERT_TRUE(file_result.has_value()) << file_result.error().ToString();
+	auto async_file = std::make_shared<AsyncWritableFile>(scheduler, std::move(file_result.value()));
+
+	auto task = [](std::shared_ptr<AsyncWritableFile> async_file, std::string first, std::string second) -> Task<Status> {
+		auto s = co_await async_file->AppendAsync(first);
+		if (!s.ok())
+		{
+			co_return s;
+		}
+		s = co_await async_file->AppendAsync(second);
+		if (!s.ok())
+		{
+			co_return s;
+		}
+		co_return co_await async_file->CloseAsync();
+	}(async_file, first, second);
+
+	const Status s = task.SyncWait();
+	ASSERT_TRUE(s.ok()) << s.ToString();
+	EXPECT_EQ(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 0u);
+
+	ScopedFd read_fd(::open(file_path.c_str(), O_RDONLY));
+	ASSERT_GE(read_fd.get(), 0) << std::strerror(errno);
+	std::array<char, 64> buffer{ };
+	const ssize_t read_size = ::read(read_fd.get(), buffer.data(), buffer.size());
+	ASSERT_GE(read_size, 0) << std::strerror(errno);
+	EXPECT_EQ(std::string_view(buffer.data(), static_cast<std::size_t>(read_size)), first + second);
 }

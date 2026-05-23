@@ -7,6 +7,8 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <unordered_map>
 #include <utility>
 
 #ifdef __linux__
@@ -16,11 +18,36 @@
 #include <unistd.h>
 #endif
 
-namespace prism
+	namespace prism
 {
+	struct IoDispatcher::RequestState
+	{
+		Operation operation{ Operation::kRead };
+		uint64_t original_user_data{ 0 };
+		int fd{ -1 };
+		const void* buf{ nullptr };
+		unsigned nbytes{ 0 };
+		off_t offset{ 0 };
+		std::function<void(uint64_t, int)> completion;
+	};
+
 	namespace
 	{
 		constexpr std::size_t kFallbackIncrement = 1;
+		constexpr std::size_t kMaxSubmitBatch = 32;
+		constexpr unsigned kProbeOpcodeCount = 256;
+
+#ifndef IORING_OP_READ
+		constexpr std::uint8_t kIoUringOpRead = 22;
+#else
+		constexpr std::uint8_t kIoUringOpRead = IORING_OP_READ;
+#endif
+
+#ifndef IORING_OP_WRITE
+		constexpr std::uint8_t kIoUringOpWrite = 23;
+#else
+		constexpr std::uint8_t kIoUringOpWrite = IORING_OP_WRITE;
+#endif
 
 #ifdef __linux__
 		bool KernelVersionAtLeast(unsigned major, unsigned minor)
@@ -78,6 +105,29 @@ namespace prism
 			}
 		}
 
+		int IoUringRegister(int ring_fd, unsigned opcode, const void* arg, unsigned nr_args)
+		{
+			while (true)
+			{
+#if defined(SYS_io_uring_register)
+				const int result = static_cast<int>(::syscall(SYS_io_uring_register, ring_fd, opcode, arg, nr_args));
+#elif defined(__NR_io_uring_register)
+				const int result = static_cast<int>(::syscall(__NR_io_uring_register, ring_fd, opcode, arg, nr_args));
+#else
+				(void)ring_fd;
+				(void)opcode;
+				(void)arg;
+				(void)nr_args;
+				errno = ENOSYS;
+				return -1;
+#endif
+				if (result >= 0 || errno != EINTR)
+				{
+					return result;
+				}
+			}
+		}
+
 		std::uint32_t LoadAcquire(std::uint32_t* value) { return std::atomic_ref<std::uint32_t>(*value).load(std::memory_order_acquire); }
 
 		void StoreRelease(std::uint32_t* value, std::uint32_t desired)
@@ -85,14 +135,44 @@ namespace prism
 			std::atomic_ref<std::uint32_t>(*value).store(desired, std::memory_order_release);
 		}
 
-		bool ReadOpcodeSupported()
+		bool OpcodeSupported(std::uint8_t opcode)
 		{
-#ifndef IORING_OP_READ
+#if defined(IORING_REGISTER_PROBE)
+			::io_uring_params params{ };
+			const int ring_fd = IoUringSetup(1, &params);
+			if (ring_fd < 0)
+			{
+				return false;
+			}
+
+			const std::size_t probe_size = sizeof(::io_uring_probe) + kProbeOpcodeCount * sizeof(::io_uring_probe_op);
+			auto probe_storage = std::make_unique<std::byte[]>(probe_size);
+			auto* probe = reinterpret_cast<::io_uring_probe*>(probe_storage.get());
+			std::memset(probe, 0, probe_size);
+
+			const int register_result = IoUringRegister(ring_fd, IORING_REGISTER_PROBE, probe, kProbeOpcodeCount);
+			::close(ring_fd);
+			if (register_result < 0)
+			{
+				return true;
+			}
+
+			for (unsigned i = 0; i < probe->ops_len; ++i)
+			{
+				const auto& op = probe->ops[i];
+				if (op.op == opcode)
+				{
+					return (op.flags & IO_URING_OP_SUPPORTED) != 0;
+				}
+			}
 			return false;
 #else
-			return KernelVersionAtLeast(5, 6);
+			return true;
 #endif
 		}
+
+		bool ReadOpcodeSupported() { return OpcodeSupported(kIoUringOpRead); }
+		bool WriteOpcodeSupported() { return OpcodeSupported(kIoUringOpWrite); }
 
 		bool ShouldFallbackFromCompletion(int result) { return result == -EINVAL || result == -EOPNOTSUPP || result == -ENOSYS; }
 
@@ -111,11 +191,40 @@ namespace prism
 				}
 			}
 		}
+
+		int BlockingWriteAt(int fd, const void* buf, unsigned nbytes, off_t offset)
+		{
+			const auto* data = static_cast<const std::byte*>(buf);
+			unsigned remaining = nbytes;
+			off_t current_offset = offset;
+			while (remaining > 0)
+			{
+				const ssize_t write_size = ::pwrite(fd, data, remaining, current_offset);
+				if (write_size > 0)
+				{
+					data += write_size;
+					remaining -= static_cast<unsigned>(write_size);
+					current_offset += write_size;
+					continue;
+				}
+				if (write_size == 0)
+				{
+					return -EIO;
+				}
+				if (errno != EINTR)
+				{
+					return -errno;
+				}
+			}
+			return static_cast<int>(nbytes);
+		}
 #else
 		int BlockingReadAt(int, void*, unsigned, off_t) { return -ENOSYS; }
+		int BlockingWriteAt(int, const void*, unsigned, off_t) { return -ENOSYS; }
 
 		bool ShouldFallbackFromCompletion(int) { return true; }
 #endif
+
 	} // namespace
 
 	IoCapability IoReactor::Probe()
@@ -257,14 +366,6 @@ namespace prism
 	bool IoReactor::SubmitRead(int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data)
 	{
 #ifdef __linux__
-#ifndef IORING_OP_READ
-		(void)fd;
-		(void)buf;
-		(void)nbytes;
-		(void)offset;
-		(void)user_data;
-		return false;
-#else
 		std::lock_guard lock(mutex_);
 		if (!IsValid() || !ReadOpcodeSupported())
 		{
@@ -281,7 +382,7 @@ namespace prism
 		const std::uint32_t index = tail & *sq_ring_mask_;
 		::io_uring_sqe& sqe = sqes_[index];
 		std::memset(&sqe, 0, sizeof(sqe));
-		sqe.opcode = IORING_OP_READ;
+		sqe.opcode = kIoUringOpRead;
 		sqe.fd = fd;
 		sqe.off = static_cast<__u64>(offset);
 		sqe.addr = reinterpret_cast<__u64>(buf);
@@ -296,7 +397,50 @@ namespace prism
 			return false;
 		}
 		return true;
+#else
+		(void)fd;
+		(void)buf;
+		(void)nbytes;
+		(void)offset;
+		(void)user_data;
+		return false;
 #endif
+	}
+
+	bool IoReactor::SubmitWrite(int fd, const void* buf, unsigned nbytes, off_t offset, uint64_t user_data)
+	{
+#ifdef __linux__
+		std::lock_guard lock(mutex_);
+		if (!IsValid() || !WriteOpcodeSupported())
+		{
+			return false;
+		}
+
+		const std::uint32_t head = LoadAcquire(sq_head_);
+		const std::uint32_t tail = LoadAcquire(sq_tail_);
+		if (tail - head >= sq_entries_)
+		{
+			return false;
+		}
+
+		const std::uint32_t index = tail & *sq_ring_mask_;
+		::io_uring_sqe& sqe = sqes_[index];
+		std::memset(&sqe, 0, sizeof(sqe));
+		sqe.opcode = kIoUringOpWrite;
+		sqe.fd = fd;
+		sqe.off = static_cast<__u64>(offset);
+		sqe.addr = reinterpret_cast<__u64>(buf);
+		sqe.len = nbytes;
+		sqe.user_data = user_data;
+		sq_array_[index] = index;
+		StoreRelease(sq_tail_, tail + 1);
+
+		if (IoUringEnter(ring_fd_, 1, 0, 0) < 0)
+		{
+			StoreRelease(sq_tail_, tail);
+			return false;
+		}
+		return true;
 #else
 		(void)fd;
 		(void)buf;
@@ -433,7 +577,7 @@ namespace prism
 		other.init_failed_ = false;
 	}
 
-	IoReadDispatcher::IoReadDispatcher(BlockingExecutor& blocking_executor, unsigned entries)
+	IoDispatcher::IoDispatcher(BlockingExecutor& blocking_executor, unsigned entries)
 	    : blocking_executor_(&blocking_executor)
 	    , capability_(IoReactor::Probe())
 	{
@@ -443,6 +587,7 @@ namespace prism
 			if (reactor->IsValid())
 			{
 				reactor_ = std::move(reactor);
+				pump_thread_ = std::jthread([this] { PumpLoop(); });
 			}
 			else
 			{
@@ -451,72 +596,242 @@ namespace prism
 		}
 	}
 
-	IoReadDispatcher::IoReadDispatcher(BlockingExecutor& blocking_executor, IoCapability capability, std::unique_ptr<IIoReactor> reactor)
+	IoDispatcher::IoDispatcher(BlockingExecutor& blocking_executor, IoCapability capability, TestReactor reactor)
 	    : blocking_executor_(&blocking_executor)
 	    , capability_(capability)
-	    , reactor_(std::move(reactor))
+	    , test_reactor_(std::move(reactor))
 	{
 		if (capability_ == IoCapability::kSupported && !HasReactor())
 		{
 			RecordFallback();
 		}
+		else if (HasReactor())
+		{
+			pump_thread_ = std::jthread([this] { PumpLoop(); });
+		}
 	}
 
-	bool IoReadDispatcher::HasReactor() const noexcept
+	IoDispatcher::~IoDispatcher()
 	{
-		return capability_ == IoCapability::kSupported && reactor_ != nullptr && reactor_->IsValid();
+		{
+			std::lock_guard lock(queue_mutex_);
+			stopping_ = true;
+		}
+		queue_cv_.notify_all();
 	}
 
-	void IoReadDispatcher::SubmitRead(
+	bool IoDispatcher::HasReactor() const noexcept
+	{
+		return capability_ == IoCapability::kSupported && ReactorIsValid();
+	}
+
+	void IoDispatcher::SubmitRead(
 	    int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data, std::function<void(uint64_t, int)> completion)
+	{
+		SubmitRequest(Operation::kRead, fd, buf, nbytes, offset, user_data, std::move(completion));
+	}
+
+	void IoDispatcher::SubmitWrite(
+	    int fd, const void* buf, unsigned nbytes, off_t offset, uint64_t user_data, std::function<void(uint64_t, int)> completion)
+	{
+		SubmitRequest(Operation::kWrite, fd, buf, nbytes, offset, user_data, std::move(completion));
+	}
+
+	void IoDispatcher::SubmitRequest(Operation operation,
+	    int fd,
+	    const void* buf,
+	    unsigned nbytes,
+	    off_t offset,
+	    uint64_t user_data,
+	    std::function<void(uint64_t, int)> completion)
 	{
 		if (!HasReactor())
 		{
 			RecordFallback();
-			SubmitBlockingRead(fd, buf, nbytes, offset, user_data, std::move(completion));
+			if (operation == Operation::kRead)
+			{
+				SubmitBlockingRead(fd, const_cast<void*>(buf), nbytes, offset, user_data, std::move(completion));
+			}
+			else
+			{
+				SubmitBlockingWrite(fd, buf, nbytes, offset, user_data, std::move(completion));
+			}
 			return;
 		}
 
-		if (!reactor_->SubmitRead(fd, buf, nbytes, offset, user_data))
+		auto state = std::make_shared<RequestState>();
+		state->operation = operation;
+		state->original_user_data = user_data;
+		state->fd = fd;
+		state->buf = buf;
+		state->nbytes = nbytes;
+		state->offset = offset;
+		state->completion = std::move(completion);
 		{
-			RecordFallback();
-			SubmitBlockingRead(fd, buf, nbytes, offset, user_data, std::move(completion));
-			return;
+			std::lock_guard lock(queue_mutex_);
+			pending_requests_.push_back(PendingRequest{ next_request_id_++, state });
 		}
-
-		blocking_executor_->Submit([this, fd, buf, nbytes, offset, user_data, completion = std::move(completion)]() mutable {
-			uint64_t completed_user_data = 0;
-			int result = 0;
-			const int consumed = reactor_->WaitCompletion(&completed_user_data, &result);
-			if (consumed <= 0 || ShouldFallbackFromCompletion(result))
-			{
-				RecordFallback();
-				if (completion)
-				{
-					completion(user_data, BlockingReadAt(fd, buf, nbytes, offset));
-				}
-				return;
-			}
-
-			if (completion)
-			{
-				completion(completed_user_data, result);
-			}
-		});
+		queue_cv_.notify_one();
 	}
 
-	void IoReadDispatcher::RecordFallback() const noexcept
+	bool IoDispatcher::ReactorIsValid() const noexcept
+	{
+		if (reactor_ != nullptr)
+		{
+			return reactor_->IsValid();
+		}
+		return test_reactor_.has_value() && test_reactor_->is_valid && test_reactor_->is_valid();
+	}
+
+	bool IoDispatcher::ReactorSubmitRead(int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data)
+	{
+		return reactor_ != nullptr ? reactor_->SubmitRead(fd, buf, nbytes, offset, user_data)
+		                           : test_reactor_->submit_read(fd, buf, nbytes, offset, user_data);
+	}
+
+	bool IoDispatcher::ReactorSubmitWrite(int fd, const void* buf, unsigned nbytes, off_t offset, uint64_t user_data)
+	{
+		return reactor_ != nullptr ? reactor_->SubmitWrite(fd, buf, nbytes, offset, user_data)
+		                           : test_reactor_->submit_write(fd, buf, nbytes, offset, user_data);
+	}
+
+	int IoDispatcher::ReactorWaitCompletion(uint64_t* user_data, int* res)
+	{
+		return reactor_ != nullptr ? reactor_->WaitCompletion(user_data, res) : test_reactor_->wait_completion(user_data, res);
+	}
+
+	void IoDispatcher::PumpLoop()
+	{
+		while (true)
+		{
+			std::deque<PendingRequest> batch;
+			{
+				std::unique_lock lock(queue_mutex_);
+				queue_cv_.wait(lock, [this] { return stopping_ || !pending_requests_.empty(); });
+				if (stopping_ && pending_requests_.empty())
+				{
+					return;
+				}
+				while (!pending_requests_.empty() && batch.size() < kMaxSubmitBatch)
+				{
+					batch.push_back(std::move(pending_requests_.front()));
+					pending_requests_.pop_front();
+				}
+			}
+
+			for (auto& request : batch)
+			{
+				{
+					std::lock_guard lock(queue_mutex_);
+					in_flight_.emplace(request.request_id, request.state);
+				}
+				const bool submitted = request.state->operation == Operation::kRead
+				    ? ReactorSubmitRead(request.state->fd,
+				          const_cast<void*>(request.state->buf),
+				          request.state->nbytes,
+				          request.state->offset,
+				          request.request_id)
+				    : ReactorSubmitWrite(
+				          request.state->fd, request.state->buf, request.state->nbytes, request.state->offset, request.request_id);
+				if (!submitted)
+				{
+					RecordFallback();
+					const int result = request.state->operation == Operation::kRead
+					    ? BlockingReadAt(request.state->fd,
+					          const_cast<void*>(request.state->buf),
+					          request.state->nbytes,
+					          request.state->offset)
+					    : BlockingWriteAt(request.state->fd, request.state->buf, request.state->nbytes, request.state->offset);
+					if (request.state->completion)
+					{
+						request.state->completion(request.state->original_user_data, result);
+					}
+					{
+						std::lock_guard lock(queue_mutex_);
+						in_flight_.erase(request.request_id);
+					}
+					continue;
+				}
+			}
+
+			while (true)
+			{
+				{
+					std::lock_guard lock(queue_mutex_);
+					if (in_flight_.empty())
+					{
+						break;
+					}
+				}
+
+				uint64_t completed_request_id = 0;
+				int result = 0;
+				const int consumed = ReactorWaitCompletion(&completed_request_id, &result);
+				if (consumed <= 0)
+				{
+					break;
+				}
+
+				std::shared_ptr<RequestState> state;
+				{
+					std::lock_guard lock(queue_mutex_);
+					const auto it = in_flight_.find(completed_request_id);
+					if (it != in_flight_.end())
+					{
+						state = std::move(it->second);
+						in_flight_.erase(it);
+					}
+				}
+
+				if (!state)
+				{
+					continue;
+				}
+
+				const int completed_result = ShouldFallbackFromCompletion(result)
+				    ? (state->operation == Operation::kRead
+				          ? BlockingReadAt(state->fd, const_cast<void*>(state->buf), state->nbytes, state->offset)
+				          : BlockingWriteAt(state->fd, state->buf, state->nbytes, state->offset))
+				    : result;
+				if (state->completion)
+				{
+					state->completion(state->original_user_data, completed_result);
+				}
+
+				{
+					std::lock_guard lock(queue_mutex_);
+					if (in_flight_.empty())
+					{
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	void IoDispatcher::RecordFallback() const noexcept
 	{
 		RuntimeMetrics::Instance().fallback_to_blocking_count.fetch_add(kFallbackIncrement, std::memory_order_relaxed);
 	}
 
-	void IoReadDispatcher::SubmitBlockingRead(
+	void IoDispatcher::SubmitBlockingRead(
 	    int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data, std::function<void(uint64_t, int)> completion)
 	{
 		blocking_executor_->Submit([fd, buf, nbytes, offset, user_data, completion = std::move(completion)]() mutable {
 			if (completion)
 			{
 				completion(user_data, BlockingReadAt(fd, buf, nbytes, offset));
+			}
+		});
+	}
+
+	void IoDispatcher::SubmitBlockingWrite(
+	    int fd, const void* buf, unsigned nbytes, off_t offset, uint64_t user_data, std::function<void(uint64_t, int)> completion)
+	{
+		blocking_executor_->Submit([fd, buf, nbytes, offset, user_data, completion = std::move(completion)]() mutable {
+			if (completion)
+			{
+				completion(user_data, BlockingWriteAt(fd, buf, nbytes, offset));
 			}
 		});
 	}

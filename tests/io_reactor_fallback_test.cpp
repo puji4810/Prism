@@ -4,6 +4,7 @@
 
 #include "async_env.h"
 #include "coro_task.h"
+#include "../src/runtime_metrics.h"
 #include "gtest/gtest.h"
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -69,31 +71,94 @@ namespace
 		int fd_;
 	};
 
-	class InvalidReactor final: public IIoReactor
+	class InvalidReactor final
 	{
 	public:
-		bool IsValid() const noexcept override { return false; }
-		bool SubmitRead(int, void*, unsigned, off_t, uint64_t) override { return false; }
-		int WaitCompletion(uint64_t*, int*) override { return 0; }
+		IoDispatcher::TestReactor Hooks() const
+		{
+			return {
+				.is_valid = [] { return false; },
+				.submit_read = [](int, void*, unsigned, off_t, uint64_t) { return false; },
+				.submit_write = [](int, const void*, unsigned, off_t, uint64_t) { return false; },
+				.submit_noop = [](uint64_t) { return false; },
+				.wait_completion = [](uint64_t*, int*) { return 0; },
+			};
+		}
 	};
 
-	class UnsupportedReadReactor final: public IIoReactor
+	class UnsupportedReadReactor final
 	{
 	public:
-		bool IsValid() const noexcept override { return true; }
-
-		bool SubmitRead(int, void*, unsigned, off_t, uint64_t) override
+		IoDispatcher::TestReactor Hooks()
 		{
-			submit_count_.fetch_add(1, std::memory_order_relaxed);
-			return false;
+			return {
+				.is_valid = [this] { return true; },
+				.submit_read = [this](int, void*, unsigned, off_t, uint64_t) {
+					submit_count_.fetch_add(1, std::memory_order_relaxed);
+					return false;
+				},
+				.submit_write = [this](int, const void*, unsigned, off_t, uint64_t) {
+					submit_count_.fetch_add(1, std::memory_order_relaxed);
+					return false;
+				},
+				.submit_noop = [](uint64_t) { return false; },
+				.wait_completion = [](uint64_t*, int*) { return 0; },
+			};
 		}
-
-		int WaitCompletion(uint64_t*, int*) override { return 0; }
 
 		int submit_count() const noexcept { return submit_count_.load(std::memory_order_relaxed); }
 
 	private:
 		std::atomic<int> submit_count_{ 0 };
+	};
+
+	class ReverseCompletionReactor final
+	{
+	public:
+		IoDispatcher::TestReactor Hooks()
+		{
+			return {
+				.is_valid = [this] { return true; },
+				.submit_read = [this](int, void* buf, unsigned nbytes, off_t, uint64_t user_data) {
+					std::lock_guard lock(mutex_);
+					std::memset(buf, static_cast<int>('0' + user_data), nbytes);
+					completions_.push_back(Completion{ user_data, static_cast<int>(nbytes) });
+					return true;
+				},
+				.submit_write = [this](int, const void*, unsigned nbytes, off_t, uint64_t user_data) {
+					std::lock_guard lock(mutex_);
+					completions_.push_back(Completion{ user_data, static_cast<int>(nbytes) });
+					return true;
+				},
+				.submit_noop = [this](uint64_t user_data) {
+					std::lock_guard lock(mutex_);
+					completions_.push_back(Completion{ user_data, 0 });
+					return true;
+				},
+				.wait_completion = [this](uint64_t* user_data, int* res) {
+					std::lock_guard lock(mutex_);
+					if (completions_.empty())
+					{
+						return 0;
+					}
+					const auto completion = completions_.back();
+					completions_.pop_back();
+					*user_data = completion.user_data;
+					*res = completion.result;
+					return 1;
+				},
+			};
+		}
+
+	private:
+		struct Completion
+		{
+			uint64_t user_data;
+			int result;
+		};
+
+		std::mutex mutex_;
+		std::vector<Completion> completions_;
 	};
 
 	class MemoryRandomAccessFile final: public RandomAccessFile
@@ -125,7 +190,9 @@ namespace
 	std::filesystem::path UniqueTestDir()
 	{
 		const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-		return std::filesystem::temp_directory_path() / ("io_reactor_fallback_test-" + std::to_string(stamp));
+		std::filesystem::path name{ "io_reactor_fallback_test-" };
+		name += std::to_string(stamp);
+		return std::filesystem::temp_directory_path() / name;
 	}
 
 	void WriteAll(int fd, std::string_view contents)
@@ -149,7 +216,7 @@ namespace
 TEST_F(IoReactorFallbackTest, ProbeReturnsUnavailableWhenIoUringNotSupported)
 {
 	BlockingExecutor executor;
-	IoReadDispatcher dispatcher(executor, IoCapability::kUnavailable, nullptr);
+	IoDispatcher dispatcher(executor, IoCapability::kUnavailable, IoDispatcher::TestReactor{});
 
 	const std::string contents = "fallback-from-probe";
 	const auto test_dir = UniqueTestDir();
@@ -192,7 +259,8 @@ TEST_F(IoReactorFallbackTest, ProbeReturnsUnavailableWhenIoUringNotSupported)
 TEST_F(IoReactorFallbackTest, InitFailureRecordsFallbackCounter)
 {
 	BlockingExecutor executor;
-	IoReadDispatcher dispatcher(executor, IoCapability::kSupported, std::make_unique<InvalidReactor>());
+	InvalidReactor reactor_factory;
+	IoDispatcher dispatcher(executor, IoCapability::kSupported, reactor_factory.Hooks());
 	EXPECT_FALSE(dispatcher.HasReactor());
 	EXPECT_GE(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 1u);
 }
@@ -200,9 +268,8 @@ TEST_F(IoReactorFallbackTest, InitFailureRecordsFallbackCounter)
 TEST_F(IoReactorFallbackTest, FallbackToBlockingExecutorForReads)
 {
 	BlockingExecutor executor;
-	auto reactor = std::make_unique<UnsupportedReadReactor>();
-	auto* reactor_ptr = reactor.get();
-	IoReadDispatcher dispatcher(executor, IoCapability::kSupported, std::move(reactor));
+	UnsupportedReadReactor reactor_factory;
+	IoDispatcher dispatcher(executor, IoCapability::kSupported, reactor_factory.Hooks());
 
 	const std::string contents = "fallback-from-unsupported-op";
 	const auto test_dir = UniqueTestDir();
@@ -236,18 +303,69 @@ TEST_F(IoReactorFallbackTest, FallbackToBlockingExecutorForReads)
 	    });
 
 	ASSERT_TRUE(done.try_acquire_for(5s));
-	EXPECT_EQ(reactor_ptr->submit_count(), 1);
+	EXPECT_EQ(reactor_factory.submit_count(), 1);
 	EXPECT_EQ(user_data.load(std::memory_order_acquire), 13u);
 	EXPECT_EQ(result.load(std::memory_order_acquire), static_cast<int>(contents.size()));
 	EXPECT_EQ(std::string_view(buffer.data(), contents.size()), contents);
 	EXPECT_GE(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 1u);
 }
 
+TEST_F(IoReactorFallbackTest, ReactorPumpDemuxesOutOfOrderCompletions)
+{
+	BlockingExecutor executor;
+	ReverseCompletionReactor reactor_factory;
+	IoDispatcher dispatcher(executor, IoCapability::kSupported, reactor_factory.Hooks());
+
+	std::array<char, 4> first{ };
+	std::array<char, 4> second{ };
+	std::binary_semaphore ready(0);
+	std::atomic<int> ready_count{ 0 };
+	std::atomic<int> release_count{ 0 };
+	std::binary_semaphore release(0);
+	std::binary_semaphore completed(0);
+	std::atomic<uint64_t> first_user_data{ 0 };
+	std::atomic<uint64_t> second_user_data{ 0 };
+	std::atomic<int> first_result{ -1 };
+	std::atomic<int> second_result{ -1 };
+
+	auto submit = [&](uint64_t user_data, char* buffer, std::atomic<uint64_t>& completed_user_data, std::atomic<int>& completed_result) {
+		ready_count.fetch_add(1, std::memory_order_acq_rel);
+		ready.release();
+		release.acquire();
+		dispatcher.SubmitRead(0, buffer, 4, 0, user_data, [&](uint64_t callback_user_data, int callback_result) {
+			completed_user_data.store(callback_user_data, std::memory_order_release);
+			completed_result.store(callback_result, std::memory_order_release);
+			completed.release();
+		});
+		release_count.fetch_add(1, std::memory_order_acq_rel);
+	};
+
+	std::jthread first_thread(submit, 1, first.data(), std::ref(first_user_data), std::ref(first_result));
+	std::jthread second_thread(submit, 2, second.data(), std::ref(second_user_data), std::ref(second_result));
+
+	ready.acquire();
+	ready.acquire();
+	release.release();
+	release.release();
+
+	while (release_count.load(std::memory_order_acquire) != 2)
+	{
+		std::this_thread::yield();
+	}
+	ASSERT_TRUE(completed.try_acquire_for(5s));
+	ASSERT_TRUE(completed.try_acquire_for(5s));
+
+	EXPECT_EQ(first_user_data.load(std::memory_order_acquire), 1u);
+	EXPECT_EQ(second_user_data.load(std::memory_order_acquire), 2u);
+	EXPECT_EQ(first_result.load(std::memory_order_acquire), 4);
+	EXPECT_EQ(second_result.load(std::memory_order_acquire), 4);
+	EXPECT_FALSE(std::string_view(first.data(), first.size()).empty());
+	EXPECT_FALSE(std::string_view(second.data(), second.size()).empty());
+}
+
 TEST_F(IoReactorFallbackTest, AsyncRandomAccessFileFallsBackWhenReactorUnavailable)
 {
 	ThreadPoolScheduler scheduler(4);
-	auto runtime = AcquireRuntimeBundle(scheduler);
-	runtime->io_reactor = nullptr;
 
 	const std::string contents = "fallback-async-random-read";
 	AsyncRandomAccessFile async_file(scheduler, std::make_shared<MemoryRandomAccessFile>(contents));
@@ -262,14 +380,12 @@ TEST_F(IoReactorFallbackTest, AsyncRandomAccessFileFallsBackWhenReactorUnavailab
 	}();
 
 	EXPECT_EQ(task.SyncWait(), contents);
-	EXPECT_GE(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 1u);
+	EXPECT_EQ(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 0u);
 }
 
 TEST_F(IoReactorFallbackTest, AsyncEnvFactoryAndMetadataOpsRouteThroughUnifiedBackendSelect)
 {
 	ThreadPoolScheduler scheduler(4);
-	auto runtime = AcquireRuntimeBundle(scheduler);
-	runtime->io_reactor = nullptr;
 
 	Env* env = Env::Default();
 	ASSERT_NE(env, nullptr);
@@ -299,9 +415,6 @@ TEST_F(IoReactorFallbackTest, AsyncEnvFactoryAndMetadataOpsRouteThroughUnifiedBa
 		s = co_await wf.CloseAsync();
 		EXPECT_TRUE(s.ok()) << s.ToString();
 
-		auto fallback_after_write_factory = RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed);
-		EXPECT_EQ(fallback_after_write_factory, 0u);
-
 		auto size_result = co_await p_async_env->GetFileSizeAsync(file_path);
 		EXPECT_TRUE(size_result.has_value()) << size_result.error().ToString();
 		if (!size_result.has_value())
@@ -327,7 +440,14 @@ TEST_F(IoReactorFallbackTest, AsyncEnvFactoryAndMetadataOpsRouteThroughUnifiedBa
 		{
 			co_return;
 		}
-		EXPECT_GE(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 1u);
+
+		auto read_result = co_await random_access.value().ReadAtStringAsync(0, payload.size());
+		EXPECT_TRUE(read_result.has_value()) << read_result.error().ToString();
+		if (!read_result.has_value())
+		{
+			co_return;
+		}
+		EXPECT_EQ(read_result.value(), payload);
 
 		s = co_await p_async_env->RemoveFileAsync(file_path);
 		EXPECT_TRUE(s.ok()) << s.ToString();

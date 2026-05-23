@@ -265,6 +265,7 @@ namespace prism
 	public:
 		PosixWritableFile(std::string fname, int fd)
 		    : pos_(0)
+		    , append_offset_(CurrentFileOffset(fd))
 		    , fd_(fd)
 		    , is_manifest_(IsManifest(fname))
 		    , filename_(std::move(fname))
@@ -348,6 +349,12 @@ namespace prism
 			return SyncFd(fd_, filename_);
 		}
 
+		int FileDescriptor() const noexcept override { return fd_; }
+
+		uint64_t AppendOffset() const noexcept override { return append_offset_ + pos_; }
+
+		void AdvanceAppendOffset(std::size_t n) noexcept override { append_offset_ += n; }
+
 	private:
 		Status FlushBuffer()
 		{
@@ -372,8 +379,15 @@ namespace prism
 
 				data += write_res;
 				size -= static_cast<size_t>(write_res);
+				append_offset_ += static_cast<std::size_t>(write_res);
 			}
 			return Status::OK();
+		}
+
+		static uint64_t CurrentFileOffset(int fd)
+		{
+			const off_t offset = ::lseek(fd, 0, SEEK_END);
+			return offset < 0 ? 0 : static_cast<uint64_t>(offset);
 		}
 
 		static std::string Dirname(const std::string& filename)
@@ -461,6 +475,7 @@ namespace prism
 		// buf_[0, pos_ - 1] contains data to be written to fd_.
 		char buf_[kWritableFileBufferSize];
 		size_t pos_;
+		uint64_t append_offset_;
 		int fd_;
 
 		const bool is_manifest_; // True if the file's name starts with MANIFEST.

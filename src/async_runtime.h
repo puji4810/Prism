@@ -1,6 +1,7 @@
 #ifndef PRISM_ASYNC_RUNTIME_H
 #define PRISM_ASYNC_RUNTIME_H
 
+#include "io_reactor.h"
 #include "scheduler.h"
 
 #include <condition_variable>
@@ -171,13 +172,19 @@ namespace prism
 		// from the single-flight compaction lane.
 		BlockingExecutor read_executor;
 
+		// io_dispatcher: prefers io_uring-backed reads/writes when a permanent file
+		// descriptor is available, and falls back to read_executor for platforms/files
+		// that cannot use the reactor path.
+		IoDispatcher io_dispatcher;
+
 		// compaction_executor: single-threaded FIFO dedicated to background
 		// compaction/flush work. Kept isolated to preserve one-compaction-per-DB
 		// semantics without contending with foreground reads.
 		BlockingExecutor compaction_executor;
 
-		// serial_lane: single-threaded FIFO for ordered file writes (Append/Flush/Sync).
-		// Guarantees submission order = execution order without blocking shared workers.
+		// serial_lane: single-threaded FIFO for ordered write-side control flow
+		// (Flush/Sync/Close and file lifecycle). Append data can bypass this lane
+		// when the writable file exposes a stable descriptor and the reactor is live.
 		SerialLane serial_lane;
 
 		// -- Scheduler adapters (IScheduler, wraps an IContinuationExecutor) --

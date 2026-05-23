@@ -1,7 +1,13 @@
 #include "async_env.h"
 
 #include "async_runtime.h"
+#include "status.h"
+
+#include <cerrno>
+#include <cstring>
+#include <limits>
 #include <mutex>
+#include <semaphore>
 #include <utility>
 
 namespace prism
@@ -35,11 +41,97 @@ namespace prism
 
 			return { &runtime.read_scheduler };
 		}
+
+		Status ReactorIoError(const char* op, int result)
+		{
+			const int error_number = result < 0 ? -result : EIO;
+			return Status::IOError(op, std::strerror(error_number));
+		}
+
+		Result<std::size_t> ReadWithDispatcher(
+		    IoDispatcher& dispatcher, const std::shared_ptr<RandomAccessFile>& file, uint64_t offset, std::span<std::byte> dst)
+		{
+			if (dst.empty())
+			{
+				return 0;
+			}
+
+			const int fd = file->FileDescriptor();
+			if (fd < 0 || dst.size() > std::numeric_limits<unsigned>::max())
+			{
+				return file->ReadAt(offset, dst);
+			}
+
+			std::binary_semaphore done(0);
+			int read_result = -EIO;
+			dispatcher.SubmitRead(fd,
+			    dst.data(),
+			    static_cast<unsigned>(dst.size()),
+			    static_cast<off_t>(offset),
+			    0,
+			    [&](uint64_t, int completed_result) {
+					read_result = completed_result;
+					done.release();
+			    });
+			done.acquire();
+
+			if (read_result < 0)
+			{
+				return std::unexpected(ReactorIoError("reactor read", read_result));
+			}
+			return static_cast<std::size_t>(read_result);
+		}
+
+		Status WriteWithDispatcher(IoDispatcher& dispatcher, const std::shared_ptr<WritableFile>& file, std::string data)
+		{
+			if (data.empty())
+			{
+				return Status::OK();
+			}
+			if (data.size() > std::numeric_limits<unsigned>::max())
+			{
+				return file->Append(Slice(data));
+			}
+
+			const int fd = file->FileDescriptor();
+			if (fd < 0)
+			{
+				return file->Append(Slice(data));
+			}
+
+			const uint64_t offset = file->AppendOffset();
+			std::binary_semaphore done(0);
+			int write_result = -EIO;
+			dispatcher.SubmitWrite(fd,
+			    data.data(),
+			    static_cast<unsigned>(data.size()),
+			    static_cast<off_t>(offset),
+			    0,
+			    [&](uint64_t, int completed_result) {
+				    write_result = completed_result;
+				    done.release();
+			    });
+			done.acquire();
+
+			if (write_result < 0)
+			{
+				return ReactorIoError("reactor write", write_result);
+			}
+			if (static_cast<std::size_t>(write_result) != data.size())
+			{
+				return Status::IOError("reactor write", "short write");
+			}
+
+			file->AdvanceAppendOffset(data.size());
+			return Status::OK();
+		}
+
 	}
 
 	AsyncRandomAccessFile::AsyncRandomAccessFile(ThreadPoolScheduler& scheduler, std::shared_ptr<RandomAccessFile> file)
 	    : runtime_(AcquireRuntimeBundle(scheduler))
 	    , file_(std::move(file))
+	    , dispatcher_(&runtime_->io_dispatcher)
 	{
 	}
 
@@ -48,6 +140,13 @@ namespace prism
 	AsyncOp<Result<std::size_t>> AsyncRandomAccessFile::ReadAtAsync(uint64_t offset, std::span<std::byte> dst) const
 	{
 		auto runtime = runtime_;
+		auto dispatcher = dispatcher_;
+		if (file_->FileDescriptor() >= 0)
+		{
+			return AsyncOp<Result<std::size_t>>((*runtime).cpu_scheduler,
+			    [dispatcher, file = file_, offset, dst]() -> Result<std::size_t> { return ReadWithDispatcher(*dispatcher, file, offset, dst); });
+		}
+
 		auto backend = BackendSelect(*runtime);
 		return AsyncOp<Result<std::size_t>>(
 		    *backend.scheduler, [file = file_, offset, dst]() -> Result<std::size_t> { return file->ReadAt(offset, dst); });
@@ -56,6 +155,23 @@ namespace prism
 	AsyncOp<Result<std::string>> AsyncRandomAccessFile::ReadAtStringAsync(uint64_t offset, std::size_t n) const
 	{
 		auto runtime = runtime_;
+		auto dispatcher = dispatcher_;
+		if (file_->FileDescriptor() >= 0)
+		{
+			return AsyncOp<Result<std::string>>((*runtime).cpu_scheduler, [dispatcher, file = file_, offset, n]() -> Result<std::string> {
+				std::string buf;
+				buf.resize(n);
+				auto bytes = std::as_writable_bytes(std::span(buf));
+				Result<std::size_t> r = ReadWithDispatcher(*dispatcher, file, offset, bytes);
+				if (!r.has_value())
+				{
+					return std::unexpected(r.error());
+				}
+				buf.resize(r.value());
+				return buf;
+			});
+		}
+
 		auto backend = BackendSelect(*runtime);
 		return AsyncOp<Result<std::string>>(*backend.scheduler, [file = file_, offset, n]() -> Result<std::string> {
 			std::string buf;
@@ -85,12 +201,13 @@ namespace prism
 		auto runtime = runtime_;
 		auto file = file_;
 		auto write_state = write_state_;
+		auto dispatcher = &runtime->io_dispatcher;
 		{
 			std::lock_guard lock(write_state->mu);
 			if (write_state->closed)
 				return AsyncOp<Status>((*runtime).cpu_scheduler, [] { return Status::IOError("file closed"); });
 		}
-		return AsyncOp<Status>((*runtime).serial_scheduler, [file, write_state, data = std::move(data)]() {
+		return AsyncOp<Status>((*runtime).serial_scheduler, [dispatcher, file, write_state, data = std::move(data)]() mutable {
 			{
 				std::lock_guard lock(write_state->mu);
 				if (write_state->closed)
@@ -98,7 +215,7 @@ namespace prism
 					return Status::IOError("file closed");
 				}
 			}
-			return file->Append(Slice(data));
+			return WriteWithDispatcher(*dispatcher, file, std::move(data));
 		});
 	}
 

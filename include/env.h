@@ -291,6 +291,13 @@ namespace prism
 		virtual Status Close() = 0;
 		virtual Status Flush() = 0;
 		virtual Status Sync() = 0;
+
+		// Optional direct append support for asynchronous backends. Implementations
+		// that return a valid descriptor must keep AppendOffset() synchronized with
+		// synchronous Append() calls and AdvanceAppendOffset().
+		virtual int FileDescriptor() const noexcept { return -1; }
+		virtual uint64_t AppendOffset() const noexcept { return 0; }
+		virtual void AdvanceAppendOffset(std::size_t) noexcept { }
 	};
 
 	// An interface for writing log messages.
