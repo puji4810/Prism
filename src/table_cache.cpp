@@ -8,7 +8,6 @@
 
 namespace prism
 {
-
 	class TableCacheEntry
 	{
 	public:

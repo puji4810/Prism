@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 namespace prism
@@ -84,20 +85,45 @@ namespace prism
 	class AsyncOp
 	{
 	private:
+		struct StateBase
+		{
+			static constexpr int kSuspending = 0;
+			static constexpr int kCompleted = 1;
+			static constexpr int kSuspended = 2;
+
+			explicit StateBase(IScheduler* blocking_sched)
+			    : blocking_scheduler(blocking_sched)
+			{
+			}
+
+			virtual ~StateBase() = default;
+			virtual void Execute() = 0;
+			virtual T ConsumeValue() = 0;
+
+			IScheduler* blocking_scheduler;
+			std::exception_ptr exception;
+			std::coroutine_handle<> handle;
+			std::atomic<int> status{ kSuspending };
+#ifdef PRISM_RUNTIME_METRICS
+			std::chrono::steady_clock::time_point suspend_time;
+#endif
+		};
+		template <typename Work>
 		struct State;
 
 	public:
 		using ValueType = T;
-		using Work = std::move_only_function<T()>;
 
-		AsyncOp(IScheduler& scheduler, Work work)
-		    : state_(std::make_shared<State>(scheduler.BlockingScheduler(), std::move(work)))
+		template <typename Work>
+		requires std::is_invocable_r_v<T, Work&>
+		AsyncOp(IScheduler& scheduler, Work&& work)
+		    : state_(std::make_shared<State<std::decay_t<Work>>>(scheduler.BlockingScheduler(), std::forward<Work>(work)))
 		{
 		}
 
 		struct Awaiter
 		{
-			std::shared_ptr<State> state;
+			std::shared_ptr<StateBase> state;
 
 			bool await_ready() const noexcept { return false; }
 
@@ -113,7 +139,7 @@ namespace prism
 				state->blocking_scheduler->Submit([st = state] {
 					try
 					{
-						st->value = st->work();
+						st->Execute();
 					}
 					catch (...)
 					{
@@ -129,9 +155,9 @@ namespace prism
 						rm.continuation_count.fetch_add(1, std::memory_order_relaxed);
 					}
 #endif
-					auto expected = State::kSuspending;
+					auto expected = StateBase::kSuspending;
 					if (st->status.compare_exchange_strong(
-					        expected, State::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
+					        expected, StateBase::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
 					{
 						return;
 					}
@@ -139,9 +165,9 @@ namespace prism
 				});
 
 				// Coroutine tries to win the handshake: kSuspending → kSuspended.
-				auto expected = State::kSuspending;
+				auto expected = StateBase::kSuspending;
 				if (state->status.compare_exchange_strong(
-				        expected, State::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
+				        expected, StateBase::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
 				{
 					// Won: worker has not finished; suspend and let worker resume us.
 					return true;
@@ -156,37 +182,34 @@ namespace prism
 				{
 					std::rethrow_exception(state->exception);
 				}
-				return std::move(*state->value);
+				return state->ConsumeValue();
 			}
 		};
 
 		Awaiter operator co_await() && noexcept { return Awaiter{ std::move(state_) }; }
 
 	private:
-		struct State
+		template <typename Work>
+		struct State final: StateBase
 		{
-			static constexpr int kSuspending = 0;
-			static constexpr int kCompleted = 1;
-			static constexpr int kSuspended = 2;
-
 			State(IScheduler* blocking_sched, Work w)
-			    : blocking_scheduler(blocking_sched)
+			    : StateBase(blocking_sched)
 			    , work(std::move(w))
 			{
 			}
 
-			IScheduler* blocking_scheduler;
+			void Execute() override
+			{
+				value = work();
+			}
+
+			T ConsumeValue() override { return std::move(*value); }
+
 			Work work;
 			std::optional<T> value;
-			std::exception_ptr exception;
-			std::coroutine_handle<> handle;
-			std::atomic<int> status{ kSuspending };
-#ifdef PRISM_RUNTIME_METRICS
-			std::chrono::steady_clock::time_point suspend_time;
-#endif
 		};
 
-		std::shared_ptr<State> state_;
+		std::shared_ptr<StateBase> state_;
 	};
 
 	// Specialization for AsyncOp<void>: Operations that don't return a value.
@@ -195,19 +218,42 @@ namespace prism
 	class AsyncOp<void>
 	{
 	private:
+		struct StateBase
+		{
+			static constexpr int kSuspending = 0;
+			static constexpr int kCompleted = 1;
+			static constexpr int kSuspended = 2;
+
+			explicit StateBase(IScheduler* blocking_sched)
+			    : blocking_scheduler(blocking_sched)
+			{
+			}
+
+			virtual ~StateBase() = default;
+			virtual void Execute() = 0;
+
+			IScheduler* blocking_scheduler;
+			std::exception_ptr exception;
+			std::coroutine_handle<> handle;
+			std::atomic<int> status{ kSuspending };
+#ifdef PRISM_RUNTIME_METRICS
+			std::chrono::steady_clock::time_point suspend_time;
+#endif
+		};
+		template <typename Work>
 		struct State;
 
 	public:
-		using Work = std::move_only_function<void()>;
-
-		AsyncOp(IScheduler& scheduler, Work work)
-		    : state_(std::make_shared<State>(scheduler.BlockingScheduler(), std::move(work)))
+		template <typename Work>
+		requires std::is_invocable_r_v<void, Work&>
+		AsyncOp(IScheduler& scheduler, Work&& work)
+		    : state_(std::make_shared<State<std::decay_t<Work>>>(scheduler.BlockingScheduler(), std::forward<Work>(work)))
 		{
 		}
 
 		struct Awaiter
 		{
-			std::shared_ptr<State> state;
+			std::shared_ptr<StateBase> state;
 
 			bool await_ready() const noexcept { return false; }
 
@@ -220,7 +266,7 @@ namespace prism
 				state->blocking_scheduler->Submit([st = state] {
 					try
 					{
-						st->work();
+						st->Execute();
 					}
 					catch (...)
 					{
@@ -236,18 +282,18 @@ namespace prism
 						rm.continuation_count.fetch_add(1, std::memory_order_relaxed);
 					}
 #endif
-					auto expected = State::kSuspending;
+					auto expected = StateBase::kSuspending;
 					if (st->status.compare_exchange_strong(
-					        expected, State::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
+					        expected, StateBase::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
 					{
 						return;
 					}
 					st->handle.resume();
 				});
 
-				auto expected = State::kSuspending;
+				auto expected = StateBase::kSuspending;
 				if (state->status.compare_exchange_strong(
-				        expected, State::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
+				        expected, StateBase::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
 				{
 					// Coroutine wins: suspend and wait for worker.
 					return true;
@@ -268,29 +314,21 @@ namespace prism
 		Awaiter operator co_await() && noexcept { return Awaiter{ std::move(state_) }; }
 
 	private:
-		struct State
+		template <typename Work>
+		struct State final: StateBase
 		{
-			static constexpr int kSuspending = 0;
-			static constexpr int kCompleted = 1;
-			static constexpr int kSuspended = 2;
-
 			State(IScheduler* blocking_sched, Work w)
-			    : blocking_scheduler(blocking_sched)
+			    : StateBase(blocking_sched)
 			    , work(std::move(w))
 			{
 			}
 
-			IScheduler* blocking_scheduler;
+			void Execute() override { work(); }
+
 			Work work;
-			std::exception_ptr exception;
-			std::coroutine_handle<> handle;
-			std::atomic<int> status{ kSuspending };
-#ifdef PRISM_RUNTIME_METRICS
-			std::chrono::steady_clock::time_point suspend_time;
-#endif
 		};
 
-		std::shared_ptr<State> state_;
+		std::shared_ptr<StateBase> state_;
 	};
 }
 
