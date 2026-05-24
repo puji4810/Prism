@@ -318,11 +318,11 @@ TEST_F(IoReactorFallbackTest, ReactorPumpDemuxesOutOfOrderCompletions)
 
 	std::array<char, 4> first{ };
 	std::array<char, 4> second{ };
-	std::binary_semaphore ready(0);
+	std::counting_semaphore<2> ready(0);
 	std::atomic<int> ready_count{ 0 };
 	std::atomic<int> release_count{ 0 };
-	std::binary_semaphore release(0);
-	std::binary_semaphore completed(0);
+	std::counting_semaphore<2> release(0);
+	std::counting_semaphore<2> completed(0);
 	std::atomic<uint64_t> first_user_data{ 0 };
 	std::atomic<uint64_t> second_user_data{ 0 };
 	std::atomic<int> first_result{ -1 };

@@ -150,7 +150,7 @@ namespace prism::bench
 	// Async benchmark window workers (real outstanding-window semantics)
 	Detached RunAsyncMixedClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
 	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
-	    std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
+	    const std::string* value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
 	    std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
 	    std::atomic<std::size_t>& client_max_inflight);
 

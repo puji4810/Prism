@@ -1875,14 +1875,20 @@ namespace prism
 		}
 		else
 		{
-			InternalKey ikey(key, snapshot, kValueTypeForSeek);
-			Slice internal_key = ikey.Encode();
+			Slice internal_key = lkey.internal_key();
 			TableGetState state{ internal_comparator_.user_comparator(), key, &value };
+			const bool use_bytewise_key_compare = internal_comparator_.IsBytewise();
+			const Comparator* ucmp = internal_comparator_.user_comparator();
 
 			// Helper lambda: check if key is in file's [smallest, largest] range
 			auto KeyInFileRange = [&](const FileMetaData* file) -> bool {
-				const Comparator* ucmp = internal_comparator_.user_comparator();
-				return (ucmp->Compare(key, file->smallest.user_key()) >= 0 && ucmp->Compare(key, file->largest.user_key()) <= 0);
+				const Slice smallest_user_key = file->smallest.user_key();
+				const Slice largest_user_key = file->largest.user_key();
+				if (use_bytewise_key_compare)
+				{
+					return (key.compare(smallest_user_key) >= 0 && key.compare(largest_user_key) <= 0);
+				}
+				return (ucmp->Compare(key, smallest_user_key) >= 0 && ucmp->Compare(key, largest_user_key) <= 0);
 			};
 
 			// Helper lambda: search a single level for the key

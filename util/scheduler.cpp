@@ -369,32 +369,22 @@ namespace prism
 				break;
 			}
 
-			auto* worker = TryReserveIdleWorker();
-			if (worker == nullptr)
+			while (true)
 			{
-				continue;
-			}
-
-			PriorityTask task;
-			bool has_task = false;
-			{
-				std::lock_guard lock(priority_mutex_);
-				// Over-notification from worker threads may result in empty queue
-				if (!priority_queue_.empty())
+				PriorityTask task;
 				{
+					std::lock_guard lock(priority_mutex_);
+					// Over-notification from worker threads may result in an empty queue.
+					if (priority_queue_.empty())
+					{
+						break;
+					}
 					task = std::move(const_cast<PriorityTask&>(priority_queue_.top()));
 					priority_queue_.pop();
-					has_task = true;
 				}
-			}
 
-			if (!has_task)
-			{
-				ReturnReservedIdleWorker(worker);
-				continue;
+				(void)TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), true, true);
 			}
-
-			worker->PushDispatched(std::move(task.job));
 		}
 	}
 
@@ -414,10 +404,11 @@ namespace prism
 				continue;
 			}
 
-			auto task = std::move(const_cast<LazyTask&>(lazy_queue_.top()));
+			const auto deadline = lazy_queue_.top().deadline;
 			const auto now = std::chrono::steady_clock::now();
-			if (ShouldPromoteLazyTask(task, now)) // POLICY: deadline expired?
+			if (deadline <= now) // POLICY: deadline expired?
 			{
+				auto task = std::move(const_cast<LazyTask&>(lazy_queue_.top()));
 				lazy_queue_.pop();
 				if (!lazy_queue_.empty())
 				{
@@ -429,7 +420,6 @@ namespace prism
 			}
 			else
 			{
-				const auto deadline = task.deadline;
 				lock.unlock();
 
 				(void)lazy_waiter_.try_acquire_until(deadline);
