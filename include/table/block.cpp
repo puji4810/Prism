@@ -96,6 +96,7 @@ namespace prism
 	{
 	private:
 		const Comparator* const comparator_;
+		const bool is_bytewise_;
 		const char* const data_; // block contents
 		uint32_t const restarts_;
 		uint32_t const num_restarts_;
@@ -107,6 +108,10 @@ namespace prism
 		Status status_;
 
 		inline int Compare(const Slice& a, const Slice& b) const { return comparator_->Compare(a, b); }
+		inline int CompareMaybeBytewise(const Slice& a, const Slice& b) const
+		{
+			return is_bytewise_ ? a.compare(b) : comparator_->Compare(a, b);
+		}
 
 		// Return the offset in data_ of next entry
 		inline uint32_t NextEntryOffset() const { return (value_.data() + value_.size()) - data_; }
@@ -178,6 +183,7 @@ namespace prism
 	public:
 		Iter(const Comparator* comparator, const char* data, uint32_t restarts, uint32_t num_restarts)
 		    : comparator_(comparator)
+		    , is_bytewise_(comparator == BytewiseComparator())
 		    , data_(data)
 		    , restarts_(restarts)
 		    , num_restarts_(num_restarts)
@@ -242,7 +248,7 @@ namespace prism
 
 			if (Valid())
 			{
-				current_key_compare = Compare(key_, target);
+				current_key_compare = CompareMaybeBytewise(key_, target);
 				if (current_key_compare < 0)
 				{
 					left = restart_index_;
@@ -272,7 +278,7 @@ namespace prism
 
 				Slice mid_key(key_ptr, non_shared);
 
-				if (Compare(mid_key, target) < 0) // the last one which lower than target
+				if (CompareMaybeBytewise(mid_key, target) < 0) // the last one which lower than target
 				{
 					left = mid;
 				}
@@ -295,7 +301,7 @@ namespace prism
 				{
 					return;
 				}
-				if (Compare(key_, target) >= 0)
+				if (CompareMaybeBytewise(key_, target) >= 0)
 				{
 					return;
 				}

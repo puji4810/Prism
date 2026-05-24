@@ -141,8 +141,8 @@ namespace prism::tests
 		RuntimeBundle runtime(scheduler);
 
 		constexpr int kReadWorkers = 4;
-		std::binary_semaphore read_started(0);
-		std::binary_semaphore release_reads(0);
+		std::counting_semaphore<kReadWorkers> read_started(0);
+		std::counting_semaphore<kReadWorkers> release_reads(0);
 
 		for (int i = 0; i < kReadWorkers; ++i)
 		{

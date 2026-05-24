@@ -5,8 +5,10 @@
 #include "scheduler.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <filesystem>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <unistd.h>
@@ -467,7 +469,7 @@ namespace prism::bench
 
 	Detached RunAsyncMixedClient(AsyncDB& db, StartGate& gate, DoneState& done, const Config& cfg,
 	    const std::vector<std::vector<std::string>>& keys, int client_id, int slot_id, std::size_t start_index, std::size_t op_count,
-	    std::string value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
+	    const std::string* value, std::vector<uint64_t>& lat, std::atomic<std::size_t>& global_inflight,
 	    std::atomic<std::size_t>& global_max_inflight, std::atomic<std::size_t>& client_inflight,
 	    std::atomic<std::size_t>& client_max_inflight)
 	{
@@ -475,6 +477,7 @@ namespace prism::bench
 		{
 			std::mt19937_64 rng(static_cast<uint64_t>(client_id * 1000 + slot_id + 1));
 			co_await gate;
+			const auto& client_keys = keys[static_cast<std::size_t>(client_id)];
 
 			if (!cfg.no_latency)
 			{
@@ -492,11 +495,12 @@ namespace prism::bench
 
 				if (do_read)
 				{
-					(void)co_await db.GetAsync(ReadOptions(), keys[static_cast<std::size_t>(client_id)][i]);
+					(void)co_await db.GetAsync(ReadOptions(), client_keys[i]);
 				}
 				else
 				{
-					(void)co_await db.PutAsync(WriteOptions(), keys[static_cast<std::size_t>(client_id)][i], value);
+					assert(value != nullptr);
+					(void)co_await db.PutAsync(WriteOptions(), client_keys[i], *value);
 				}
 
 				RecordInflightLeave(global_inflight);
@@ -526,6 +530,7 @@ namespace prism::bench
 		{
 			co_await gate;
 			(void)slot_id;
+			const auto& client_keys = keys[static_cast<std::size_t>(client_id)];
 
 			if (!cfg.no_latency)
 			{
@@ -540,7 +545,7 @@ namespace prism::bench
 				RecordInflightEnter(global_inflight, global_max_inflight);
 				RecordInflightEnter(client_inflight, client_max_inflight);
 
-				(void)co_await db.GetAsync(ReadOptions(), keys[static_cast<std::size_t>(client_id)][i]);
+				(void)co_await db.GetAsync(ReadOptions(), client_keys[i]);
 
 				RecordInflightLeave(global_inflight);
 				RecordInflightLeave(client_inflight);
@@ -571,7 +576,11 @@ namespace prism::bench
 
 		std::vector<std::vector<uint64_t>> lat;
 		lat.resize(static_cast<std::size_t>(total_slots));
-		const std::string value = MakeValue(cfg.value_size);
+		std::optional<std::string> value;
+		if (cfg.read_ratio < 100)
+		{
+			value.emplace(MakeValue(cfg.value_size));
+		}
 
 		std::atomic<std::size_t> global_inflight{ 0 };
 		std::atomic<std::size_t> global_max_inflight{ 0 };
@@ -590,7 +599,7 @@ namespace prism::bench
 			{
 				const std::size_t start_index = SlotStartIndex(cfg.ops_per_client, effective_inflight, slot);
 				const std::size_t op_count = SlotOpCount(cfg.ops_per_client, effective_inflight, slot);
-				RunAsyncMixedClient(db, gate, done, cfg, keys, c, slot, start_index, op_count, value,
+				RunAsyncMixedClient(db, gate, done, cfg, keys, c, slot, start_index, op_count, value ? &*value : nullptr,
 				    lat[static_cast<std::size_t>(slot_idx)], global_inflight, global_max_inflight,
 				    client_inflight[static_cast<std::size_t>(c)], client_max_inflight[static_cast<std::size_t>(c)]);
 				++slot_idx;
@@ -715,6 +724,7 @@ namespace prism::bench
 		{
 			co_await gate;
 			(void)slot_id;
+			const auto& client_keys = keys[static_cast<std::size_t>(client_id)];
 
 			if (!cfg.no_latency)
 			{
@@ -733,7 +743,7 @@ namespace prism::bench
 				RecordInflightEnter(global_inflight, global_max_inflight);
 				RecordInflightEnter(client_inflight, client_max_inflight);
 
-				(void)co_await db.GetAsync(read_opts, keys[static_cast<std::size_t>(client_id)][i]);
+				(void)co_await db.GetAsync(read_opts, client_keys[i]);
 
 				RecordInflightLeave(global_inflight);
 				RecordInflightLeave(client_inflight);
@@ -835,6 +845,7 @@ namespace prism::bench
 		{
 			co_await gate;
 			(void)slot_id;
+			const auto& client_keys = keys[static_cast<std::size_t>(client_id)];
 
 			if (!cfg.no_latency)
 			{
@@ -852,7 +863,7 @@ namespace prism::bench
 				RecordInflightEnter(global_inflight, global_max_inflight);
 				RecordInflightEnter(client_inflight, client_max_inflight);
 
-				(void)co_await db.GetAsync(read_opts, keys[static_cast<std::size_t>(client_id)][i]);
+				(void)co_await db.GetAsync(read_opts, client_keys[i]);
 
 				RecordInflightLeave(global_inflight);
 				RecordInflightLeave(client_inflight);
@@ -1024,6 +1035,7 @@ namespace prism::bench
 		{
 			co_await gate;
 			(void)slot_id;
+			const auto& client_keys = keys[static_cast<std::size_t>(client_id)];
 
 			if (!cfg.no_latency)
 			{
@@ -1041,7 +1053,7 @@ namespace prism::bench
 				RecordInflightEnter(global_inflight, global_max_inflight);
 				RecordInflightEnter(client_inflight, client_max_inflight);
 
-				(void)co_await db.PutAsync(write_opts, keys[static_cast<std::size_t>(client_id)][i], value);
+				(void)co_await db.PutAsync(write_opts, client_keys[i], value);
 
 				RecordInflightLeave(global_inflight);
 				RecordInflightLeave(client_inflight);

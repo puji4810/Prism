@@ -112,10 +112,12 @@ namespace prism
 	{
 	private:
 		const Comparator* user_comparator_;
+		bool is_bytewise_;
 
 	public:
 		explicit InternalKeyComparator(const Comparator* c)
 		    : user_comparator_(c)
+		    , is_bytewise_(c == BytewiseComparator())
 		{
 		}
 		const char* Name() const override;
@@ -124,6 +126,7 @@ namespace prism
 		void FindShortSuccessor(std::string* key) const override;
 
 		const Comparator* user_comparator() const { return user_comparator_; }
+		bool IsBytewise() const { return is_bytewise_; }
 
 		int Compare(const InternalKey& a, const InternalKey& b) const;
 	};

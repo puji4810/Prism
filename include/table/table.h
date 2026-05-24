@@ -19,9 +19,9 @@ namespace prism
 	class BlockHandle;
 	class Footer;
 	struct Options;
-	class RandomAccessFile; // TODO: posix_env
+	class RandomAccessFile;
 	struct ReadOptions;
-	class TableCache; // TODO: table_cache
+	class TableCache;
 	class FilterBlockReader;
 
 	// A Table is a sorted map from strings to strings.  Tables are
@@ -71,6 +71,7 @@ namespace prism
 		struct Rep;
 
 		static Iterator* BlockReader(void*, const ReadOptions&, const Slice&);
+		static Iterator* BlockReaderByHandle(Table*, const ReadOptions&, const BlockHandle&);
 
 		explicit Table(Rep* rep)
 		    : rep_(rep)
@@ -114,46 +115,6 @@ namespace prism
 
 namespace prism
 {
-	inline Status Table::InternalGet(const ReadOptions& options, const Slice& key, void* arg, HandleResult handle_result)
-	{
-		Status s;
-		Iterator* index_iter = rep_->index_block->NewIterator(rep_->options.comparator);
-		index_iter->Seek(key);
-		if (index_iter->Valid())
-		{
-			Slice handle_value = index_iter->value();
-			FilterBlockReader* filter = rep_->filter;
-			BlockHandle handle;
-			bool skip_data_block = false;
-
-			// Use filter block to fast-reject blocks that cannot contain the key.
-			if (filter != nullptr && handle.DecodeFrom(handle_value).ok() && !filter->KeyMayMatch(handle.offset(), key))
-			{
-				skip_data_block = true;
-			}
-
-			if (!skip_data_block)
-			{
-				Iterator* block_iter = BlockReader(this, options, index_iter->value());
-				block_iter->Seek(key);
-				if (block_iter->Valid())
-				{
-					s = handle_result(arg, block_iter->key(), block_iter->value());
-				}
-				else
-				{
-					s = block_iter->status();
-				}
-				delete block_iter;
-			}
-		}
-		if (s.ok())
-		{
-			s = index_iter->status();
-		}
-		delete index_iter;
-		return s;
-	}
 }
 
 #endif

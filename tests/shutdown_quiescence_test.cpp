@@ -56,7 +56,7 @@ TEST_F(ShutdownQuiescenceTest, ScopeDestructorWaitsForAllChildren)
 	BlockingExecutor executor(2);
 	std::binary_semaphore child_a_started(0);
 	std::binary_semaphore child_b_started(0);
-	std::binary_semaphore release_children(0);
+	std::counting_semaphore<2> release_children(0);
 	std::binary_semaphore destroyed(0);
 	std::atomic<bool> destroy_done{ false };
 

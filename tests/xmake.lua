@@ -317,7 +317,7 @@ target("runtime_lane_test")
 target("executor_microbench")
 	set_kind("binary")
 	add_files("$(projectdir)/benchmark/executor_microbench.cpp")
-	add_files("$(projectdir)/util/scheduler.cpp", "$(projectdir)/src/async_runtime.cpp", "$(projectdir)/src/runtime_metrics.cpp")
+	add_files("$(projectdir)/util/scheduler.cpp", "$(projectdir)/src/async_runtime.cpp", "$(projectdir)/src/io_reactor.cpp", "$(projectdir)/src/runtime_metrics.cpp")
 	add_includedirs("$(builddir)/generated", "$(projectdir)/include", "$(projectdir)/src", "$(projectdir)/util")
 	add_tests("default")
 
