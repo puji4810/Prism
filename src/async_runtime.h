@@ -28,7 +28,7 @@ namespace prism
 	{
 	public:
 		virtual ~IContinuationExecutor() = default;
-		virtual void Submit(std::function<void()> work) = 0;
+		virtual void Submit(std::move_only_function<void()> work) = 0;
 	};
 
 	enum class BlockingExecutorLane
@@ -46,7 +46,7 @@ namespace prism
 	public:
 		explicit ThreadPoolExecutor(ThreadPoolScheduler& scheduler);
 
-		void Submit(std::function<void()> work) override;
+		void Submit(std::move_only_function<void()> work) override;
 
 	private:
 		ThreadPoolScheduler* scheduler_;
@@ -66,7 +66,7 @@ namespace prism
 		BlockingExecutor(BlockingExecutor&&) = delete;
 		BlockingExecutor& operator=(BlockingExecutor&&) = delete;
 
-		void Submit(std::function<void()> work) override;
+		void Submit(std::move_only_function<void()> work) override;
 		bool Empty() const;
 		bool IsCurrentWorker() const noexcept;
 
@@ -75,7 +75,7 @@ namespace prism
 
 		mutable std::mutex mutex_;
 		std::condition_variable cv_;
-		std::deque<std::function<void()>> queue_;
+		std::deque<std::move_only_function<void()>> queue_;
 		BlockingExecutorLane lane_{ BlockingExecutorLane::kGeneric };
 		bool stopping_{ false };
 		std::vector<std::jthread> workers_;
@@ -94,7 +94,7 @@ namespace prism
 		SerialLane(SerialLane&&) = delete;
 		SerialLane& operator=(SerialLane&&) = delete;
 
-		void Submit(std::function<void()> work) override;
+		void Submit(std::move_only_function<void()> work) override;
 		bool Empty() const;
 		bool Done() const;
 		bool IsCurrentWorker() const noexcept;
@@ -104,7 +104,7 @@ namespace prism
 
 		mutable std::mutex mutex_;
 		std::condition_variable cv_;
-		std::deque<std::function<void()>> queue_;
+		std::deque<std::move_only_function<void()>> queue_;
 		std::jthread worker_;
 		bool stopping_{ false };
 		bool running_{ false };

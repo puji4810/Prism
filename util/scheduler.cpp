@@ -165,7 +165,7 @@ namespace prism
 				}
 			}
 
-			const auto worker_index = ChooseLeastLoadedWorker();
+			const auto worker_index = ChooseSubmissionWorker();
 			if (TryPushToWorker(std::move(job), worker_index, false, true))
 			{
 				RuntimeMetrics::Instance().foreground_fastpath_submits.fetch_add(1, std::memory_order_relaxed);
@@ -247,16 +247,14 @@ namespace prism
 		return best_index;
 	}
 
-	bool ThreadPoolScheduler::TryDispatch(Job& job)
+	std::size_t ThreadPoolScheduler::ChooseSubmissionWorker()
 	{
-		auto* worker = TryReserveIdleWorker();
-		if (worker == nullptr)
+		const auto worker_count = work_threads_.size();
+		if (worker_count == 0)
 		{
-			return false;
+			return 0;
 		}
-
-		worker->PushDispatched(std::move(job));
-		return true;
+		return submit_cursor_.fetch_add(1, std::memory_order_relaxed) % worker_count;
 	}
 
 	ThreadPoolScheduler::WorkThread* ThreadPoolScheduler::TryReserveIdleWorker()
@@ -296,7 +294,7 @@ namespace prism
 	{
 		while (!lazy_queue_.empty())
 		{
-			auto task = lazy_queue_.top();
+			auto task = std::move(const_cast<LazyTask&>(lazy_queue_.top()));
 			lazy_queue_.pop();
 			if (!TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), true, true))
 			{
@@ -310,7 +308,7 @@ namespace prism
 	{
 		while (!lazy_queue_.empty())
 		{
-			auto task = lazy_queue_.top();
+			auto task = std::move(const_cast<LazyTask&>(lazy_queue_.top()));
 			lazy_queue_.pop();
 			if (TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), false, true))
 			{
@@ -416,7 +414,7 @@ namespace prism
 				continue;
 			}
 
-			auto task = lazy_queue_.top();
+			auto task = std::move(const_cast<LazyTask&>(lazy_queue_.top()));
 			const auto now = std::chrono::steady_clock::now();
 			if (ShouldPromoteLazyTask(task, now)) // POLICY: deadline expired?
 			{
@@ -598,7 +596,7 @@ namespace prism
 	}
 
 	bool ThreadPoolScheduler::WorkThread::HandleJobCompletion(
-	    const QueuedJob& job, bool queue_empty_after, ThreadPoolScheduler& scheduler) noexcept
+	    QueuedJob& job, bool queue_empty_after, ThreadPoolScheduler& scheduler) noexcept
 	{
 		try
 		{

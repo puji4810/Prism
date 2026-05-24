@@ -21,7 +21,7 @@ namespace prism
 	class IScheduler
 	{
 	public:
-		using Job = std::function<void()>;
+		using Job = std::move_only_function<void()>;
 
 		virtual ~IScheduler() = default;
 
@@ -56,7 +56,7 @@ namespace prism
 	// 1. Submit(job, priority): Immediate execution
 	//    - priority == 0: throughput-first fast path to worker-local queue
 	//      * worker self-submit -> same worker queue
-	//      * external submit -> least-loaded worker queue
+	//      * external submit -> round-robin worker queue
 	//    - priority > 0: fallback/background priority queue
 	//
 	// 2. SubmitAfter(deadline, job): Delayed execution
@@ -213,7 +213,7 @@ namespace prism
 			void Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept;
 			bool TrySteal(ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state);
 			bool TryDequeueJob(QueuedJob& out, bool& queue_empty);
-			bool HandleJobCompletion(const QueuedJob& job, bool queue_empty_after,
+			bool HandleJobCompletion(QueuedJob& job, bool queue_empty_after,
 			                        ThreadPoolScheduler& scheduler) noexcept;
 
 			// Mechanics: register this worker as idle in pending_list_ and signal
@@ -245,10 +245,10 @@ namespace prism
 
 		// TryDispatch: Find idle worker and assign job. Returns false if no idle workers.
 		// Only consumes `job` on success so callers can safely retry/fallback.
-		bool TryDispatch(Job& job);
 		WorkThread* TryReserveIdleWorker();
 		void ReturnReservedIdleWorker(WorkThread* worker);
 		bool TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable);
+		std::size_t ChooseSubmissionWorker();
 		std::size_t ChooseLeastLoadedWorker() const;
 
 		// PriorityLoop: Dispatcher thread that processes priority_queue_
@@ -292,6 +292,7 @@ namespace prism
 		void PushToPriorityQueue(Job job, std::size_t priority, bool wake = true);
 
 		std::vector<WorkThread> work_threads_;
+		std::atomic<std::size_t> submit_cursor_{ 0 };
 		std::vector<WorkThread*> pending_list_;
 		std::mutex pending_mutex_;
 

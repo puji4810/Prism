@@ -13,9 +13,6 @@
 #include <semaphore>
 
 #include <unistd.h>
-#ifdef __linux__
-#include <sys/prctl.h>
-#endif
 
 // VTune ITT instrumentation (optional -- compiles to no-ops when not available)
 #if __has_include(<ittnotify.h>)
@@ -27,52 +24,6 @@ inline void __itt_resume(void) { }
 
 namespace prism::bench
 {
-	namespace
-	{
-		void PausePerfEvents()
-		{
-#ifdef __linux__
-			(void)::prctl(PR_TASK_PERF_EVENTS_DISABLE, 0, 0, 0, 0);
-#endif
-		}
-
-		void ResumePerfEvents()
-		{
-#ifdef __linux__
-			(void)::prctl(PR_TASK_PERF_EVENTS_ENABLE, 0, 0, 0, 0);
-#endif
-		}
-
-		struct PrefillProfileGuard
-		{
-			explicit PrefillProfileGuard(bool enabled)
-			    : enabled(enabled)
-			{
-				if (!enabled)
-				{
-					return;
-				}
-				PausePerfEvents();
-				__itt_pause();
-			}
-
-			~PrefillProfileGuard()
-			{
-				if (!enabled)
-				{
-					return;
-				}
-				__itt_resume();
-				ResumePerfEvents();
-			}
-
-			PrefillProfileGuard(const PrefillProfileGuard&) = delete;
-			PrefillProfileGuard& operator=(const PrefillProfileGuard&) = delete;
-
-			bool enabled;
-		};
-	}
-
 	static void RunSyncBenchmark(const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		if (cfg.mode == BenchMode::kSstReadPipeline)
@@ -108,8 +59,11 @@ namespace prism::bench
 		    = (cfg.prefill == 1) || (cfg.prefill == -1 && (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0));
 		if (should_prefill_sync)
 		{
-			PrefillProfileGuard pause_guard(cfg.profile_pause_prefill);
-			Prefill(db, keys, cfg.key_space_per_client, cfg.value_size, cfg.profile_pause_prefill);
+			if (cfg.profile_pause_prefill)
+				__itt_pause();
+			Prefill(db, keys, cfg.ops_per_client, cfg.value_size);
+			if (cfg.profile_pause_prefill)
+				__itt_resume();
 		}
 
 		if (cfg.mode == BenchMode::kDiskRead)
@@ -230,17 +184,22 @@ namespace prism::bench
 
 		if (should_prefill)
 		{
-			PrefillProfileGuard pause_guard(cfg.profile_pause_prefill);
+			if (cfg.profile_pause_prefill)
+				__itt_pause();
 			Options prefill_options = options;
 			prefill_options.env = env_to_use;
 			auto pre = Database::Open(prefill_options, dir);
 			if (!pre.has_value())
 			{
 				std::fprintf(stderr, "async prefill open failed: %s\n", pre.error().ToString().c_str());
+				if (cfg.profile_pause_prefill)
+					__itt_resume();
 				return;
 			}
 			auto pre_db = std::move(pre.value());
-			Prefill(pre_db, keys, cfg.key_space_per_client, cfg.value_size, cfg.profile_pause_prefill);
+			Prefill(pre_db, keys, cfg.ops_per_client, cfg.value_size);
+			if (cfg.profile_pause_prefill)
+				__itt_resume();
 		}
 
 		auto open_sem = std::binary_semaphore(0);
@@ -429,11 +388,11 @@ int main(int argc, char** argv)
 	using namespace prism::bench;
 
 	Config cfg = ParseArgs(argc, argv);
-	const auto keys = MakeKeys(cfg.clients, cfg.key_space_per_client);
+	const auto keys = MakeKeys(cfg.clients, cfg.ops_per_client);
 
-	std::printf("config: run=%s bench=%s phase=%s clients=%d workers=%d ops=%zu key_space=%zu value_size=%zu read_ratio=%d\n",
-	    RunName(cfg).c_str(), BenchName(cfg.mode).c_str(), PhaseName(cfg.phase).c_str(), cfg.clients, cfg.workers,
-	    cfg.ops_per_client, cfg.key_space_per_client, cfg.value_size, cfg.read_ratio);
+	std::printf("config: run=%s bench=%s phase=%s clients=%d workers=%d ops=%zu value_size=%zu read_ratio=%d\n", RunName(cfg).c_str(),
+	    BenchName(cfg.mode).c_str(), PhaseName(cfg.phase).c_str(), cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size,
+	    cfg.read_ratio);
 
 	if (cfg.do_sync)
 	{

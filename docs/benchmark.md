@@ -38,8 +38,10 @@ Built from `benchmark/kv_bench.cpp` + `benchmark/kv_bench_lib.cpp`. Supports syn
 | `--clients=<n>` | int | 4 | Number of concurrent clients |
 | `--workers=<n>` | int | 4 | Worker threads for async scheduler |
 | `--ops=<n>` | int | 10000 | Operations per client |
+| `--key_space=<n>` | int | ops | Distinct keys per client; ops wrap inside this space |
 | `--value_size=<n>` | int | 100 | Value size in bytes |
 | `--read_ratio=<n>` | int (0-100) | 0 | Percentage of reads in mixed mode |
+| `--write_batch_size=<n>` | int | 32 | Batch size for async write flushes |
 | `--inflight_per_client=<n>` | int | 1 | Outstanding operations per client (async only). Use `inflight=1` for serialized baseline; use `inflight_per_client > 1` (e.g., 2, 4, 8, 16) to measure async pipelining benefits. |
 | `--rounds=<n>` | int | 3 | Number of measurement rounds |
 | `--warmup_rounds=<n>` | int | 0 | Warmup rounds before measurement |
@@ -51,8 +53,23 @@ Built from `benchmark/kv_bench.cpp` + `benchmark/kv_bench_lib.cpp`. Supports syn
 | `--async` | flag | — | Run only async benchmark (shorthand) |
 | `--no_latency` | flag | off | Skip p50/p95 percentile collection |
 | `--phase=<mode>` | `full\|prefill_only\|warmup_only\|steady_state\|compaction_overlap_only` | `full` | Profiling phase isolation |
-| `--profile-pause-prefill` | flag | off | Pause VTune/ITT during prefill phase |
+| `--profile-pause-prefill` | flag | off | Pause VTune/ITT/perf during prefill phase |
 | `--help` | flag | — | Print help |
+
+### Steady-State Profiling
+
+For long perf/VTune runs, prefill once and then measure with `--prefill=0` against the same `--db_dir`.
+
+If you want a small dataset with a long measurement window, set `--key_space` lower than `--ops` so the workload cycles over the same keys instead of growing the DB every time.
+
+Example:
+
+```bash
+./build/linux/x86_64/release/kv_bench --run=async --bench=mixed \
+  --clients=24 --workers=24 --ops=5000000 --key_space=50000 \
+  --value_size=8 --read_ratio=100 --prefill=0 \
+  --inflight_per_client=16 --db_dir=/tmp/prism_bench --keep_db=1
+```
 
 ### Async DB Architecture Notes
 
