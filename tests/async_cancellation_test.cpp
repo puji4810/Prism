@@ -22,7 +22,7 @@ namespace
 	class ManualExecutor: public IContinuationExecutor
 	{
 	public:
-		void Submit(std::function<void()> work) override
+		void Submit(std::move_only_function<void()> work) override
 		{
 			std::lock_guard lock(mutex_);
 			queue_.push(std::move(work));
@@ -30,7 +30,7 @@ namespace
 
 		void DrainOne()
 		{
-			std::function<void()> work;
+			std::move_only_function<void()> work;
 			{
 				std::lock_guard lock(mutex_);
 				ASSERT_FALSE(queue_.empty());
@@ -42,7 +42,7 @@ namespace
 
 	private:
 		std::mutex mutex_;
-		std::queue<std::function<void()>> queue_;
+		std::queue<std::move_only_function<void()>> queue_;
 	};
 }
 

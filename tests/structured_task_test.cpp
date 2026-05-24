@@ -31,7 +31,7 @@ namespace
 	class InlineExecutor: public IContinuationExecutor
 	{
 	public:
-		void Submit(std::function<void()> work) override { work(); }
+		void Submit(std::move_only_function<void()> work) override { work(); }
 	};
 }
 

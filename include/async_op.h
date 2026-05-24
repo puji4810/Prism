@@ -91,7 +91,7 @@ namespace prism
 		using Work = std::move_only_function<T()>;
 
 		AsyncOp(IScheduler& scheduler, Work work)
-		    : state_(std::make_shared<State>(&scheduler, std::move(work)))
+		    : state_(std::make_shared<State>(scheduler.BlockingScheduler(), std::move(work)))
 		{
 		}
 
@@ -110,9 +110,7 @@ namespace prism
 				state->suspend_time = std::chrono::steady_clock::now();
 #endif
 
-				IScheduler* blocking_scheduler = state->scheduler->BlockingScheduler();
-
-				blocking_scheduler->Submit([st = state] {
+				state->blocking_scheduler->Submit([st = state] {
 					try
 					{
 						st->value = st->work();
@@ -171,13 +169,13 @@ namespace prism
 			static constexpr int kCompleted = 1;
 			static constexpr int kSuspended = 2;
 
-			State(IScheduler* sched, Work w)
-			    : scheduler(sched)
+			State(IScheduler* blocking_sched, Work w)
+			    : blocking_scheduler(blocking_sched)
 			    , work(std::move(w))
 			{
 			}
 
-			IScheduler* scheduler;
+			IScheduler* blocking_scheduler;
 			Work work;
 			std::optional<T> value;
 			std::exception_ptr exception;
@@ -203,7 +201,7 @@ namespace prism
 		using Work = std::move_only_function<void()>;
 
 		AsyncOp(IScheduler& scheduler, Work work)
-		    : state_(std::make_shared<State>(&scheduler, std::move(work)))
+		    : state_(std::make_shared<State>(scheduler.BlockingScheduler(), std::move(work)))
 		{
 		}
 
@@ -219,9 +217,7 @@ namespace prism
 #ifdef PRISM_RUNTIME_METRICS
 				state->suspend_time = std::chrono::steady_clock::now();
 #endif
-				IScheduler* blocking_scheduler = state->scheduler->BlockingScheduler();
-
-				blocking_scheduler->Submit([st = state] {
+				state->blocking_scheduler->Submit([st = state] {
 					try
 					{
 						st->work();
@@ -278,13 +274,13 @@ namespace prism
 			static constexpr int kCompleted = 1;
 			static constexpr int kSuspended = 2;
 
-			State(IScheduler* sched, Work w)
-			    : scheduler(sched)
+			State(IScheduler* blocking_sched, Work w)
+			    : blocking_scheduler(blocking_sched)
 			    , work(std::move(w))
 			{
 			}
 
-			IScheduler* scheduler;
+			IScheduler* blocking_scheduler;
 			Work work;
 			std::exception_ptr exception;
 			std::coroutine_handle<> handle;

@@ -143,7 +143,7 @@ namespace prism
 	{
 	}
 
-	void ThreadPoolExecutor::Submit(std::function<void()> work)
+	void ThreadPoolExecutor::Submit(std::move_only_function<void()> work)
 	{
 		// Priority 0 is the shared CPU pool fast path: direct worker-local enqueue
 		// plus stealing, with no bounce through the legacy priority dispatcher.
@@ -187,7 +187,7 @@ namespace prism
 		workers_.clear();
 	}
 
-	void BlockingExecutor::Submit(std::function<void()> work)
+	void BlockingExecutor::Submit(std::move_only_function<void()> work)
 	{
 #ifdef PRISM_RUNTIME_METRICS
 		auto submit_time = std::chrono::steady_clock::now();
@@ -232,7 +232,7 @@ namespace prism
 	{
 		while (true)
 		{
-			std::function<void()> job;
+			std::move_only_function<void()> job;
 			{
 				std::unique_lock lock(mutex_);
 				cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
@@ -269,7 +269,7 @@ namespace prism
 		cv_.notify_all();
 	}
 
-	void SerialLane::Submit(std::function<void()> work)
+	void SerialLane::Submit(std::move_only_function<void()> work)
 	{
 		{
 			std::lock_guard lock(mutex_);
@@ -296,7 +296,7 @@ namespace prism
 	{
 		while (true)
 		{
-			std::function<void()> job;
+			std::move_only_function<void()> job;
 			{
 				std::unique_lock lock(mutex_);
 				cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
