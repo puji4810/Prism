@@ -32,15 +32,8 @@ namespace prism::bench
 		constexpr std::size_t kRecordSize = 4096;
 		constexpr std::uint64_t kWorkloadSeed = 0xC0FFEEULL;
 
-		enum class Backend
-		{
-			kThreadPool,
-			kBlockingLane,
-		};
-
 		struct BenchConfig
 		{
-			Backend backend = Backend::kThreadPool;
 			std::string backend_name = "thread_pool";
 			std::string workload = "random_read";
 			std::size_t ops = 10000;
@@ -154,12 +147,10 @@ namespace prism::bench
 					const auto value = arg.substr(std::string_view("--backend=").size());
 					if (value == "thread_pool")
 					{
-						cfg.backend = Backend::kThreadPool;
 						cfg.backend_name = "thread_pool";
 					}
 					else if (value == "blocking_lane")
 					{
-						cfg.backend = Backend::kBlockingLane;
 						cfg.backend_name = "blocking_lane";
 					}
 					else
@@ -190,18 +181,6 @@ namespace prism::bench
 				}
 			}
 			return cfg;
-		}
-
-		AsyncEnvBackendMode ToBackendMode(Backend backend)
-		{
-			switch (backend)
-			{
-			case Backend::kThreadPool:
-				return AsyncEnvBackendMode::kThreadPool;
-			case Backend::kBlockingLane:
-				return AsyncEnvBackendMode::kBlockingLane;
-			}
-			std::terminate();
 		}
 
 		std::vector<std::string> MakeFilePaths(const std::filesystem::path& dir)
@@ -443,8 +422,7 @@ int main(int argc, char** argv)
 		const auto requests = BuildWorkload(cfg.ops);
 
 		ThreadPoolScheduler scheduler(kWorkerCount);
-		auto runtime = AcquireRuntimeBundle(scheduler);
-		runtime->async_env_backend = ToBackendMode(cfg.backend);
+		(void)AcquireRuntimeBundle(scheduler);
 
 		AsyncEnv async_env(scheduler, env);
 		const auto files = OpenAsyncFiles(async_env, file_paths);

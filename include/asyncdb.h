@@ -7,7 +7,6 @@
 #include "status.h"
 #include "write_batch.h"
 
-#include <memory>
 #include <string>
 
 namespace prism
@@ -32,16 +31,16 @@ namespace prism
 
 		AsyncDB(const AsyncDB&) = delete;
 		AsyncDB& operator=(const AsyncDB&) = delete;
-		AsyncDB(AsyncDB&&) = default;
-		AsyncDB& operator=(AsyncDB&&) = default;
+		AsyncDB(AsyncDB&& other) noexcept;
+		AsyncDB& operator=(AsyncDB&& other) noexcept;
 
 		// Opens a database asynchronously and returns a by-value handle.
-		// The AsyncDB handle is move-only and internally uses shared_ptr for async safety.
+		// The AsyncDB handle is move-only; outstanding operations pin internal state.
 		static AsyncOp<Result<AsyncDB>> OpenAsync(ThreadPoolScheduler& scheduler, const Options& options, std::string dbname);
 
 		AsyncOp<Status> PutAsync(const WriteOptions& options, std::string key, std::string value);
 
-		AsyncOp<Result<std::string>> GetAsync(const ReadOptions& options, std::string key);
+		AsyncOp<Result<std::string>> GetAsync(ReadOptions options, std::string key);
 		AsyncOp<Status> DeleteAsync(const WriteOptions& options, std::string key);
 		AsyncOp<Status> WriteAsync(const WriteOptions& options, WriteBatch batch);
 		// Captures a cheap-copy Snapshot handle that can be stored by value in
@@ -53,9 +52,9 @@ namespace prism
 
 		struct SharedState;
 
-		AsyncDB(std::shared_ptr<SharedState> state);
+		AsyncDB(SharedState* state);
 
-		std::shared_ptr<SharedState> state_;
+		SharedState* state_ = nullptr;
 	};
 }
 

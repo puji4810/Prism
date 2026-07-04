@@ -66,15 +66,12 @@ namespace prism::tests
 		std::deque<Job> queue_;
 	};
 
-	class SplitManualScheduler: public IScheduler
+	class ManualAsyncScheduler: public IScheduler
 	{
 	public:
-		void Submit(Job job, std::size_t priority = 0) override { continuation.Submit(std::move(job), priority); }
-		IScheduler* BlockingScheduler() noexcept override { return &blocking; }
-		IScheduler* ContinuationScheduler() noexcept override { return &continuation; }
+		void Submit(Job job, std::size_t priority = 0) override { blocking.Submit(std::move(job), priority); }
 
 		ManualScheduler blocking;
-		ManualScheduler continuation;
 	};
 
 	// ---------------------------------------------------------------------------
@@ -265,7 +262,7 @@ namespace prism::tests
 
 	TEST(AsyncOpTest, BlockingWorkResumesCoroutineInline)
 	{
-		SplitManualScheduler sched;
+		ManualAsyncScheduler sched;
 
 		auto task = [&]() -> Task<int> {
 			int result = co_await AsyncOp<int>(sched, [] { return 99; });
@@ -273,12 +270,9 @@ namespace prism::tests
 		}();
 
 		ASSERT_EQ(sched.blocking.Size(), 1u);
-		EXPECT_TRUE(sched.continuation.Empty());
-
 		sched.blocking.RunOne();
 
 		EXPECT_TRUE(sched.blocking.Empty());
-		EXPECT_TRUE(sched.continuation.Empty()) << "hot-path resume should not bounce through a continuation queue";
 
 		auto result = task.SyncWaitFor(std::chrono::milliseconds(1));
 		ASSERT_TRUE(result.has_value());

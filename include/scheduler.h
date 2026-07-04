@@ -2,26 +2,171 @@
 #define PRISM_SCHEDULER_H
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <queue>
 #include <semaphore>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace prism
 {
+	class InlineJob
+	{
+	public:
+		static constexpr std::size_t kInlineBytes = 128;
+
+		InlineJob() noexcept = default;
+
+		template <typename F>
+		    requires(!std::is_same_v<std::decay_t<F>, InlineJob> && std::is_invocable_r_v<void, std::decay_t<F>&>)
+		InlineJob(F&& f)
+		{
+			using Fn = std::decay_t<F>;
+			Emplace<Fn>(std::forward<F>(f));
+		}
+
+		InlineJob(const InlineJob&) = delete;
+		InlineJob& operator=(const InlineJob&) = delete;
+
+		InlineJob(InlineJob&& other) noexcept { MoveFrom(std::move(other)); }
+
+		InlineJob& operator=(InlineJob&& other) noexcept
+		{
+			if (this != &other)
+			{
+				Reset();
+				MoveFrom(std::move(other));
+			}
+			return *this;
+		}
+
+		~InlineJob() { Reset(); }
+
+		explicit operator bool() const noexcept { return invoke_ != nullptr; }
+
+		void operator()()
+		{
+			assert(invoke_ != nullptr);
+			invoke_(ptr_);
+		}
+
+	private:
+		using InvokeFn = void (*)(void*);
+		using DestroyFn = void (*)(void*) noexcept;
+		using DeleteFn = void (*)(void*) noexcept;
+		using MoveFn = void (*)(void*, void*) noexcept;
+
+		template <typename Fn>
+		static constexpr bool kUseInlineStorage = sizeof(Fn) <= kInlineBytes && alignof(Fn) <= alignof(std::max_align_t)
+		    && std::is_nothrow_move_constructible_v<Fn>;
+
+		void* StoragePtr() noexcept { return static_cast<void*>(storage_); }
+		const void* StoragePtr() const noexcept { return static_cast<const void*>(storage_); }
+
+		template <typename Fn, typename F>
+		void Emplace(F&& f)
+		{
+			invoke_ = [](void* ptr) { (*static_cast<Fn*>(ptr))(); };
+			destroy_ = [](void* ptr) noexcept { std::destroy_at(static_cast<Fn*>(ptr)); };
+			delete_ = [](void* ptr) noexcept { delete static_cast<Fn*>(ptr); };
+			move_ = [](void* src, void* dst) noexcept {
+				std::construct_at(static_cast<Fn*>(dst), std::move(*static_cast<Fn*>(src)));
+			};
+
+			if constexpr (kUseInlineStorage<Fn>)
+			{
+				ptr_ = StoragePtr();
+				std::construct_at(static_cast<Fn*>(ptr_), std::forward<F>(f));
+				heap_allocated_ = false;
+			}
+			else
+			{
+				ptr_ = new Fn(std::forward<F>(f));
+				heap_allocated_ = true;
+			}
+		}
+
+		void Reset() noexcept
+		{
+			if (invoke_ == nullptr)
+			{
+				return;
+			}
+			if (heap_allocated_)
+			{
+				delete_(ptr_);
+			}
+			else
+			{
+				destroy_(ptr_);
+			}
+			ptr_ = nullptr;
+			invoke_ = nullptr;
+			destroy_ = nullptr;
+			delete_ = nullptr;
+			move_ = nullptr;
+			heap_allocated_ = false;
+		}
+
+		void MoveFrom(InlineJob&& other) noexcept
+		{
+			ptr_ = nullptr;
+			invoke_ = other.invoke_;
+			destroy_ = other.destroy_;
+			delete_ = other.delete_;
+			move_ = other.move_;
+			heap_allocated_ = other.heap_allocated_;
+
+			if (other.invoke_ == nullptr)
+			{
+				return;
+			}
+
+			if (other.heap_allocated_)
+			{
+				ptr_ = other.ptr_;
+				other.ptr_ = nullptr;
+			}
+			else
+			{
+				ptr_ = StoragePtr();
+				move_(other.ptr_, ptr_);
+				other.destroy_(other.ptr_);
+			}
+
+			other.invoke_ = nullptr;
+			other.destroy_ = nullptr;
+			other.delete_ = nullptr;
+			other.move_ = nullptr;
+			other.heap_allocated_ = false;
+		}
+
+		alignas(std::max_align_t) std::byte storage_[kInlineBytes];
+		void* ptr_{ nullptr };
+		InvokeFn invoke_{ nullptr };
+		DestroyFn destroy_{ nullptr };
+		DeleteFn delete_{ nullptr };
+		MoveFn move_{ nullptr };
+		bool heap_allocated_{ false };
+	};
+
 	// IScheduler: Minimal abstract scheduler interface.
 	// Allows AsyncOp and other components to submit work without depending on
 	// the concrete ThreadPoolScheduler. Enables deterministic test doubles.
 	class IScheduler
 	{
 	public:
-		using Job = std::move_only_function<void()>;
+		using Job = InlineJob;
 
 		virtual ~IScheduler() = default;
 
@@ -29,18 +174,6 @@ namespace prism
 		// Thread-safe. Must be callable from any thread.
 		virtual void Submit(Job job, std::size_t priority = 0) = 0;
 
-		// Routing hooks that decouple work dispatch from coroutine resumption routing.
-		// BlockingScheduler() — returns the scheduler where actual work (I/O, CPU) is submitted.
-		//   AsyncOp calls BlockingScheduler() to dispatch blocking work to the thread pool.
-		// ContinuationScheduler() — available for explicit split-lane scenarios; used by
-		//   ExecutorSchedulerAdapter and standalone adapter tests. Production AsyncOp does
-		//   NOT queue continuations through ContinuationScheduler — coroutine resumption
-		//   happens inline on the worker that completed the work.
-		// Default (inherited) implementation returns `this`, routing both through the same
-		// scheduler. Test doubles and ExecutorSchedulerAdapter override these to route
-		// blocking and continuation lanes separately.
-		virtual IScheduler* BlockingScheduler() noexcept { return this; }
-		virtual IScheduler* ContinuationScheduler() noexcept { return this; }
 	};
 
 	// ThreadPoolScheduler: Worker-local thread pool with fallback priority and delayed task support.
@@ -50,7 +183,6 @@ namespace prism
 	// - Foreground immediate Submit() pushes directly to worker-local queues
 	// - 1 priority dispatcher thread: fallback/background path only
 	// - 1 lazy dispatcher thread: processes delayed tasks (lazy_queue_), dispatches when ready
-	// - pending_list_: tracks idle workers for fallback/background dispatch only
 	//
 	// Task Submission Paths:
 	// 1. Submit(job, priority): Immediate execution
@@ -74,9 +206,7 @@ namespace prism
 	// Fallback Dispatch:
 	// - Each worker has its own queue (mutex-protected deque)
 	// - Each worker tracks an approximate atomic load counter for fast external balancing
-	// - Workers re-enter pending_list_ only for fallback/background dispatch jobs
-	// - QueuedJob tracks dispatch/pinning metadata; `dispatched` marks jobs that came
-	//   through the dispatcher and therefore may need pending-list bookkeeping
+	// - QueuedJob tracks pinning metadata for stealing and affinity
 	//
 	// - Shutdown Protocol:
 	// - Exit() sets exit_flag_, wakes all threads.
@@ -89,7 +219,6 @@ namespace prism
 	// - Destructor joins all threads (safe cleanup)
 	//
 	// Thread Safety:
-	// - pending_list_: protected by pending_mutex_
 	// - priority_queue_: protected by priority_mutex_
 	// - lazy_queue_: protected by lazy_mutex_
 	// - Each WorkThread's queue_: protected by its own mutex_
@@ -142,12 +271,30 @@ namespace prism
 
 		// Submit job with priority (higher number = higher priority).
 		void Submit(Job job, std::size_t priority = 0) override;
+		template <typename F>
+		    requires(!std::is_same_v<std::decay_t<F>, Job>)
+		void Submit(F&& job, std::size_t priority = 0)
+		{
+			SubmitJob(std::forward<F>(job), priority);
+		}
 
 		// Submit job to execute after deadline/delay.
 		void SubmitAfter(std::chrono::steady_clock::time_point deadline, Job job);
+		template <typename F>
+		    requires(!std::is_same_v<std::decay_t<F>, Job>)
+		void SubmitAfter(std::chrono::steady_clock::time_point deadline, F&& job)
+		{
+			SubmitAfterJob(deadline, std::forward<F>(job));
+		}
 		void SubmitAfter(std::chrono::milliseconds delay, Job job)
 		{
 			SubmitAfter(std::chrono::steady_clock::now() + delay, std::move(job));
+		}
+		template <typename F>
+		    requires(!std::is_same_v<std::decay_t<F>, Job>)
+		void SubmitAfter(std::chrono::milliseconds delay, F&& job)
+		{
+			SubmitAfter(std::chrono::steady_clock::now() + delay, std::forward<F>(job));
 		}
 
 		// Submit job with strict same-worker affinity (for cache locality).
@@ -164,12 +311,18 @@ namespace prism
 		// During shutdown: only worker re-entrant SubmitIn calls are accepted
 		// (identical to Submit/SubmitAfter policy — see ShouldAcceptSubmitDuringShutdown).
 		void SubmitIn(Context ctx, Job job);
+		template <typename F>
+		    requires(!std::is_same_v<std::decay_t<F>, Job>)
+		void SubmitIn(Context ctx, F&& job)
+		{
+			SubmitInJob(ctx, std::forward<F>(job));
+		}
 		// Returns the number of worker threads in the pool.
 		std::size_t WorkerCount() const { return work_threads_.size(); }
 
 	private:
 		// WorkThread: Worker with its own task queue.
-		// Consumes tasks from its queue, re-enters pending_list_ only for dispatched jobs when idle.
+		// Consumes tasks from its queue and steals from peers under load.
 		class WorkThread
 		{
 		public:
@@ -191,6 +344,21 @@ namespace prism
 
 			// PushDispatched: Submission from dispatcher (marks job as dispatched=true)
 			void PushDispatched(Job job);
+			template <typename F>
+			void Emplace(F&& job, bool stealable)
+			{
+				{
+					std::lock_guard lock(mutex_);
+					queue_.emplace_back(std::forward<F>(job), stealable);
+					load_.fetch_add(1, std::memory_order_relaxed);
+				}
+				semaphore_.release();
+			}
+			template <typename F>
+			void EmplaceDispatched(F&& job)
+			{
+				Emplace(std::forward<F>(job), true);
+			}
 			std::size_t Load() const noexcept;
 
 			// Wake: Signal semaphore (used during shutdown)
@@ -204,21 +372,23 @@ namespace prism
 		private:
 			struct QueuedJob
 			{
+				QueuedJob() = default;
+				template <typename F>
+				QueuedJob(F&& fn, bool is_stealable)
+				    : job(std::forward<F>(fn))
+				    , stealable(is_stealable)
+				{
+				}
+
 				Job job;
-				bool dispatched{ false };
 				bool stealable{ true };
 				bool stolen{ false };
 			};
 
 			void Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept;
 			bool TrySteal(ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state);
-			bool TryDequeueJob(QueuedJob& out, bool& queue_empty);
-			bool HandleJobCompletion(QueuedJob& job, bool queue_empty_after,
-			                        ThreadPoolScheduler& scheduler) noexcept;
-
-			// Mechanics: register this worker as idle in pending_list_ and signal
-			// the priority dispatcher so it can route work here.
-			void RegisterAsIdleWorker(ThreadPoolScheduler& scheduler);
+			bool TryDequeueJob(QueuedJob& out);
+			bool HandleJobCompletion(QueuedJob& job, ThreadPoolScheduler& scheduler) noexcept;
 
 			std::counting_semaphore<> semaphore_{ 0z };
 			std::jthread thread_{};
@@ -229,6 +399,14 @@ namespace prism
 
 		struct PriorityTask
 		{
+			PriorityTask() = default;
+			template <typename F>
+			PriorityTask(F&& fn, std::size_t task_priority)
+			    : job(std::forward<F>(fn))
+			    , priority(task_priority)
+			{
+			}
+
 			Job job;
 			std::size_t priority;
 
@@ -237,17 +415,40 @@ namespace prism
 
 		struct LazyTask
 		{
+			LazyTask() = default;
+			template <typename F>
+			LazyTask(F&& fn, std::chrono::steady_clock::time_point task_deadline)
+			    : job(std::forward<F>(fn))
+			    , deadline(task_deadline)
+			{
+			}
+
 			Job job;
 			std::chrono::steady_clock::time_point deadline;
 
 			bool operator<(const LazyTask& rhs) const noexcept { return rhs.deadline < deadline; }
 		};
 
-		// TryDispatch: Find idle worker and assign job. Returns false if no idle workers.
-		// Only consumes `job` on success so callers can safely retry/fallback.
-		WorkThread* TryReserveIdleWorker();
-		void ReturnReservedIdleWorker(WorkThread* worker);
 		bool TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable);
+		template <typename F>
+		bool TryEmplaceToWorker(F&& job, std::size_t worker_index, bool dispatched, bool stealable)
+		{
+			if (worker_index >= work_threads_.size())
+			{
+				return false;
+			}
+
+			auto& worker = work_threads_[worker_index];
+			if (dispatched)
+			{
+				worker.EmplaceDispatched(std::forward<F>(job));
+			}
+			else
+			{
+				worker.Emplace(std::forward<F>(job), stealable);
+			}
+			return true;
+		}
 		std::size_t ChooseSubmissionWorker();
 		std::size_t ChooseLeastLoadedWorker() const;
 
@@ -290,11 +491,80 @@ namespace prism
 		// PushToPriorityQueue: enqueue a job into priority_queue_ and
 		//   optionally wake the priority dispatcher thread.
 		void PushToPriorityQueue(Job job, std::size_t priority, bool wake = true);
+		template <typename F>
+		void PushToPriorityQueue(F&& job, std::size_t priority, bool wake = true)
+		{
+			{
+				std::lock_guard lock(priority_mutex_);
+				priority_queue_.emplace(std::forward<F>(job), priority);
+			}
+			if (wake)
+			{
+				priority_waiter_.release();
+			}
+		}
+
+		template <typename F>
+		void SubmitJob(F&& job, std::size_t priority)
+		{
+			assert(ShouldAcceptSubmitDuringShutdown());
+
+			if (ShouldUseFastPath(priority))
+			{
+				if (current_scheduler_ == this)
+				{
+					if (TryEmplaceToWorker(std::forward<F>(job), current_worker_index_, false, true))
+					{
+						RecordForegroundFastPathSubmit();
+						return;
+					}
+				}
+
+				const auto worker_index = ChooseSubmissionWorker();
+				if (TryEmplaceToWorker(std::forward<F>(job), worker_index, false, true))
+				{
+					RecordForegroundFastPathSubmit();
+					return;
+				}
+			}
+
+			RecordForegroundFallbackSubmit();
+			PushToPriorityQueue(std::forward<F>(job), priority, /*wake=*/true);
+		}
+
+		template <typename F>
+		void SubmitAfterJob(std::chrono::steady_clock::time_point deadline, F&& job)
+		{
+			assert(ShouldAcceptSubmitDuringShutdown());
+
+			{
+				std::lock_guard lock(lazy_mutex_);
+				lazy_queue_.emplace(std::forward<F>(job), deadline);
+			}
+			lazy_waiter_.release();
+		}
+
+		template <typename F>
+		void SubmitInJob(Context ctx, F&& job)
+		{
+			assert(ShouldAcceptSubmitDuringShutdown());
+
+			if (ctx.scheduler_ == this && TryEmplaceToWorker(std::forward<F>(job), ctx.worker_index_, false, true))
+			{
+				return;
+			}
+
+#ifndef NDEBUG
+			std::fprintf(stderr,
+			    "[prism::scheduler] SubmitIn context mismatch: this=%p ctx.scheduler_=%p ctx.worker_index_=%zu."
+			    " Falling back to Submit().\n",
+			    static_cast<const void*>(this), static_cast<const void*>(ctx.scheduler_), ctx.worker_index_);
+#endif
+			SubmitJob(std::forward<F>(job), 0);
+		}
 
 		std::vector<WorkThread> work_threads_;
 		std::atomic<std::size_t> submit_cursor_{ 0 };
-		std::vector<WorkThread*> pending_list_;
-		std::mutex pending_mutex_;
 
 		std::priority_queue<LazyTask> lazy_queue_;
 		std::priority_queue<PriorityTask> priority_queue_;
@@ -308,6 +578,12 @@ namespace prism
 		std::jthread priority_thread_;
 
 		std::atomic<bool> exit_flag_{ false };
+
+		static void RecordForegroundFastPathSubmit() noexcept;
+		static void RecordForegroundFallbackSubmit() noexcept;
+
+		static thread_local const ThreadPoolScheduler* current_scheduler_;
+		static thread_local std::size_t current_worker_index_;
 	};
 }
 

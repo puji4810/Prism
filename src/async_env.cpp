@@ -26,19 +26,6 @@ namespace prism
 
 		AsyncEnvBackend BackendSelect(RuntimeBundle& runtime)
 		{
-			switch (runtime.async_env_backend)
-			{
-			case AsyncEnvBackendMode::kThreadPool:
-				// Legacy benchmark/config alias. Older callers still use the historical
-				// "thread_pool" name; all modes now route directly to
-				// read_scheduler for file-I/O isolation.
-				return { &runtime.read_scheduler };
-			case AsyncEnvBackendMode::kBlockingLane:
-				return { &runtime.read_scheduler };
-			case AsyncEnvBackendMode::kDefault:
-				return { &runtime.read_scheduler };
-			}
-
 			return { &runtime.read_scheduler };
 		}
 

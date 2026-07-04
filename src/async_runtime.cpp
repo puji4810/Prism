@@ -143,7 +143,7 @@ namespace prism
 	{
 	}
 
-	void ThreadPoolExecutor::Submit(std::move_only_function<void()> work)
+	void ThreadPoolExecutor::Submit(Job work)
 	{
 		// Priority 0 is the shared CPU pool fast path: direct worker-local enqueue
 		// plus stealing, with no bounce through the legacy priority dispatcher.
@@ -187,7 +187,7 @@ namespace prism
 		workers_.clear();
 	}
 
-	void BlockingExecutor::Submit(std::move_only_function<void()> work)
+	void BlockingExecutor::Submit(Job work)
 	{
 #ifdef PRISM_RUNTIME_METRICS
 		auto submit_time = std::chrono::steady_clock::now();
@@ -195,7 +195,7 @@ namespace prism
 			std::lock_guard lock(mutex_);
 			auto current_depth = queue_.size();
 			RecordLaneSubmit(lane_, current_depth);
-			queue_.push_back([lane = lane_, submit_time, work = std::move(work)]() mutable {
+			queue_.emplace_back([lane = lane_, submit_time, work = std::move(work)]() mutable {
 				auto exec_start = std::chrono::steady_clock::now();
 				auto wait_us
 				    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_start - submit_time).count());
@@ -232,7 +232,7 @@ namespace prism
 	{
 		while (true)
 		{
-			std::move_only_function<void()> job;
+			Job job;
 			{
 				std::unique_lock lock(mutex_);
 				cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
@@ -269,7 +269,7 @@ namespace prism
 		cv_.notify_all();
 	}
 
-	void SerialLane::Submit(std::move_only_function<void()> work)
+	void SerialLane::Submit(Job work)
 	{
 		{
 			std::lock_guard lock(mutex_);
@@ -296,7 +296,7 @@ namespace prism
 	{
 		while (true)
 		{
-			std::move_only_function<void()> job;
+			Job job;
 			{
 				std::unique_lock lock(mutex_);
 				cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
@@ -325,19 +325,12 @@ namespace prism
 		}
 	}
 
-	ExecutorSchedulerAdapter::ExecutorSchedulerAdapter(
-	    IContinuationExecutor& executor, IScheduler* blocking_scheduler, IScheduler* continuation_scheduler)
+	ExecutorSchedulerAdapter::ExecutorSchedulerAdapter(IContinuationExecutor& executor)
 	    : executor_(&executor)
-	    , blocking_scheduler_(blocking_scheduler != nullptr ? blocking_scheduler : this)
-	    , continuation_scheduler_(continuation_scheduler != nullptr ? continuation_scheduler : this)
 	{
 	}
 
 	void ExecutorSchedulerAdapter::Submit(Job job, std::size_t /*priority*/) { executor_->Submit(std::move(job)); }
-
-	IScheduler* ExecutorSchedulerAdapter::BlockingScheduler() noexcept { return blocking_scheduler_; }
-
-	IScheduler* ExecutorSchedulerAdapter::ContinuationScheduler() noexcept { return continuation_scheduler_; }
 
 	RuntimeBundle::RuntimeBundle(ThreadPoolScheduler& scheduler)
 	    : cpu_executor(scheduler)

@@ -31,7 +31,7 @@ namespace
 	class InlineExecutor: public IContinuationExecutor
 	{
 	public:
-		void Submit(std::move_only_function<void()> work) override { work(); }
+		void Submit(Job work) override { work(); }
 	};
 }
 
@@ -110,16 +110,15 @@ TEST(StructuredTaskTest, RuntimeBundleConstructsAndDrainsResources)
 	}
 }
 
-TEST(StructuredTaskTest, SchedulerAdapterRoutesBlockingAndContinuationSeparately)
+TEST(StructuredTaskTest, SchedulerAdapterSubmitsToWrappedExecutor)
 {
-	InlineExecutor continuation_executor;
-	InlineExecutor blocking_executor;
-	ExecutorSchedulerAdapter blocking_scheduler(blocking_executor);
-	ExecutorSchedulerAdapter continuation_scheduler(continuation_executor);
-	ExecutorSchedulerAdapter runtime_scheduler(continuation_executor, &blocking_scheduler, &continuation_scheduler);
+	InlineExecutor executor;
+	ExecutorSchedulerAdapter scheduler(executor);
+	std::atomic<int> submitted{ 0 };
 
-	EXPECT_EQ(runtime_scheduler.BlockingScheduler(), &blocking_scheduler);
-	EXPECT_EQ(runtime_scheduler.ContinuationScheduler(), &continuation_scheduler);
+	scheduler.Submit([&submitted] { submitted.fetch_add(1, std::memory_order_relaxed); });
+
+	EXPECT_EQ(submitted.load(std::memory_order_relaxed), 1);
 }
 
 TEST(StructuredTaskTest, TaskScopeSubmitsAndJoinsChildren)

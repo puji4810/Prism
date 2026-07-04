@@ -13,7 +13,6 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <type_traits>
 #include <utility>
 
 namespace prism
@@ -77,7 +76,8 @@ namespace prism
 	//   - No lost wakeup (if worker finishes first, await_suspend returns false and coroutine continues immediately).
 	//
 	// Thread Safety:
-	// - State is shared via std::shared_ptr to ensure lifetime across thread boundaries
+	// - State is owned by the awaiter in the awaiting coroutine frame; the submitted
+	//   worker captures a raw pointer and must complete before await_resume destroys it.
 	// - Work execution and result storage happen on thread pool threads
 	// - Coroutine resumption happens inline on the worker that completed the operation.
 	//   This avoids bouncing hot-path continuations through the same executor queue.
@@ -85,45 +85,35 @@ namespace prism
 	class AsyncOp
 	{
 	private:
-		struct StateBase
-		{
-			static constexpr int kSuspending = 0;
-			static constexpr int kCompleted = 1;
-			static constexpr int kSuspended = 2;
-
-			explicit StateBase(IScheduler* blocking_sched)
-			    : blocking_scheduler(blocking_sched)
-			{
-			}
-
-			virtual ~StateBase() = default;
-			virtual void Execute() = 0;
-			virtual T ConsumeValue() = 0;
-
-			IScheduler* blocking_scheduler;
-			std::exception_ptr exception;
-			std::coroutine_handle<> handle;
-			std::atomic<int> status{ kSuspending };
-#ifdef PRISM_RUNTIME_METRICS
-			std::chrono::steady_clock::time_point suspend_time;
-#endif
-		};
-		template <typename Work>
 		struct State;
 
 	public:
 		using ValueType = T;
+		using Work = std::move_only_function<T()>;
 
-		template <typename Work>
-		requires std::is_invocable_r_v<T, Work&>
-		AsyncOp(IScheduler& scheduler, Work&& work)
-		    : state_(std::make_shared<State<std::decay_t<Work>>>(scheduler.BlockingScheduler(), std::forward<Work>(work)))
+		AsyncOp(IScheduler& scheduler, Work work)
+		    : state_(std::make_unique<State>(&scheduler, std::move(work)))
+		{
+		}
+
+		AsyncOp(ThreadPoolScheduler& scheduler, Work work)
+		    : state_(std::make_unique<State>(&scheduler, std::move(work)))
+		{
+		}
+
+		AsyncOp(IScheduler& scheduler, void* keep_alive, void (*release_keep_alive)(void*), Work work)
+		    : state_(std::make_unique<State>(&scheduler, keep_alive, release_keep_alive, std::move(work)))
+		{
+		}
+
+		AsyncOp(ThreadPoolScheduler& scheduler, void* keep_alive, void (*release_keep_alive)(void*), Work work)
+		    : state_(std::make_unique<State>(&scheduler, keep_alive, release_keep_alive, std::move(work)))
 		{
 		}
 
 		struct Awaiter
 		{
-			std::shared_ptr<StateBase> state;
+			std::unique_ptr<State> state;
 
 			bool await_ready() const noexcept { return false; }
 
@@ -136,10 +126,11 @@ namespace prism
 				state->suspend_time = std::chrono::steady_clock::now();
 #endif
 
-				state->blocking_scheduler->Submit([st = state] {
+				State* st = state.get();
+				auto job = [st] {
 					try
 					{
-						st->Execute();
+						st->value = st->work();
 					}
 					catch (...)
 					{
@@ -155,19 +146,27 @@ namespace prism
 						rm.continuation_count.fetch_add(1, std::memory_order_relaxed);
 					}
 #endif
-					auto expected = StateBase::kSuspending;
+					auto expected = State::kSuspending;
 					if (st->status.compare_exchange_strong(
-					        expected, StateBase::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
+					        expected, State::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
 					{
 						return;
 					}
 					st->handle.resume();
-				});
+				};
+				if (state->direct_scheduler != nullptr)
+				{
+					state->direct_scheduler->Submit(std::move(job));
+				}
+				else
+				{
+					state->scheduler->Submit(std::move(job));
+				}
 
 				// Coroutine tries to win the handshake: kSuspending → kSuspended.
-				auto expected = StateBase::kSuspending;
+				auto expected = State::kSuspending;
 				if (state->status.compare_exchange_strong(
-				        expected, StateBase::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
+				        expected, State::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
 				{
 					// Won: worker has not finished; suspend and let worker resume us.
 					return true;
@@ -182,34 +181,81 @@ namespace prism
 				{
 					std::rethrow_exception(state->exception);
 				}
-				return state->ConsumeValue();
+				return std::move(*state->value);
 			}
 		};
 
 		Awaiter operator co_await() && noexcept { return Awaiter{ std::move(state_) }; }
 
 	private:
-		template <typename Work>
-		struct State final: StateBase
+		struct State
 		{
-			State(IScheduler* blocking_sched, Work w)
-			    : StateBase(blocking_sched)
+			static constexpr int kSuspending = 0;
+			static constexpr int kCompleted = 1;
+			static constexpr int kSuspended = 2;
+
+			struct KeepAlive
+			{
+				KeepAlive() = default;
+				KeepAlive(void* ptr_arg, void (*release_arg)(void*))
+				    : ptr(ptr_arg)
+				    , release(release_arg)
+				{
+				}
+				KeepAlive(const KeepAlive&) = delete;
+				KeepAlive& operator=(const KeepAlive&) = delete;
+				~KeepAlive()
+				{
+					if (ptr != nullptr)
+					{
+						release(ptr);
+					}
+				}
+
+				void* ptr = nullptr;
+				void (*release)(void*) = nullptr;
+			};
+
+			State(IScheduler* sched, Work w)
+			    : scheduler(sched)
 			    , work(std::move(w))
 			{
 			}
 
-			void Execute() override
+			State(ThreadPoolScheduler* sched, Work w)
+			    : direct_scheduler(sched)
+			    , work(std::move(w))
 			{
-				value = work();
 			}
 
-			T ConsumeValue() override { return std::move(*value); }
+			State(IScheduler* sched, void* keep_alive_ptr, void (*release_keep_alive)(void*), Work w)
+			    : scheduler(sched)
+			    , keep_alive(keep_alive_ptr, release_keep_alive)
+			    , work(std::move(w))
+			{
+			}
 
+			State(ThreadPoolScheduler* sched, void* keep_alive_ptr, void (*release_keep_alive)(void*), Work w)
+			    : direct_scheduler(sched)
+			    , keep_alive(keep_alive_ptr, release_keep_alive)
+			    , work(std::move(w))
+			{
+			}
+
+			IScheduler* scheduler = nullptr;
+			ThreadPoolScheduler* direct_scheduler = nullptr;
+			KeepAlive keep_alive;
 			Work work;
 			std::optional<T> value;
+			std::exception_ptr exception;
+			std::coroutine_handle<> handle;
+			std::atomic<int> status{ kSuspending };
+#ifdef PRISM_RUNTIME_METRICS
+			std::chrono::steady_clock::time_point suspend_time;
+#endif
 		};
 
-		std::shared_ptr<StateBase> state_;
+		std::unique_ptr<State> state_;
 	};
 
 	// Specialization for AsyncOp<void>: Operations that don't return a value.
@@ -218,42 +264,24 @@ namespace prism
 	class AsyncOp<void>
 	{
 	private:
-		struct StateBase
-		{
-			static constexpr int kSuspending = 0;
-			static constexpr int kCompleted = 1;
-			static constexpr int kSuspended = 2;
-
-			explicit StateBase(IScheduler* blocking_sched)
-			    : blocking_scheduler(blocking_sched)
-			{
-			}
-
-			virtual ~StateBase() = default;
-			virtual void Execute() = 0;
-
-			IScheduler* blocking_scheduler;
-			std::exception_ptr exception;
-			std::coroutine_handle<> handle;
-			std::atomic<int> status{ kSuspending };
-#ifdef PRISM_RUNTIME_METRICS
-			std::chrono::steady_clock::time_point suspend_time;
-#endif
-		};
-		template <typename Work>
 		struct State;
 
 	public:
-		template <typename Work>
-		requires std::is_invocable_r_v<void, Work&>
-		AsyncOp(IScheduler& scheduler, Work&& work)
-		    : state_(std::make_shared<State<std::decay_t<Work>>>(scheduler.BlockingScheduler(), std::forward<Work>(work)))
+		using Work = std::move_only_function<void()>;
+
+		AsyncOp(IScheduler& scheduler, Work work)
+		    : state_(std::make_unique<State>(&scheduler, std::move(work)))
+		{
+		}
+
+		AsyncOp(ThreadPoolScheduler& scheduler, Work work)
+		    : state_(std::make_unique<State>(&scheduler, std::move(work)))
 		{
 		}
 
 		struct Awaiter
 		{
-			std::shared_ptr<StateBase> state;
+			std::unique_ptr<State> state;
 
 			bool await_ready() const noexcept { return false; }
 
@@ -263,10 +291,11 @@ namespace prism
 #ifdef PRISM_RUNTIME_METRICS
 				state->suspend_time = std::chrono::steady_clock::now();
 #endif
-				state->blocking_scheduler->Submit([st = state] {
+				State* st = state.get();
+				auto job = [st] {
 					try
 					{
-						st->Execute();
+						st->work();
 					}
 					catch (...)
 					{
@@ -282,18 +311,26 @@ namespace prism
 						rm.continuation_count.fetch_add(1, std::memory_order_relaxed);
 					}
 #endif
-					auto expected = StateBase::kSuspending;
+					auto expected = State::kSuspending;
 					if (st->status.compare_exchange_strong(
-					        expected, StateBase::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
+					        expected, State::kCompleted, std::memory_order_acq_rel, std::memory_order_acquire))
 					{
 						return;
 					}
 					st->handle.resume();
-				});
+				};
+				if (state->direct_scheduler != nullptr)
+				{
+					state->direct_scheduler->Submit(std::move(job));
+				}
+				else
+				{
+					state->scheduler->Submit(std::move(job));
+				}
 
-				auto expected = StateBase::kSuspending;
+				auto expected = State::kSuspending;
 				if (state->status.compare_exchange_strong(
-				        expected, StateBase::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
+				        expected, State::kSuspended, std::memory_order_acq_rel, std::memory_order_acquire))
 				{
 					// Coroutine wins: suspend and wait for worker.
 					return true;
@@ -314,21 +351,36 @@ namespace prism
 		Awaiter operator co_await() && noexcept { return Awaiter{ std::move(state_) }; }
 
 	private:
-		template <typename Work>
-		struct State final: StateBase
+		struct State
 		{
-			State(IScheduler* blocking_sched, Work w)
-			    : StateBase(blocking_sched)
+			static constexpr int kSuspending = 0;
+			static constexpr int kCompleted = 1;
+			static constexpr int kSuspended = 2;
+
+			State(IScheduler* sched, Work w)
+			    : scheduler(sched)
 			    , work(std::move(w))
 			{
 			}
 
-			void Execute() override { work(); }
+			State(ThreadPoolScheduler* sched, Work w)
+			    : direct_scheduler(sched)
+			    , work(std::move(w))
+			{
+			}
 
+			IScheduler* scheduler = nullptr;
+			ThreadPoolScheduler* direct_scheduler = nullptr;
 			Work work;
+			std::exception_ptr exception;
+			std::coroutine_handle<> handle;
+			std::atomic<int> status{ kSuspending };
+#ifdef PRISM_RUNTIME_METRICS
+			std::chrono::steady_clock::time_point suspend_time;
+#endif
 		};
 
-		std::shared_ptr<StateBase> state_;
+		std::unique_ptr<State> state_;
 	};
 }
 

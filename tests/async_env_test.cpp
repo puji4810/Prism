@@ -416,54 +416,33 @@ TEST_F(AsyncEnvTest, AsyncWritableFileMoveAndDestroySafety)
 	EXPECT_EQ(content, "moved_data");
 }
 
-// Characterize that all three AsyncEnvBackendMode values (kDefault,
-// kThreadPool, kBlockingLane) route through BackendSelect directly to
-// read_scheduler. Each mode
-// executes a metadata operation (CreateDirAsync) and a factory operation
-// (NewRandomAccessFileAsync), both of which internally call BackendSelect.
-TEST_F(AsyncEnvTest, BackendModeSelection)
+// AsyncEnv has a single file-I/O routing policy: metadata and factory
+// operations use the RuntimeBundle read lane.
+TEST_F(AsyncEnvTest, FileOperationsUseDefaultReadLane)
 {
-	constexpr AsyncEnvBackendMode kModes[] = {
-		AsyncEnvBackendMode::kDefault,
-		AsyncEnvBackendMode::kThreadPool,
-		AsyncEnvBackendMode::kBlockingLane,
-	};
+	ThreadPoolScheduler scheduler(4);
+	AsyncEnv async_env(scheduler, env_);
 
-	for (const auto mode : kModes)
+	const std::string dir_path = TestFile("read_lane");
+	auto mkdir_task = [&]() -> Task<void> {
+		auto s = co_await async_env.CreateDirAsync(dir_path);
+		EXPECT_TRUE(s.ok()) << "CreateDirAsync: " << s.ToString();
+	}();
+	mkdir_task.SyncWait();
+
+	const std::string file_path = dir_path + "/data.txt";
 	{
-		ThreadPoolScheduler scheduler(4);
-		auto runtime = AcquireRuntimeBundle(scheduler);
-		runtime->async_env_backend = mode;
-
-		AsyncEnv async_env(scheduler, env_);
-
-		// Metadata op: CreateDirAsync routes through BackendSelect.
-		const std::string dir_path = TestFile("mode_" + std::to_string(static_cast<int>(mode)));
-		auto mkdir_task = [&]() -> Task<void> {
-			auto s = co_await async_env.CreateDirAsync(dir_path);
-			EXPECT_TRUE(s.ok()) << "Mode " << static_cast<int>(mode)
-			                    << " CreateDirAsync: " << s.ToString();
-		}();
-		mkdir_task.SyncWait();
-
-		// Factory op: write a file synchronously, then open it via
-		// NewRandomAccessFileAsync which also routes through BackendSelect.
-		const std::string file_path = dir_path + "/data.txt";
-		{
-			auto wf = env_->NewWritableFile(file_path);
-			ASSERT_TRUE(wf.has_value());
-			auto s = wf.value()->Append(Slice("backend_mode_test"));
-			ASSERT_TRUE(s.ok());
-			s = wf.value()->Close();
-			ASSERT_TRUE(s.ok());
-		}
-
-		auto read_task = [&]() -> Task<void> {
-			auto raf_res = co_await async_env.NewRandomAccessFileAsync(file_path);
-			EXPECT_TRUE(raf_res.has_value())
-			    << "Mode " << static_cast<int>(mode)
-			    << " NewRandomAccessFileAsync: " << raf_res.error().ToString();
-		}();
-		read_task.SyncWait();
+		auto wf = env_->NewWritableFile(file_path);
+		ASSERT_TRUE(wf.has_value());
+		auto s = wf.value()->Append(Slice("backend_mode_test"));
+		ASSERT_TRUE(s.ok());
+		s = wf.value()->Close();
+		ASSERT_TRUE(s.ok());
 	}
+
+	auto read_task = [&]() -> Task<void> {
+		auto raf_res = co_await async_env.NewRandomAccessFileAsync(file_path);
+		EXPECT_TRUE(raf_res.has_value()) << "NewRandomAccessFileAsync: " << raf_res.error().ToString();
+	}();
+	read_task.SyncWait();
 }
