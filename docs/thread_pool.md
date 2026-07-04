@@ -141,7 +141,7 @@ While `ThreadPoolScheduler` owns the CPU continuation pool, Prism's runtime incl
 
 The `BlockingExecutor` runs long-running synchronous operations on a dedicated thread. Its primary consumers are:
 
-- **Compaction** — `CompactionController` submits `BackgroundCompaction` work to the `BlockingExecutor` via `BlockingScheduler()`.
+- **Compaction** — `CompactionController` submits `BackgroundCompaction` work to the dedicated compaction executor.
 - **Blocking file I/O** — reads and writes that cannot use the async `IoReactor` backend.
 
 By isolating these operations from the CPU thread pool, the `BlockingExecutor` ensures that a multi-second compaction never delays a sub-microsecond coroutine resume.
@@ -174,4 +174,3 @@ This replaces the legacy `Env::Schedule()` / `StartThread()` model, where backgr
 - **Debug Hardening**:
   - `SubmitIn` validates the scheduler instance to prevent cross-pool affinity corruption.
   - `CaptureContext` uses `thread_local` storage to verify the calling thread belongs to the specific scheduler instance.
-
