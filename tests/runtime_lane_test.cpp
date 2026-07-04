@@ -65,9 +65,8 @@ namespace prism::tests
 	// ===========================================================================
 	// Test 1: Read Lane Isolation Verification
 	//
-	// Confirms that read_executor and compaction_executor are distinct objects
-	// and that read_scheduler self-routes both blocking and continuation,
-	// while compaction_scheduler and serial_scheduler also self-route.
+	// Confirms that read_executor and compaction_executor are distinct physical
+	// lanes, while their scheduler adapters remain simple submit-only views.
 	// ===========================================================================
 	TEST(RuntimeLaneTest, ReadAndCompactionExecutorsAreSeparate)
 	{
@@ -75,17 +74,6 @@ namespace prism::tests
 		RuntimeBundle runtime(scheduler);
 
 		EXPECT_NE(&runtime.read_executor, &runtime.compaction_executor);
-
-		EXPECT_EQ(runtime.read_scheduler.BlockingScheduler(), &runtime.read_scheduler);
-		EXPECT_EQ(runtime.read_scheduler.ContinuationScheduler(), &runtime.read_scheduler);
-		EXPECT_EQ(runtime.foreground_db_scheduler.BlockingScheduler(), &runtime.foreground_db_scheduler);
-		EXPECT_EQ(runtime.foreground_db_scheduler.ContinuationScheduler(), &runtime.foreground_db_scheduler);
-		EXPECT_EQ(runtime.cpu_scheduler.BlockingScheduler(), &runtime.cpu_scheduler);
-		EXPECT_EQ(runtime.cpu_scheduler.ContinuationScheduler(), &runtime.cpu_scheduler);
-		EXPECT_EQ(runtime.compaction_scheduler.BlockingScheduler(), &runtime.compaction_scheduler);
-		EXPECT_EQ(runtime.compaction_scheduler.ContinuationScheduler(), &runtime.compaction_scheduler);
-		EXPECT_EQ(runtime.serial_scheduler.BlockingScheduler(), &runtime.serial_scheduler);
-		EXPECT_EQ(runtime.serial_scheduler.ContinuationScheduler(), &runtime.serial_scheduler);
 
 		{
 			std::binary_semaphore done(0);

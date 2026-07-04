@@ -11,24 +11,21 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace prism
 {
-	enum class AsyncEnvBackendMode
-	{
-		kDefault,
-		kThreadPool,
-		kBlockingLane,
-	};
-
 	// The interface for all continuation executors
 	// All the async execution backends should implement this interface
 	class IContinuationExecutor
 	{
 	public:
+		using Job = IScheduler::Job;
+
 		virtual ~IContinuationExecutor() = default;
-		virtual void Submit(std::move_only_function<void()> work) = 0;
+		virtual void Submit(Job work) = 0;
 	};
 
 	enum class BlockingExecutorLane
@@ -46,7 +43,13 @@ namespace prism
 	public:
 		explicit ThreadPoolExecutor(ThreadPoolScheduler& scheduler);
 
-		void Submit(std::move_only_function<void()> work) override;
+		void Submit(Job work) override;
+		template <typename F>
+		    requires(!std::is_same_v<std::decay_t<F>, Job>)
+		void Submit(F&& work)
+		{
+			scheduler_->Submit(std::forward<F>(work), 0);
+		}
 
 	private:
 		ThreadPoolScheduler* scheduler_;
@@ -66,7 +69,7 @@ namespace prism
 		BlockingExecutor(BlockingExecutor&&) = delete;
 		BlockingExecutor& operator=(BlockingExecutor&&) = delete;
 
-		void Submit(std::move_only_function<void()> work) override;
+		void Submit(Job work) override;
 		bool Empty() const;
 		bool IsCurrentWorker() const noexcept;
 
@@ -75,7 +78,7 @@ namespace prism
 
 		mutable std::mutex mutex_;
 		std::condition_variable cv_;
-		std::deque<std::move_only_function<void()>> queue_;
+		std::deque<Job> queue_;
 		BlockingExecutorLane lane_{ BlockingExecutorLane::kGeneric };
 		bool stopping_{ false };
 		std::vector<std::jthread> workers_;
@@ -94,7 +97,7 @@ namespace prism
 		SerialLane(SerialLane&&) = delete;
 		SerialLane& operator=(SerialLane&&) = delete;
 
-		void Submit(std::move_only_function<void()> work) override;
+		void Submit(Job work) override;
 		bool Empty() const;
 		bool Done() const;
 		bool IsCurrentWorker() const noexcept;
@@ -104,7 +107,7 @@ namespace prism
 
 		mutable std::mutex mutex_;
 		std::condition_variable cv_;
-		std::deque<std::move_only_function<void()>> queue_;
+		std::deque<Job> queue_;
 		std::jthread worker_;
 		bool stopping_{ false };
 		bool running_{ false };
@@ -113,22 +116,16 @@ namespace prism
 	class ExecutorSchedulerAdapter final: public IScheduler
 	{
 	public:
-		explicit ExecutorSchedulerAdapter(
-		    IContinuationExecutor& executor, IScheduler* blocking_scheduler = nullptr, IScheduler* continuation_scheduler = nullptr);
+		explicit ExecutorSchedulerAdapter(IContinuationExecutor& executor);
 
 		void Submit(Job job, std::size_t priority = 0) override;
-		IScheduler* BlockingScheduler() noexcept override;
-		IScheduler* ContinuationScheduler() noexcept override;
 
 	private:
 		IContinuationExecutor* executor_;
-		IScheduler* blocking_scheduler_;
-		IScheduler* continuation_scheduler_;
 	};
 
 	// RuntimeBundle owns the complete async execution environment for a DB instance.
-	// It concretely constructs executors and scheduler adapters, wiring the routing
-	// relationships declared by IScheduler::BlockingScheduler/ContinuationScheduler.
+	// It concretely constructs executors and scheduler adapters.
 	//
 	// Physical threads (only 4 sources):
 	//   ThreadPoolScheduler (external, shared) — N worker threads, priority + timer
@@ -189,8 +186,7 @@ namespace prism
 
 		// -- Scheduler adapters (IScheduler, wraps an IContinuationExecutor) --
 
-		// cpu_scheduler: wraps cpu_executor_impl. BlockingScheduler/ContinuationScheduler
-		// both return this (self), so work and coroutine resume share the same thread pool.
+		// cpu_scheduler: wraps cpu_executor_impl, so work runs on the shared CPU pool.
 		ExecutorSchedulerAdapter cpu_scheduler;
 
 		// read_scheduler: wraps read_executor. Blocking work runs on this lane, while
@@ -206,17 +202,11 @@ namespace prism
 		// serial_scheduler: wraps serial_lane for ordered writes.
 		ExecutorSchedulerAdapter serial_scheduler;
 
-		// foreground_db_scheduler: wraps cpu_executor_impl and keeps both blocking work and
-		// continuations on the shared thread pool. AsyncDB foreground operations use this
+		// foreground_db_scheduler: wraps cpu_executor_impl. AsyncDB foreground operations use this
 		// adapter so CPU-resident DB work lands on ThreadPoolScheduler::Submit(job, 0),
 		// bypassing the old priority dispatcher/read-lane bottleneck while preserving
 		// explicit read/compaction/serial isolation for blocking subsystems.
 		ExecutorSchedulerAdapter foreground_db_scheduler;
-
-		// -- I/O backend configuration --
-
-		// async_env_backend: controls which scheduler AsyncEnv uses for file I/O.
-		AsyncEnvBackendMode async_env_backend{ AsyncEnvBackendMode::kDefault };
 	};
 
 	std::shared_ptr<RuntimeBundle> AcquireRuntimeBundle(ThreadPoolScheduler& scheduler);

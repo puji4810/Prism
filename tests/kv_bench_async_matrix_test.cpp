@@ -50,6 +50,12 @@ namespace
 		}
 	}
 
+	void ParseUnknownNoLatencyFlag()
+	{
+		char* argv[] = { const_cast<char*>("test"), const_cast<char*>("--no_latency=1") };
+		(void)prism::bench::ParseArgs(2, argv);
+	}
+
 	TEST(KVBenchAsyncMatrixTest, ConfigDefaults)
 	{
 		prism::bench::Config cfg;
@@ -266,6 +272,11 @@ namespace
 		char* argv[] = { const_cast<char*>("test"), const_cast<char*>("--inflight_per_client=8") };
 		auto cfg = prism::bench::ParseArgs(2, argv);
 		EXPECT_EQ(cfg.inflight_per_client, 8);
+	}
+
+	TEST(KVBenchAsyncMatrixTest, UnknownFlagRejected)
+	{
+		EXPECT_EXIT(ParseUnknownNoLatencyFlag(), ::testing::ExitedWithCode(1), "unknown argument");
 	}
 
 	TEST(KVBenchAsyncMatrixTest, InflightDepthOneIsNoPipeline)

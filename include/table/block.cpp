@@ -3,13 +3,20 @@
 #include "comparator.h"
 #include "iterator.h"
 #include "status.h"
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <sys/types.h>
 
-namespace prism
-{
+	namespace prism
+	{
+	namespace
+	{
+		constexpr std::size_t kInitialKeyBufferReserve = 128;
+	}
+
 	inline uint32_t Block::NumRestarts() const
 	{
 		assert(size_ >= sizeof(uint32_t)); // make sure there is enough space for the restarts
@@ -113,6 +120,48 @@ namespace prism
 			return is_bytewise_ ? a.compare(b) : comparator_->Compare(a, b);
 		}
 
+		int CompareDecodedKeyToTarget(uint32_t shared, const char* non_shared_data, uint32_t non_shared, const Slice& target) const
+		{
+			const std::size_t target_size = target.size();
+			const std::size_t shared_to_compare = std::min<std::size_t>(shared, target_size);
+			if (shared_to_compare > 0)
+			{
+				const int r = std::memcmp(key_.data(), target.data(), shared_to_compare);
+				if (r != 0)
+				{
+					return r;
+				}
+			}
+
+			if (shared > target_size)
+			{
+				return 1;
+			}
+
+			const std::size_t target_pos = shared;
+			const std::size_t target_left = target_size - target_pos;
+			const std::size_t delta_to_compare = std::min<std::size_t>(non_shared, target_left);
+			if (delta_to_compare > 0)
+			{
+				const int r = std::memcmp(non_shared_data, target.data() + target_pos, delta_to_compare);
+				if (r != 0)
+				{
+					return r;
+				}
+			}
+
+			const std::size_t key_size = static_cast<std::size_t>(shared) + non_shared;
+			if (key_size < target_size)
+			{
+				return -1;
+			}
+			if (key_size > target_size)
+			{
+				return 1;
+			}
+			return 0;
+		}
+
 		// Return the offset in data_ of next entry
 		inline uint32_t NextEntryOffset() const { return (value_.data() + value_.size()) - data_; }
 
@@ -144,7 +193,7 @@ namespace prism
 			status_ = Status::Corruption("bad entry in block");
 		}
 
-		bool ParseNextKey()
+		bool ParseNextKeyInternal(const Slice* target, int* target_compare)
 		{
 			current_ = NextEntryOffset();
 			const char* p = data_ + current_;
@@ -169,15 +218,33 @@ namespace prism
 			}
 			else
 			{
-				key_.resize(shared); // we have make sure that key.size >= shared
-				key_.append(p, non_shared);
+				if (target_compare != nullptr)
+				{
+					if (is_bytewise_)
+					{
+						*target_compare = CompareDecodedKeyToTarget(shared, p, non_shared, *target);
+					}
+				}
+				key_.resize(shared + non_shared); // we have made sure that key.size >= shared
+				std::memcpy(key_.data() + shared, p, non_shared);
 				value_ = Slice(p + non_shared, value_length);
+				if (target_compare != nullptr && !is_bytewise_)
+				{
+					*target_compare = comparator_->Compare(key_, *target);
+				}
 				while (restart_index_ + 1 < num_restarts_ && GetRestartPoint(restart_index_ + 1) < current_)
 				{
 					++restart_index_;
 				}
 				return true;
 			}
+		}
+
+		bool ParseNextKey() { return ParseNextKeyInternal(nullptr, nullptr); }
+
+		bool ParseNextKeyAndCompare(const Slice& target, int* target_compare)
+		{
+			return ParseNextKeyInternal(&target, target_compare);
 		}
 
 	public:
@@ -191,6 +258,7 @@ namespace prism
 		    , restart_index_(num_restarts_)
 		{
 			assert(num_restarts > 0);
+			key_.reserve(kInitialKeyBufferReserve);
 		}
 
 		bool Valid() const override { return current_ < restarts_; } // valid in [0, restarts_)
@@ -297,11 +365,12 @@ namespace prism
 			// Linear search (within restart block) for first key >= target
 			while (true)
 			{
-				if (!ParseNextKey())
+				int target_compare = 0;
+				if (!ParseNextKeyAndCompare(target, &target_compare))
 				{
 					return;
 				}
-				if (CompareMaybeBytewise(key_, target) >= 0)
+				if (target_compare >= 0)
 				{
 					return;
 				}

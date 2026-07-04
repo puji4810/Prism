@@ -14,12 +14,6 @@ namespace prism
 		constexpr std::size_t kLazyFallbackPriority = (std::numeric_limits<std::size_t>::max)();
 		constexpr auto kStealBackoff = std::chrono::microseconds(100);
 
-		// Thread-local state: set by each WorkThread at the start of Consume(), cleared on exit.
-		// Used by CaptureContext() to determine whether the calling thread belongs to a specific
-		// ThreadPoolScheduler instance, and which worker index it is.
-		thread_local const ThreadPoolScheduler* t_current_scheduler = nullptr;
-		thread_local std::size_t t_current_worker_index = 0;
-
 		std::size_t DefaultThreadCount(std::size_t requested)
 		{
 			const std::size_t hw = std::max<std::size_t>(std::thread::hardware_concurrency(), 1);
@@ -37,20 +31,21 @@ namespace prism
 		}
 	}
 
+	thread_local const ThreadPoolScheduler* ThreadPoolScheduler::current_scheduler_ = nullptr;
+	thread_local std::size_t ThreadPoolScheduler::current_worker_index_ = 0;
+
 	ThreadPoolScheduler::Context ThreadPoolScheduler::CaptureContext() const
 	{
-		if (t_current_scheduler == this)
-			return Context(this, t_current_worker_index);
+		if (current_scheduler_ == this)
+			return Context(this, current_worker_index_);
 		return Context{ };
 	}
 
 	ThreadPoolScheduler::ThreadPoolScheduler(std::size_t num_threads)
 	    : work_threads_(DefaultThreadCount(num_threads))
 	{
-		pending_list_.reserve(work_threads_.size());
 		for (std::size_t i = 0; i < work_threads_.size(); ++i)
 		{
-			pending_list_.push_back(&work_threads_[i]);
 			work_threads_[i].Start(*this, i);
 		}
 
@@ -91,8 +86,8 @@ namespace prism
 		// creating new entries that must also be drained.
 		// Mark this (destructor) thread as belonging to the scheduler so that
 		// re-entrant Submit* calls from within drained jobs satisfy the debug guard.
-		const auto* prev_scheduler = t_current_scheduler;
-		t_current_scheduler = this;
+		const auto* prev_scheduler = current_scheduler_;
+		current_scheduler_ = this;
 		bool work_remains = true;
 		while (work_remains)
 		{
@@ -102,7 +97,7 @@ namespace prism
 			DrainPriorityQueueToEmpty(work_remains);
 			DrainWorkerLocalQueues(work_remains);
 		}
-		t_current_scheduler = prev_scheduler;
+		current_scheduler_ = prev_scheduler;
 	}
 
 	bool ThreadPoolScheduler::IsExitRequested() const noexcept { return exit_flag_.load(std::memory_order_acquire); }
@@ -128,7 +123,7 @@ namespace prism
 
 	bool ThreadPoolScheduler::ShouldAcceptSubmitDuringShutdown() const noexcept
 	{
-		return !IsExitRequested() || (t_current_scheduler == this);
+		return !IsExitRequested() || (current_scheduler_ == this);
 	}
 
 	bool ThreadPoolScheduler::ShouldPromoteLazyTask(const LazyTask& task, std::chrono::steady_clock::time_point now) noexcept
@@ -152,64 +147,17 @@ namespace prism
 
 	void ThreadPoolScheduler::Submit(Job job, std::size_t priority)
 	{
-		assert(ShouldAcceptSubmitDuringShutdown()); // POLICY: only worker re-entrant submits after exit
-
-		if (ShouldUseFastPath(priority)) // POLICY: route to worker-local fast path or priority queue?
-		{
-			if (t_current_scheduler == this)
-			{
-				if (TryPushToWorker(std::move(job), t_current_worker_index, false, true))
-				{
-					RuntimeMetrics::Instance().foreground_fastpath_submits.fetch_add(1, std::memory_order_relaxed);
-					return;
-				}
-			}
-
-			const auto worker_index = ChooseSubmissionWorker();
-			if (TryPushToWorker(std::move(job), worker_index, false, true))
-			{
-				RuntimeMetrics::Instance().foreground_fastpath_submits.fetch_add(1, std::memory_order_relaxed);
-				return;
-			}
-		}
-
-		// POLICY: fast path unavailable → fall back to priority-queue dispatch.
-		RuntimeMetrics::Instance().foreground_fallback_submits.fetch_add(1, std::memory_order_relaxed);
-		PushToPriorityQueue(std::move(job), priority, /*wake=*/true);
+		SubmitJob(std::move(job), priority);
 	}
 
 	void ThreadPoolScheduler::SubmitAfter(std::chrono::steady_clock::time_point deadline, Job job)
 	{
-		assert(ShouldAcceptSubmitDuringShutdown()); // POLICY: only worker re-entrant submits after exit
-
-		{
-			std::lock_guard lock(lazy_mutex_);
-			lazy_queue_.push(LazyTask{ std::move(job), deadline });
-		}
-		lazy_waiter_.release();
+		SubmitAfterJob(deadline, std::move(job));
 	}
 
 	void ThreadPoolScheduler::SubmitIn(Context ctx, Job job)
 	{
-		assert(ShouldAcceptSubmitDuringShutdown()); // POLICY: only worker re-entrant submits after exit
-
-		// Only honor affinity if the context belongs to this scheduler instance.
-		if (ctx.scheduler_ == this)
-		{
-			auto& t = work_threads_[ctx.worker_index_];
-			t.Push(std::move(job));
-			return;
-		}
-
-		// Invalid context or foreign scheduler: fall back to normal Submit.
-		// Debug-only mismatch trace: helps diagnose misrouted affinity submissions.
-#ifndef NDEBUG
-		std::fprintf(stderr,
-		    "[prism::scheduler] SubmitIn context mismatch: this=%p ctx.scheduler_=%p ctx.worker_index_=%zu."
-		    " Falling back to Submit().\n",
-		    static_cast<const void*>(this), static_cast<const void*>(ctx.scheduler_), ctx.worker_index_);
-#endif
-		Submit(std::move(job));
+		SubmitInJob(ctx, std::move(job));
 	}
 
 	bool ThreadPoolScheduler::TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable)
@@ -255,30 +203,6 @@ namespace prism
 			return 0;
 		}
 		return submit_cursor_.fetch_add(1, std::memory_order_relaxed) % worker_count;
-	}
-
-	ThreadPoolScheduler::WorkThread* ThreadPoolScheduler::TryReserveIdleWorker()
-	{
-		std::lock_guard lock(pending_mutex_);
-		if (pending_list_.empty())
-		{
-			return nullptr;
-		}
-
-		auto* worker = pending_list_.back();
-		pending_list_.pop_back();
-		return worker;
-	}
-
-	void ThreadPoolScheduler::ReturnReservedIdleWorker(WorkThread* worker)
-	{
-		if (worker == nullptr)
-		{
-			return;
-		}
-
-		std::lock_guard lock(pending_mutex_);
-		pending_list_.push_back(worker);
 	}
 
 	void ThreadPoolScheduler::DispatchExpiredTask(LazyTask&& task)
@@ -469,7 +393,7 @@ namespace prism
 	{
 		{
 			std::lock_guard lock(mutex_);
-			queue_.push_back(QueuedJob{ std::move(job), false, true });
+			queue_.push_back(QueuedJob{ std::move(job), true });
 			load_.fetch_add(1, std::memory_order_relaxed);
 		}
 		semaphore_.release();
@@ -479,7 +403,7 @@ namespace prism
 	{
 		{
 			std::lock_guard lock(mutex_);
-			queue_.push_back(QueuedJob{ std::move(job), false, stealable });
+			queue_.push_back(QueuedJob{ std::move(job), stealable });
 			load_.fetch_add(1, std::memory_order_relaxed);
 		}
 		semaphore_.release();
@@ -489,7 +413,7 @@ namespace prism
 	{
 		{
 			std::lock_guard lock(mutex_);
-			queue_.push_back(QueuedJob{ std::move(job), true, true });
+			queue_.push_back(QueuedJob{ std::move(job), true });
 			load_.fetch_add(1, std::memory_order_relaxed);
 		}
 		semaphore_.release();
@@ -564,7 +488,7 @@ namespace prism
 		return true;
 	}
 
-	bool ThreadPoolScheduler::WorkThread::TryDequeueJob(QueuedJob& out, bool& queue_empty)
+	bool ThreadPoolScheduler::WorkThread::TryDequeueJob(QueuedJob& out)
 	{
 		std::lock_guard lock(mutex_);
 		if (queue_.empty())
@@ -572,21 +496,10 @@ namespace prism
 		out = std::move(queue_.front());
 		queue_.pop_front();
 		load_.fetch_sub(1, std::memory_order_relaxed);
-		queue_empty = queue_.empty();
 		return true;
 	}
 
-	void ThreadPoolScheduler::WorkThread::RegisterAsIdleWorker(ThreadPoolScheduler& scheduler)
-	{
-		{
-			std::lock_guard lock(scheduler.pending_mutex_);
-			scheduler.pending_list_.push_back(this);
-		}
-		scheduler.priority_waiter_.release();
-	}
-
-	bool ThreadPoolScheduler::WorkThread::HandleJobCompletion(
-	    QueuedJob& job, bool queue_empty_after, ThreadPoolScheduler& scheduler) noexcept
+	bool ThreadPoolScheduler::WorkThread::HandleJobCompletion(QueuedJob& job, ThreadPoolScheduler& scheduler) noexcept
 	{
 		try
 		{
@@ -606,21 +519,6 @@ namespace prism
 			RuntimeMetrics::Instance().worker_local_jobs_completed.fetch_add(1, std::memory_order_relaxed);
 		}
 
-		// Only dispatched jobs participate in the idle-worker registry.
-		// Fast-path affinity/local submissions stay on the worker queue and do not need
-		// to bounce through pending_list_.
-		bool should_reregister = job.dispatched && queue_empty_after;
-		if (job.dispatched && !should_reregister)
-		{
-			std::lock_guard lock(mutex_);
-			should_reregister = queue_.empty();
-		}
-
-		if (should_reregister)
-		{
-			RegisterAsIdleWorker(scheduler); // MECHANICS
-		}
-
 		if (scheduler.IsExitRequested())
 		{
 			std::lock_guard lock(mutex_);
@@ -632,8 +530,8 @@ namespace prism
 	void ThreadPoolScheduler::WorkThread::Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept
 	{
 		// Register this thread with the scheduler instance so CaptureContext() can validate.
-		t_current_scheduler = &scheduler;
-		t_current_worker_index = worker_index;
+		current_scheduler_ = &scheduler;
+		current_worker_index_ = worker_index;
 		std::uint64_t rng_state = (static_cast<std::uint64_t>(worker_index) + 1) * 0x9e3779b97f4a7c15ull;
 
 		while (true)
@@ -643,11 +541,10 @@ namespace prism
 			while (true)
 			{
 				QueuedJob queued;
-				bool queue_empty_after = false;
 
-				if (TryDequeueJob(queued, queue_empty_after))
+				if (TryDequeueJob(queued))
 				{
-					if (HandleJobCompletion(queued, queue_empty_after, scheduler))
+					if (HandleJobCompletion(queued, scheduler))
 						break;
 					continue;
 				}
@@ -679,8 +576,18 @@ namespace prism
 		}
 
 		// Clear thread-local state when worker exits.
-		t_current_scheduler = nullptr;
-		t_current_worker_index = 0;
+		current_scheduler_ = nullptr;
+		current_worker_index_ = 0;
+	}
+
+	void ThreadPoolScheduler::RecordForegroundFastPathSubmit() noexcept
+	{
+		RuntimeMetrics::Instance().foreground_fastpath_submits.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	void ThreadPoolScheduler::RecordForegroundFallbackSubmit() noexcept
+	{
+		RuntimeMetrics::Instance().foreground_fallback_submits.fetch_add(1, std::memory_order_relaxed);
 	}
 
 }

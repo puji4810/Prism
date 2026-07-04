@@ -190,7 +190,7 @@ namespace prism::bench
 				for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
 				{
 					const bool do_read = (cfg.read_ratio > 0) && (static_cast<int>(rng() % 100) < cfg.read_ratio);
-					const uint64_t begin = NowNs();
+					const uint64_t begin = cfg.no_latency ? 0 : NowNs();
 					if (do_read)
 					{
 						auto r = db.Get(ReadOptions(), Slice(keys[static_cast<std::size_t>(t)][i]));
@@ -207,9 +207,9 @@ namespace prism::bench
 							local_sink += 1;
 						}
 					}
-					const uint64_t end = NowNs();
 					if (!cfg.no_latency)
 					{
+						const uint64_t end = NowNs();
 						local_lat.push_back(end - begin);
 					}
 				}
@@ -289,15 +289,15 @@ namespace prism::bench
 
 				for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
 				{
-					const uint64_t begin = NowNs();
+					const uint64_t begin = cfg.no_latency ? 0 : NowNs();
 					auto r = db.Get(ReadOptions(), Slice(keys[static_cast<std::size_t>(t)][i]));
 					if (r.has_value())
 					{
 						local_sink += r.value().size();
 					}
-					const uint64_t end = NowNs();
 					if (!cfg.no_latency)
 					{
+						const uint64_t end = NowNs();
 						local_lat.push_back(end - begin);
 					}
 				}
@@ -383,15 +383,15 @@ namespace prism::bench
 
 				for (std::size_t i = 0; i < cfg.ops_per_client; ++i)
 				{
-					const uint64_t begin = NowNs();
+					const uint64_t begin = cfg.no_latency ? 0 : NowNs();
 					Status s = db.Put(write_opts, Slice(keys[static_cast<std::size_t>(t)][i]), Slice(value));
 					if (s.ok())
 					{
 						local_sink += 1;
 					}
-					const uint64_t end = NowNs();
 					if (!cfg.no_latency)
 					{
+						const uint64_t end = NowNs();
 						local_lat.push_back(end - begin);
 					}
 				}
@@ -444,13 +444,60 @@ namespace prism::bench
 			}
 		}
 
-		void RecordInflightEnter(std::atomic<std::size_t>& inflight, std::atomic<std::size_t>& max_inflight)
+		bool TrackInflightStats(const Config& cfg) { return !cfg.no_latency; }
+
+		void RecordInflightEnter(
+		    bool enabled, std::atomic<std::size_t>& inflight, std::atomic<std::size_t>& max_inflight)
 		{
+			if (!enabled)
+			{
+				return;
+			}
 			const std::size_t current = inflight.fetch_add(1, std::memory_order_relaxed) + 1;
 			UpdateMax(max_inflight, current);
 		}
 
-		void RecordInflightLeave(std::atomic<std::size_t>& inflight) { inflight.fetch_sub(1, std::memory_order_relaxed); }
+		void RecordInflightLeave(bool enabled, std::atomic<std::size_t>& inflight)
+		{
+			if (enabled)
+			{
+				inflight.fetch_sub(1, std::memory_order_relaxed);
+			}
+		}
+
+		std::size_t ConfiguredClientInflight(const Config& cfg, int effective_inflight)
+		{
+			return std::min(static_cast<std::size_t>(effective_inflight), cfg.ops_per_client);
+		}
+
+		std::size_t ConfiguredGlobalInflight(const Config& cfg, int effective_inflight)
+		{
+			return static_cast<std::size_t>(cfg.clients) * ConfiguredClientInflight(cfg, effective_inflight);
+		}
+
+		void FinishInflightStats(Stats& out, const Config& cfg, int effective_inflight,
+		    const std::atomic<std::size_t>& global_max_inflight, const std::atomic<std::size_t>* client_max_inflight)
+		{
+			if (!TrackInflightStats(cfg))
+			{
+				out.max_inflight_observed = ConfiguredGlobalInflight(cfg, effective_inflight);
+				out.max_client_inflight = ConfiguredClientInflight(cfg, effective_inflight);
+				return;
+			}
+
+			out.max_inflight_observed = global_max_inflight.load(std::memory_order_relaxed);
+
+			std::size_t max_client_inflight = 0;
+			for (int c = 0; c < cfg.clients; ++c)
+			{
+				const std::size_t client_max = client_max_inflight[static_cast<std::size_t>(c)].load(std::memory_order_relaxed);
+				if (client_max > max_client_inflight)
+				{
+					max_client_inflight = client_max;
+				}
+			}
+			out.max_client_inflight = max_client_inflight;
+		}
 
 		std::size_t SlotOpCount(std::size_t total_ops, int num_slots, int slot_id)
 		{
@@ -483,15 +530,16 @@ namespace prism::bench
 			{
 				lat.reserve(op_count);
 			}
+			const bool track_inflight = TrackInflightStats(cfg);
 
 			for (std::size_t op = 0; op < op_count; ++op)
 			{
 				const std::size_t i = start_index + op;
 				const bool do_read = (cfg.read_ratio > 0) && (static_cast<int>(rng() % 100) < cfg.read_ratio);
-				const uint64_t begin = NowNs();
+				const uint64_t begin = cfg.no_latency ? 0 : NowNs();
 
-				RecordInflightEnter(global_inflight, global_max_inflight);
-				RecordInflightEnter(client_inflight, client_max_inflight);
+				RecordInflightEnter(track_inflight, global_inflight, global_max_inflight);
+				RecordInflightEnter(track_inflight, client_inflight, client_max_inflight);
 
 				if (do_read)
 				{
@@ -503,12 +551,12 @@ namespace prism::bench
 					(void)co_await db.PutAsync(WriteOptions(), client_keys[i], *value);
 				}
 
-				RecordInflightLeave(global_inflight);
-				RecordInflightLeave(client_inflight);
+				RecordInflightLeave(track_inflight, global_inflight);
+				RecordInflightLeave(track_inflight, client_inflight);
 
-				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
 				{
+					const uint64_t end = NowNs();
 					lat.push_back(end - begin);
 				}
 			}
@@ -536,23 +584,24 @@ namespace prism::bench
 			{
 				lat.reserve(op_count);
 			}
+			const bool track_inflight = TrackInflightStats(cfg);
 
 			for (std::size_t op = 0; op < op_count; ++op)
 			{
 				const std::size_t i = start_index + op;
-				const uint64_t begin = NowNs();
+				const uint64_t begin = cfg.no_latency ? 0 : NowNs();
 
-				RecordInflightEnter(global_inflight, global_max_inflight);
-				RecordInflightEnter(client_inflight, client_max_inflight);
+				RecordInflightEnter(track_inflight, global_inflight, global_max_inflight);
+				RecordInflightEnter(track_inflight, client_inflight, client_max_inflight);
 
 				(void)co_await db.GetAsync(ReadOptions(), client_keys[i]);
 
-				RecordInflightLeave(global_inflight);
-				RecordInflightLeave(client_inflight);
+				RecordInflightLeave(track_inflight, global_inflight);
+				RecordInflightLeave(track_inflight, client_inflight);
 
-				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
 				{
+					const uint64_t end = NowNs();
 					lat.push_back(end - begin);
 				}
 			}
@@ -617,18 +666,7 @@ namespace prism::bench
 		}
 
 		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		out.max_inflight_observed = global_max_inflight.load(std::memory_order_relaxed);
-
-		std::size_t max_client_inflight = 0;
-		for (int c = 0; c < cfg.clients; ++c)
-		{
-			const std::size_t client_max = client_max_inflight[static_cast<std::size_t>(c)].load(std::memory_order_relaxed);
-			if (client_max > max_client_inflight)
-			{
-				max_client_inflight = client_max;
-			}
-		}
-		out.max_client_inflight = max_client_inflight;
+		FinishInflightStats(out, cfg, effective_inflight, global_max_inflight, client_max_inflight.get());
 
 		out.write_sync = 0;
 		if (!cfg.no_latency)
@@ -690,18 +728,7 @@ namespace prism::bench
 		}
 
 		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		out.max_inflight_observed = global_max_inflight.load(std::memory_order_relaxed);
-
-		std::size_t max_client_inflight = 0;
-		for (int c = 0; c < cfg.clients; ++c)
-		{
-			const std::size_t client_max = client_max_inflight[static_cast<std::size_t>(c)].load(std::memory_order_relaxed);
-			if (client_max > max_client_inflight)
-			{
-				max_client_inflight = client_max;
-			}
-		}
-		out.max_client_inflight = max_client_inflight;
+		FinishInflightStats(out, cfg, effective_inflight, global_max_inflight, client_max_inflight.get());
 
 		out.write_sync = 0;
 		if (!cfg.no_latency)
@@ -730,6 +757,7 @@ namespace prism::bench
 			{
 				lat.reserve(op_count);
 			}
+			const bool track_inflight = TrackInflightStats(cfg);
 
 			// Use fill_cache=false for SST read pipeline benchmark
 			ReadOptions read_opts;
@@ -738,19 +766,19 @@ namespace prism::bench
 			for (std::size_t op = 0; op < op_count; ++op)
 			{
 				const std::size_t i = start_index + op;
-				const uint64_t begin = NowNs();
+				const uint64_t begin = cfg.no_latency ? 0 : NowNs();
 
-				RecordInflightEnter(global_inflight, global_max_inflight);
-				RecordInflightEnter(client_inflight, client_max_inflight);
+				RecordInflightEnter(track_inflight, global_inflight, global_max_inflight);
+				RecordInflightEnter(track_inflight, client_inflight, client_max_inflight);
 
 				(void)co_await db.GetAsync(read_opts, client_keys[i]);
 
-				RecordInflightLeave(global_inflight);
-				RecordInflightLeave(client_inflight);
+				RecordInflightLeave(track_inflight, global_inflight);
+				RecordInflightLeave(track_inflight, client_inflight);
 
-				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
 				{
+					const uint64_t end = NowNs();
 					lat.push_back(end - begin);
 				}
 			}
@@ -811,18 +839,7 @@ namespace prism::bench
 		}
 
 		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		out.max_inflight_observed = global_max_inflight.load(std::memory_order_relaxed);
-
-		std::size_t max_client_inflight = 0;
-		for (int c = 0; c < cfg.clients; ++c)
-		{
-			const std::size_t client_max = client_max_inflight[static_cast<std::size_t>(c)].load(std::memory_order_relaxed);
-			if (client_max > max_client_inflight)
-			{
-				max_client_inflight = client_max;
-			}
-		}
-		out.max_client_inflight = max_client_inflight;
+		FinishInflightStats(out, cfg, effective_inflight, global_max_inflight, client_max_inflight.get());
 
 		out.write_sync = 0;
 		if (!cfg.no_latency)
@@ -851,6 +868,7 @@ namespace prism::bench
 			{
 				lat.reserve(op_count);
 			}
+			const bool track_inflight = TrackInflightStats(cfg);
 
 			ReadOptions read_opts;
 			read_opts.fill_cache = false;
@@ -858,19 +876,19 @@ namespace prism::bench
 			for (std::size_t op = 0; op < op_count; ++op)
 			{
 				const std::size_t i = start_index + op;
-				const uint64_t begin = NowNs();
+				const uint64_t begin = cfg.no_latency ? 0 : NowNs();
 
-				RecordInflightEnter(global_inflight, global_max_inflight);
-				RecordInflightEnter(client_inflight, client_max_inflight);
+				RecordInflightEnter(track_inflight, global_inflight, global_max_inflight);
+				RecordInflightEnter(track_inflight, client_inflight, client_max_inflight);
 
 				(void)co_await db.GetAsync(read_opts, client_keys[i]);
 
-				RecordInflightLeave(global_inflight);
-				RecordInflightLeave(client_inflight);
+				RecordInflightLeave(track_inflight, global_inflight);
+				RecordInflightLeave(track_inflight, client_inflight);
 
-				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
 				{
+					const uint64_t end = NowNs();
 					lat.push_back(end - begin);
 				}
 			}
@@ -897,6 +915,7 @@ namespace prism::bench
 			{
 				lat.reserve(op_count);
 			}
+			const bool track_inflight = TrackInflightStats(cfg);
 
 			WriteOptions write_opts;
 			write_opts.sync = false;
@@ -904,10 +923,10 @@ namespace prism::bench
 			for (std::size_t op = 0; op < op_count; ++op)
 			{
 				const std::size_t i = start_index + op;
-				const uint64_t begin = NowNs();
+				const uint64_t begin = cfg.no_latency ? 0 : NowNs();
 
-				RecordInflightEnter(global_inflight, global_max_inflight);
-				RecordInflightEnter(client_inflight, client_max_inflight);
+				RecordInflightEnter(track_inflight, global_inflight, global_max_inflight);
+				RecordInflightEnter(track_inflight, client_inflight, client_max_inflight);
 
 				char key_buf[64];
 				const int n = std::snprintf(key_buf, sizeof(key_buf), "cw_%d_%zu", client_id, i);
@@ -915,12 +934,12 @@ namespace prism::bench
 
 				(void)co_await db.PutAsync(write_opts, key, value);
 
-				RecordInflightLeave(global_inflight);
-				RecordInflightLeave(client_inflight);
+				RecordInflightLeave(track_inflight, global_inflight);
+				RecordInflightLeave(track_inflight, client_inflight);
 
-				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
 				{
+					const uint64_t end = NowNs();
 					lat.push_back(end - begin);
 				}
 			}
@@ -1000,18 +1019,7 @@ namespace prism::bench
 		}
 
 		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		out.max_inflight_observed = global_max_inflight.load(std::memory_order_relaxed);
-
-		std::size_t max_client_inflight = 0;
-		for (int c = 0; c < cfg.clients; ++c)
-		{
-			const std::size_t client_max = client_max_inflight[static_cast<std::size_t>(c)].load(std::memory_order_relaxed);
-			if (client_max > max_client_inflight)
-			{
-				max_client_inflight = client_max;
-			}
-		}
-		out.max_client_inflight = max_client_inflight;
+		FinishInflightStats(out, cfg, effective_inflight, global_max_inflight, client_max_inflight.get());
 
 		out.write_sync = 0;
 		if (!cfg.no_latency)
@@ -1041,6 +1049,7 @@ namespace prism::bench
 			{
 				lat.reserve(op_count);
 			}
+			const bool track_inflight = TrackInflightStats(cfg);
 
 			WriteOptions write_opts;
 			write_opts.sync = true;
@@ -1048,19 +1057,19 @@ namespace prism::bench
 			for (std::size_t op = 0; op < op_count; ++op)
 			{
 				const std::size_t i = start_index + op;
-				const uint64_t begin = NowNs();
+				const uint64_t begin = cfg.no_latency ? 0 : NowNs();
 
-				RecordInflightEnter(global_inflight, global_max_inflight);
-				RecordInflightEnter(client_inflight, client_max_inflight);
+				RecordInflightEnter(track_inflight, global_inflight, global_max_inflight);
+				RecordInflightEnter(track_inflight, client_inflight, client_max_inflight);
 
 				(void)co_await db.PutAsync(write_opts, client_keys[i], value);
 
-				RecordInflightLeave(global_inflight);
-				RecordInflightLeave(client_inflight);
+				RecordInflightLeave(track_inflight, global_inflight);
+				RecordInflightLeave(track_inflight, client_inflight);
 
-				const uint64_t end = NowNs();
 				if (!cfg.no_latency)
 				{
+					const uint64_t end = NowNs();
 					lat.push_back(end - begin);
 				}
 			}
@@ -1122,18 +1131,7 @@ namespace prism::bench
 		}
 
 		out.seconds = static_cast<double>(end_ns - begin_ns) / 1e9;
-		out.max_inflight_observed = global_max_inflight.load(std::memory_order_relaxed);
-
-		std::size_t max_client_inflight = 0;
-		for (int c = 0; c < cfg.clients; ++c)
-		{
-			const std::size_t client_max = client_max_inflight[static_cast<std::size_t>(c)].load(std::memory_order_relaxed);
-			if (client_max > max_client_inflight)
-			{
-				max_client_inflight = client_max;
-			}
-		}
-		out.max_client_inflight = max_client_inflight;
+		FinishInflightStats(out, cfg, effective_inflight, global_max_inflight, client_max_inflight.get());
 
 		out.write_sync = 1;
 		if (!cfg.no_latency)
@@ -1253,6 +1251,7 @@ namespace prism::bench
 		for (int i = 1; i < argc; ++i)
 		{
 			std::string_view arg(argv[i]);
+			bool handled = false;
 
 			if (arg == "--help")
 			{
@@ -1288,66 +1287,75 @@ namespace prism::bench
 			auto parse_int = [&](std::string_view key, int& out) {
 				if (!arg.starts_with(key))
 				{
-					return;
+					return false;
 				}
 				out = std::stoi(std::string(arg.substr(key.size())));
+				return true;
 			};
 
 			auto parse_size = [&](std::string_view key, std::size_t& out) {
 				if (!arg.starts_with(key))
 				{
-					return;
+					return false;
 				}
 				out = static_cast<std::size_t>(std::stoull(std::string(arg.substr(key.size()))));
+				return true;
 			};
 
-			parse_int("--clients=", cfg.clients);
-			parse_int("--workers=", cfg.workers);
-			parse_int("--rounds=", cfg.rounds);
-			parse_size("--ops=", cfg.ops_per_client);
-			parse_size("--value_size=", cfg.value_size);
-			parse_size("--write_buffer_size=", cfg.write_buffer_size);
-			parse_int("--read_ratio=", cfg.read_ratio);
-			parse_int("--inflight_per_client=", cfg.inflight_per_client);
-			parse_int("--warmup_rounds=", cfg.warmup_rounds);
-			parse_int("--prefill=", cfg.prefill);
+			handled = parse_int("--clients=", cfg.clients) || handled;
+			handled = parse_int("--workers=", cfg.workers) || handled;
+			handled = parse_int("--rounds=", cfg.rounds) || handled;
+			handled = parse_size("--ops=", cfg.ops_per_client) || handled;
+			handled = parse_size("--value_size=", cfg.value_size) || handled;
+			handled = parse_size("--write_buffer_size=", cfg.write_buffer_size) || handled;
+			handled = parse_int("--read_ratio=", cfg.read_ratio) || handled;
+			handled = parse_int("--inflight_per_client=", cfg.inflight_per_client) || handled;
+			handled = parse_int("--warmup_rounds=", cfg.warmup_rounds) || handled;
+			handled = parse_int("--prefill=", cfg.prefill) || handled;
 
 			if (arg == "--profile-pause-prefill")
 			{
 				cfg.profile_pause_prefill = true;
+				handled = true;
 			}
 
 			if (arg == "--no_latency")
 			{
 				cfg.no_latency = true;
+				handled = true;
 			}
 
 			if (arg.starts_with("--keep_db="))
 			{
 				int tmp = 0;
-				parse_int("--keep_db=", tmp);
+				(void)parse_int("--keep_db=", tmp);
 				cfg.keep_db = (tmp != 0);
+				handled = true;
 			}
 
 			if (arg.starts_with("--db_dir="))
 			{
 				cfg.db_dir = std::string(arg.substr(9));
+				handled = true;
 			}
 
 			if (arg == "--sync")
 			{
 				cfg.do_sync = true;
 				cfg.do_async = false;
+				handled = true;
 			}
 			if (arg == "--async")
 			{
 				cfg.do_sync = false;
 				cfg.do_async = true;
+				handled = true;
 			}
 
 			if (arg.starts_with("--run="))
 			{
 				std::string_view run_val = arg.substr(6);
+				handled = true;
 				if (run_val == "sync")
 				{
 					cfg.do_sync = true;
@@ -1375,26 +1383,31 @@ namespace prism::bench
 			{
 				cfg.mode = BenchMode::kMixed;
 				bench_flag_handled = true;
+				handled = true;
 			}
 			if (arg == "--bench=disk_read")
 			{
 				cfg.mode = BenchMode::kDiskRead;
 				bench_flag_handled = true;
+				handled = true;
 			}
 			if (arg == "--bench=sst_read_pipeline")
 			{
 				cfg.mode = BenchMode::kSstReadPipeline;
 				bench_flag_handled = true;
+				handled = true;
 			}
 			if (arg == "--bench=durability_write")
 			{
 				cfg.mode = BenchMode::kDurabilityWrite;
 				bench_flag_handled = true;
+				handled = true;
 			}
 			if (arg == "--bench=compaction_overlap")
 			{
 				cfg.mode = BenchMode::kCompactionOverlap;
 				bench_flag_handled = true;
+				handled = true;
 			}
 
 			if (arg.starts_with("--bench=") && !bench_flag_handled)
@@ -1412,26 +1425,31 @@ namespace prism::bench
 			{
 				cfg.phase = PhaseMode::kFull;
 				phase_flag_handled = true;
+				handled = true;
 			}
 			if (arg == "--phase=prefill-only")
 			{
 				cfg.phase = PhaseMode::kPrefillOnly;
 				phase_flag_handled = true;
+				handled = true;
 			}
 			if (arg == "--phase=warmup-only")
 			{
 				cfg.phase = PhaseMode::kWarmupOnly;
 				phase_flag_handled = true;
+				handled = true;
 			}
 			if (arg == "--phase=steady-state")
 			{
 				cfg.phase = PhaseMode::kSteadyState;
 				phase_flag_handled = true;
+				handled = true;
 			}
 			if (arg == "--phase=compaction-overlap-only")
 			{
 				cfg.phase = PhaseMode::kCompactionOverlapOnly;
 				phase_flag_handled = true;
+				handled = true;
 			}
 
 			if (arg.starts_with("--phase=") && !phase_flag_handled)
@@ -1441,6 +1459,12 @@ namespace prism::bench
 				    "unknown --phase value: %s; allowed: full|prefill-only|warmup-only|"
 				    "steady-state|compaction-overlap-only\n",
 				    std::string(phase_val).c_str());
+				exit(1);
+			}
+
+			if (!handled)
+			{
+				std::fprintf(stderr, "unknown argument: %s\n", std::string(arg).c_str());
 				exit(1);
 			}
 		}

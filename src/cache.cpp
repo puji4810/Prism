@@ -3,6 +3,7 @@
 #include "slice.h"
 #include "port/thread_annotations.h"
 #include "hash.h"
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -170,7 +171,7 @@ namespace prism
 		}
 	};
 
-	class LRUCache
+	class alignas(64) LRUCache
 	{
 	public:
 		LRUCache();
@@ -364,15 +365,14 @@ namespace prism
 		}
 	}
 
-	static constexpr int kNumShardBits = 4;
+	static constexpr int kNumShardBits = 6;
 	static constexpr int kNumShards = 1 << kNumShardBits;
 
 	class ShardedLRUCache: public Cache
 	{
 	private:
 		LRUCache shard_[kNumShards];
-		std::mutex id_mutex_;
-		uint64_t last_id_;
+		std::atomic<uint64_t> last_id_;
 
 		static inline uint32_t HashSlice(const Slice& s) { return Hash(s.data(), s.size(), 0); }
 
@@ -415,8 +415,7 @@ namespace prism
 		void* Value(Handle* handle) override { return reinterpret_cast<LRUHandle*>(handle)->value; }
 		uint64_t NewId() override
 		{
-			std::lock_guard<std::mutex> guard(id_mutex_);
-			return ++(last_id_);
+			return last_id_.fetch_add(1, std::memory_order_relaxed) + 1;
 		}
 		void Prune() override
 		{

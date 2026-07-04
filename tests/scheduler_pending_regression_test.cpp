@@ -138,8 +138,8 @@ TEST(SchedulerPendingRegressionTest, AffinityBeforeDispatchedNoZombie)
 // TEST 2: High-volume interleaved SubmitIn + Submit stress
 //
 // Exercises many concurrent affinity + dispatched job submissions and asserts
-// all complete. With the old code, this would eventually hit the zombie state
-// under load (pending_list_ drains to zero with work still queued).
+// all complete. With the old idle-registry dispatcher path, this would
+// eventually hit the zombie state with work still queued.
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, HighVolumeAffinityAndDispatchedMix)
 {
@@ -174,11 +174,10 @@ TEST(SchedulerPendingRegressionTest, HighVolumeAffinityAndDispatchedMix)
 }
 
 // ---------------------------------------------------------------------------
-// TEST 3: Verify worker re-registers after dispatched job with empty queue
+// TEST 3: Verify worker accepts more work after dispatched job with empty queue
 //
 // Forces a scenario where a dispatched job runs with an empty queue after pop,
-// confirms the worker re-enters pending_list_ (evidenced by being able to
-// receive and execute a subsequent Submit).
+// then confirms a subsequent Submit wakes the worker and runs.
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, WorkerReregistersAfterDispatchedJob)
 {
@@ -186,23 +185,22 @@ TEST(SchedulerPendingRegressionTest, WorkerReregistersAfterDispatchedJob)
 
 	std::atomic<int> step{ 0 };
 
-	// First job: dispatched. After it runs, worker must re-register.
+	// First job: dispatched. After it runs, the worker must accept new work.
 	scheduler.Submit([&step]() { step.fetch_add(1, std::memory_order_release); });
 
 	ASSERT_TRUE(WaitFor(step, 1)) << "first dispatched job did not run";
 
-	// If worker re-registered, it should now accept a second Submit.
+	// The worker should now accept a second Submit.
 	scheduler.Submit([&step]() { step.fetch_add(1, std::memory_order_release); });
 
-	ASSERT_TRUE(WaitFor(step, 2)) << "worker did not re-register after dispatched job (zombie)";
+	ASSERT_TRUE(WaitFor(step, 2)) << "worker did not accept work after dispatched job";
 }
 
 // ---------------------------------------------------------------------------
-// TEST 4: Worker re-registers after draining a stolen batch to empty
+// TEST 4: Worker stays dispatchable after draining a stolen batch to empty
 //
 // Forces one worker to steal multiple jobs from another, then verifies that
-// once the stolen batch drains to empty the thief re-enters pending_list_ and
-// the priority dispatcher can still place queued fallback work.
+// once the stolen batch drains to empty, queued priority work still runs.
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorityDispatch)
 {
@@ -281,9 +279,8 @@ TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorit
 // ---------------------------------------------------------------------------
 // TEST 5: Affinity-only jobs must NOT trigger re-registration
 //
-// Submits only affinity jobs to a pinned worker. The worker must NOT
-// end up double-registered in pending_list_ (which would let the dispatcher
-// double-dispatch and eventually corrupt the counter).
+// Submits only affinity jobs to a pinned worker. The scheduler must not lose
+// progress or corrupt counters while those worker-local jobs are draining.
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, AffinityJobsDoNotSpuriouslyReregister)
 {
@@ -318,7 +315,7 @@ TEST(SchedulerPendingRegressionTest, AffinityJobsDoNotSpuriouslyReregister)
 //
 // Verify that after all workers go idle (drain to empty), a new submission
 // wakes a worker and makes progress. This characterizes the basic wakeup
-// contract for the pending_list_ / dispatcher pipeline.
+// contract for direct worker-local submission.
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, IdleWorkersWakeOnNewSubmissions)
 {

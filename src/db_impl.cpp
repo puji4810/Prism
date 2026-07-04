@@ -1839,18 +1839,17 @@ namespace prism
 
 	Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
 	{
-		// Phase 1: Acquire a pinned read view lock-free via the published SuperVersion.
+		// Phase 1: Acquire the published read view. SuperVersions are retired only
+		// during DB teardown, so point reads do not need per-call ref/unref traffic.
 		SuperVersion* sv = super_version_.load(std::memory_order_acquire);
 		if (sv == nullptr)
 		{
 			return std::unexpected(Status::Corruption("database not initialized"));
 		}
-		sv->Ref();
 
 		auto snapshot_result = ResolveSnapshotSequence(read_options.snapshot_handle);
 		if (!snapshot_result.has_value())
 		{
-			sv->Unref();
 			return std::unexpected(snapshot_result.error());
 		}
 		SequenceNumber snapshot = snapshot_result.value();
@@ -1942,9 +1941,6 @@ namespace prism
 				}
 			}
 		}
-
-		// Phase 3: Release the read view (pinned via SuperVersion).
-		sv->Unref();
 
 		if (!s.ok())
 		{
