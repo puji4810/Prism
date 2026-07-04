@@ -27,6 +27,10 @@ Prism is a LevelDB-inspired LSM-tree key-value storage engine implemented in mod
   - Multi-queue dispatch architecture
   - Priority and lazy (timer) dispatchers
   - Thread affinity and shutdown handling
+- **[Scheduler Optimization Review](scheduler_optimization.md)** - Scheduler/routing simplification and perf-driven optimization plan
+  - Foreground scheduler topology
+  - Redundant routing layers
+  - Hotspot evidence and next-step priorities
 
 ### Data Formats
 

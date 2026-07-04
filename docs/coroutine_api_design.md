@@ -59,7 +59,7 @@ sequenceDiagram
     participant READ as read_executor
 
     UC->>AOp: co_await
-    AOp->>READ: BlockingScheduler()->Submit(work)
+    AOp->>READ: scheduler.Submit(work)
     activate READ
     READ->>READ: st->work()  (foreground async work)
     READ-->>AOp: result ready
@@ -69,7 +69,7 @@ sequenceDiagram
     UC->>UC: continue after co_await
 ```
 
-**Current rule**: `include/async_op.h` submits only the blocking work through `BlockingScheduler()`. When that work completes, the worker runs the same three-state suspend/resume handshake inline and calls `handle.resume()` directly if the coroutine is already suspended. This keeps async DB work on the read lane without paying a second queue/mutex hop for every continuation. `AcquireRuntimeBundle()` protects shutdown by deferring `RuntimeBundle` deletion to a small cleanup thread if the last reference is released from a bundle-owned worker.
+**Current rule**: `include/async_op.h` submits the work directly to the scheduler it was given. When that work completes, the worker runs the same three-state suspend/resume handshake inline and calls `handle.resume()` directly if the coroutine is already suspended. This keeps async DB work on the foreground CPU pool and file operations on the read lane without paying a second queue/mutex hop for every continuation. `AcquireRuntimeBundle()` protects shutdown by deferring `RuntimeBundle` deletion to a small cleanup thread if the last reference is released from a bundle-owned worker.
 
 ### 1.3 Executor Routing: Who Runs What
 
@@ -163,8 +163,8 @@ Without separation, a long-running compaction would occupy the same execution la
 
 Every `AsyncDB` operation wraps work in an `AsyncOp` that receives the `foreground_db_scheduler`. At `await_suspend()`:
 
-1. `scheduler->BlockingScheduler()` returns the same `foreground_db_scheduler` (itself)
-2. Work is submitted to the shared CPU pool via `ThreadPoolScheduler` worker-local fast paths
+1. `AsyncOp` calls `foreground_db_scheduler.Submit(work)`
+2. The adapter forwards to the shared CPU pool via `ThreadPoolScheduler` worker-local fast paths
 3. The completing worker runs the CAS handshake inline and calls `st->handle.resume()` directly
 
 This keeps `AsyncDB` hot-path operations on the lightweight CPU pool while avoiding a second queue hop. `AsyncEnv` file I/O operations use a separate `read_scheduler` routed to `read_executor` (4 threads), and ordered writable-file operations use `serial_scheduler` routed to `SerialLane` (1 thread). If coroutine teardown releases the final `RuntimeBundle` reference on a bundle-owned worker, `AcquireRuntimeBundle()` defers actual destruction to an external cleanup thread, preventing any executor from self-joining.
