@@ -11,7 +11,9 @@
 #include "two_level_iterator.h"
 #include "status.h"
 #include "iterator.h"
+#include <functional>
 #include <cstdint>
+#include <string>
 
 namespace prism
 {
@@ -20,6 +22,7 @@ namespace prism
 	class Footer;
 	struct Options;
 	class RandomAccessFile;
+	class AsyncRuntime;
 	struct ReadOptions;
 	class TableCache;
 	class FilterBlockReader;
@@ -83,7 +86,15 @@ namespace prism
 		// to Seek(key).  May not make such a call if filter policy says
 		// that key is not present.
 		using HandleResult = Status (*)(void*, const Slice& k, const Slice& v);
+		using AsyncGetCallback = std::move_only_function<void(Status)>;
 		Status InternalGet(const ReadOptions& options, const Slice& key, void* arg, HandleResult handle_result);
+		void InternalGetAsyncCallback(AsyncRuntime& runtime,
+		    RandomAccessFile& file,
+		    ReadOptions options,
+		    std::string key,
+		    void* arg,
+		    HandleResult handle_result,
+		    AsyncGetCallback completion);
 		void ReadMeta(const Footer& footer);
 		void ReadFilter(const Slice& filter_handle_value);
 

@@ -3,161 +3,104 @@
 #include "runtime_metrics.h"
 
 #include <algorithm>
-#include <unordered_map>
+#include <chrono>
+#include <random>
+#include <utility>
 
 namespace prism
 {
 	namespace
 	{
-		constexpr std::size_t kCpuContinuationPriority = 0;
-		constexpr std::size_t kReadExecutorThreadCount = 4;
-
-		// For Singleton, here:
-		// https://puji4810.github.io/2025/12/26/Singleton/
-		// we dont need a synchronized destruction
-		std::mutex& RegistryMutex()
-		{
-			static std::mutex mutex;
-			return mutex;
-		}
-
-		// Never call destructor of registry
-		auto& RuntimeRegistry()
-		{
-			static auto* registry = new std::unordered_map<ThreadPoolScheduler*, std::weak_ptr<RuntimeBundle>>();
-			return *registry;
-		}
-
-		class DeferredRuntimeDeletionQueue
-		{
-		public:
-			DeferredRuntimeDeletionQueue()
-			    : worker_([this] { WorkerLoop(); })
-			{
-			}
-
-			~DeferredRuntimeDeletionQueue()
-			{
-				{
-					std::lock_guard lock(mutex_);
-					stopping_ = true;
-				}
-				cv_.notify_all();
-			}
-
-			void Enqueue(RuntimeBundle* runtime)
-			{
-				{
-					std::lock_guard lock(mutex_);
-					queue_.push_back(runtime);
-				}
-				cv_.notify_one();
-			}
-
-		private:
-			void WorkerLoop()
-			{
-				while (true)
-				{
-					RuntimeBundle* runtime = nullptr;
-					{
-						std::unique_lock lock(mutex_);
-						cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
-						if (stopping_ && queue_.empty())
-						{
-							return;
-					}
-					runtime = queue_.front();
-					queue_.pop_front();
-				}
-					delete runtime;
-				}
-			}
-
-			std::mutex mutex_;
-			std::condition_variable cv_;
-			std::deque<RuntimeBundle*> queue_;
-			bool stopping_{ false };
-			std::jthread worker_;
-		};
-
-		DeferredRuntimeDeletionQueue& RuntimeDeletionQueue()
-		{
-			static DeferredRuntimeDeletionQueue queue;
-			return queue;
-		}
+		thread_local const BlockingExecutor* tls_blocking_executor = nullptr;
+		thread_local std::size_t tls_blocking_worker_index = 0;
 
 #ifndef PRISM_RUNTIME_METRICS
 		[[maybe_unused]] constexpr std::size_t kRuntimeMetricsSizeAnchor = sizeof(prism::RuntimeMetrics);
 #endif
 
 #ifdef PRISM_RUNTIME_METRICS
-		void RecordLaneSubmit(BlockingExecutorLane lane, std::size_t current_depth)
+		void RecordRoleSubmit(BlockingExecutorRole role, std::size_t current_depth)
 		{
 			auto& metrics = RuntimeMetrics::Instance();
-			switch (lane)
+			switch (role)
 			{
-			case BlockingExecutorLane::kRead:
-				metrics.blocking_jobs_submitted.fetch_add(1, std::memory_order_relaxed);
-				if (current_depth > metrics.blocking_peak_queue_depth.load(std::memory_order_relaxed))
+			case BlockingExecutorRole::kDbRead:
+				metrics.db_read_jobs_submitted.fetch_add(1, std::memory_order_relaxed);
+				if (current_depth > metrics.db_read_peak_queue_depth.load(std::memory_order_relaxed))
 				{
-					metrics.blocking_peak_queue_depth.store(current_depth, std::memory_order_relaxed);
+					metrics.db_read_peak_queue_depth.store(current_depth, std::memory_order_relaxed);
 				}
 				break;
-			case BlockingExecutorLane::kCompaction:
+			case BlockingExecutorRole::kBlockingIo:
+				metrics.blocking_io_jobs_submitted.fetch_add(1, std::memory_order_relaxed);
+				if (current_depth > metrics.blocking_io_peak_queue_depth.load(std::memory_order_relaxed))
+				{
+					metrics.blocking_io_peak_queue_depth.store(current_depth, std::memory_order_relaxed);
+				}
+				break;
+			case BlockingExecutorRole::kCompaction:
 				metrics.compaction_queue_jobs_submitted.fetch_add(1, std::memory_order_relaxed);
 				if (current_depth > metrics.compaction_peak_queue_depth.load(std::memory_order_relaxed))
 				{
 					metrics.compaction_peak_queue_depth.store(current_depth, std::memory_order_relaxed);
 				}
 				break;
-			case BlockingExecutorLane::kGeneric:
+			case BlockingExecutorRole::kGeneric:
 				break;
 			}
 		}
 
-		void RecordLaneCompletion(BlockingExecutorLane lane, uint64_t wait_us, uint64_t exec_us)
+		void RecordRoleCompletion(BlockingExecutorRole role, uint64_t wait_us, uint64_t exec_us)
 		{
 			auto& metrics = RuntimeMetrics::Instance();
-			switch (lane)
+			switch (role)
 			{
-			case BlockingExecutorLane::kRead:
-				metrics.blocking_enqueue_wait_total_us.fetch_add(wait_us, std::memory_order_relaxed);
-				metrics.blocking_exec_time_total_us.fetch_add(exec_us, std::memory_order_relaxed);
-				metrics.blocking_jobs_completed.fetch_add(1, std::memory_order_relaxed);
+			case BlockingExecutorRole::kDbRead:
+				metrics.db_read_enqueue_wait_total_us.fetch_add(wait_us, std::memory_order_relaxed);
+				metrics.db_read_exec_time_total_us.fetch_add(exec_us, std::memory_order_relaxed);
+				metrics.db_read_jobs_completed.fetch_add(1, std::memory_order_relaxed);
 				break;
-			case BlockingExecutorLane::kCompaction:
+			case BlockingExecutorRole::kBlockingIo:
+				metrics.blocking_io_enqueue_wait_total_us.fetch_add(wait_us, std::memory_order_relaxed);
+				metrics.blocking_io_exec_time_total_us.fetch_add(exec_us, std::memory_order_relaxed);
+				metrics.blocking_io_jobs_completed.fetch_add(1, std::memory_order_relaxed);
+				break;
+			case BlockingExecutorRole::kCompaction:
 				metrics.compaction_enqueue_wait_total_us.fetch_add(wait_us, std::memory_order_relaxed);
 				metrics.compaction_exec_time_total_us.fetch_add(exec_us, std::memory_order_relaxed);
 				metrics.compaction_queue_jobs_completed.fetch_add(1, std::memory_order_relaxed);
 				break;
-			case BlockingExecutorLane::kGeneric:
+			case BlockingExecutorRole::kGeneric:
 				break;
 			}
 		}
 #endif
+
+		constexpr auto kStealBackoff = std::chrono::microseconds(100);
+
+		std::uint64_t NextRandom(std::uint64_t& state) noexcept
+		{
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			return state;
+		}
 	}
 
-	ThreadPoolExecutor::ThreadPoolExecutor(ThreadPoolScheduler& scheduler)
-	    : scheduler_(&scheduler)
-	{
-	}
-
-	void ThreadPoolExecutor::Submit(Job work)
-	{
-		// Priority 0 is the shared CPU pool fast path: direct worker-local enqueue
-		// plus stealing, with no bounce through the legacy priority dispatcher.
-		scheduler_->Submit(std::move(work), kCpuContinuationPriority);
-	}
-
-	BlockingExecutor::BlockingExecutor(std::size_t thread_count, BlockingExecutorLane lane)
-	    : lane_(lane)
+	BlockingExecutor::BlockingExecutor(std::size_t thread_count, BlockingExecutorRole role, BlockingExecutorOptions options)
+	    : role_(role)
+	    , options_(options)
 	{
 		const std::size_t actual_threads = std::max<std::size_t>(thread_count, 1);
+		shards_.reserve(actual_threads);
+		for (std::size_t i = 0; i < actual_threads; ++i)
+		{
+			shards_.push_back(std::make_unique<Shard>());
+		}
 		workers_.reserve(actual_threads);
 		for (std::size_t i = 0; i < actual_threads; ++i)
 		{
-			workers_.emplace_back([this] { WorkerLoop(); });
+			workers_.emplace_back([this, i] { WorkerLoop(i); });
 		}
 	}
 
@@ -168,99 +111,271 @@ namespace prism
 			std::terminate();
 		}
 
-		{
-			std::lock_guard lock(mutex_);
-			stopping_ = true;
-		}
-		cv_.notify_all();
+		stopping_.store(true, std::memory_order_release);
+		WakeAll();
 
 		for (auto& worker : workers_)
 		{
-			if (!worker.joinable())
+			if (worker.joinable())
 			{
-				continue;
+				worker.request_stop();
+				worker.join();
 			}
-
-			worker.request_stop();
-			worker.join();
 		}
 		workers_.clear();
+
+		for (auto& shard : shards_)
+		{
+			while (!shard->queue.empty())
+			{
+				auto job = std::move(shard->queue.front());
+				shard->queue.pop_front();
+				shard->load.fetch_sub(1, std::memory_order_relaxed);
+				try
+				{
+					job();
+				}
+				catch (...)
+				{
+					std::terminate();
+				}
+			}
+		}
+		shards_.clear();
 	}
 
 	void BlockingExecutor::Submit(Job work)
 	{
+		const std::size_t worker_count = shards_.size();
+		std::size_t target_index = 0;
+		bool self_submit = false;
+
+		if (tls_blocking_executor == this)
+		{
+			target_index = tls_blocking_worker_index;
+			self_submit = true;
+		}
+		if (!self_submit && worker_count > 0)
+		{
+			target_index = submit_cursor_.fetch_add(1, std::memory_order_relaxed) % worker_count;
+		}
+
+		auto& shard = *shards_[target_index];
 #ifdef PRISM_RUNTIME_METRICS
 		auto submit_time = std::chrono::steady_clock::now();
+		std::size_t current_depth;
 		{
-			std::lock_guard lock(mutex_);
-			auto current_depth = queue_.size();
-			RecordLaneSubmit(lane_, current_depth);
-			queue_.emplace_back([lane = lane_, submit_time, work = std::move(work)]() mutable {
+			std::lock_guard lock(shard.mutex);
+			current_depth = shard.queue.size();
+			RecordRoleSubmit(role_, current_depth);
+			shard.queue.emplace_back([role = role_, submit_time, work = std::move(work)]() mutable {
 				auto exec_start = std::chrono::steady_clock::now();
 				auto wait_us
 				    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_start - submit_time).count());
 				work();
 				auto exec_end = std::chrono::steady_clock::now();
 				auto exec_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_end - exec_start).count());
-				RecordLaneCompletion(lane, wait_us, exec_us);
+				RecordRoleCompletion(role, wait_us, exec_us);
 			});
 		}
-		cv_.notify_one();
 #else
 		{
-			std::lock_guard lock(mutex_);
-			queue_.push_back(std::move(work));
+			std::lock_guard lock(shard.mutex);
+			shard.queue.push_back(std::move(work));
 		}
-		cv_.notify_one();
 #endif
+		shard.load.fetch_add(1, std::memory_order_relaxed);
+		shard.semaphore.release();
 	}
 
 	bool BlockingExecutor::Empty() const
 	{
-		std::lock_guard lock(mutex_);
-		return queue_.empty();
+		for (const auto& shard : shards_)
+		{
+			std::lock_guard lock(shard->mutex);
+			if (!shard->queue.empty())
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 
 	bool BlockingExecutor::IsCurrentWorker() const noexcept
 	{
-		const auto current_thread_id = std::this_thread::get_id();
-		return std::any_of(workers_.begin(), workers_.end(),
-		    [current_thread_id](const std::jthread& worker) { return worker.joinable() && worker.get_id() == current_thread_id; });
+		return tls_blocking_executor == this;
 	}
 
-	void BlockingExecutor::WorkerLoop()
+	bool BlockingExecutor::TryPopOwn(Shard& shard, Job& out)
 	{
-		while (true)
+		std::lock_guard lock(shard.mutex);
+		if (shard.queue.empty())
 		{
-			Job job;
-			{
-				std::unique_lock lock(mutex_);
-				cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
-				if (stopping_ && queue_.empty())
-				{
-					return;
-				}
-				job = std::move(queue_.front());
-				queue_.pop_front();
-			}
+			return false;
+		}
+		out = std::move(shard.queue.front());
+		shard.queue.pop_front();
+		shard.load.fetch_sub(1, std::memory_order_relaxed);
+		return true;
+	}
 
-			try
-			{
-				job();
-			}
-			catch (...)
-			{
-				std::terminate();
-			}
+	bool BlockingExecutor::TrySteal(std::size_t self_index, std::uint64_t& rng_state, Job& out)
+	{
+		const std::size_t worker_count = shards_.size();
+		if (!options_.enable_stealing || worker_count <= 1)
+		{
+			return false;
+		}
+#ifdef PRISM_RUNTIME_METRICS
+		switch (role_)
+		{
+		case BlockingExecutorRole::kDbRead:
+			RuntimeMetrics::Instance().db_read_steal_attempts.fetch_add(1, std::memory_order_relaxed);
+			break;
+		case BlockingExecutorRole::kBlockingIo:
+			RuntimeMetrics::Instance().blocking_io_steal_attempts.fetch_add(1, std::memory_order_relaxed);
+			break;
+		case BlockingExecutorRole::kCompaction:
+		case BlockingExecutorRole::kGeneric:
+			break;
+		}
+#endif
+
+		const std::size_t victim_index = NextVictim(self_index, worker_count, rng_state);
+		auto& self_shard = *shards_[self_index];
+		auto& victim = *shards_[victim_index];
+
+		std::scoped_lock lock(self_shard.mutex, victim.mutex);
+		if (!self_shard.queue.empty() || victim.queue.empty())
+		{
+			return false;
+		}
+
+		const std::size_t steal_count = std::max<std::size_t>(1, victim.queue.size() / 2);
+		for (std::size_t i = 0; i < steal_count; ++i)
+		{
+			self_shard.queue.push_front(std::move(victim.queue.back()));
+			victim.queue.pop_back();
+		}
+		victim.load.fetch_sub(steal_count, std::memory_order_relaxed);
+		self_shard.load.fetch_add(steal_count, std::memory_order_relaxed);
+
+		out = std::move(self_shard.queue.front());
+		self_shard.queue.pop_front();
+		self_shard.load.fetch_sub(1, std::memory_order_relaxed);
+#ifdef PRISM_RUNTIME_METRICS
+		switch (role_)
+		{
+		case BlockingExecutorRole::kDbRead:
+			RuntimeMetrics::Instance().db_read_steal_successes.fetch_add(1, std::memory_order_relaxed);
+			break;
+		case BlockingExecutorRole::kBlockingIo:
+			RuntimeMetrics::Instance().blocking_io_steal_successes.fetch_add(1, std::memory_order_relaxed);
+			break;
+		case BlockingExecutorRole::kCompaction:
+		case BlockingExecutorRole::kGeneric:
+			break;
+		}
+#endif
+		return true;
+	}
+
+	std::size_t BlockingExecutor::NextVictim(std::size_t self_index, std::size_t worker_count, std::uint64_t& rng_state)
+	{
+		std::size_t victim = NextRandom(rng_state) % (worker_count - 1);
+		if (victim >= self_index)
+		{
+			++victim;
+		}
+		return victim;
+	}
+
+	void BlockingExecutor::WakeAll()
+	{
+		for (auto& shard : shards_)
+		{
+			shard->semaphore.release();
 		}
 	}
 
-	SerialLane::SerialLane()
+	bool BlockingExecutor::AnyShardNonEmpty() const noexcept
+	{
+		for (const auto& shard : shards_)
+		{
+			if (shard->load.load(std::memory_order_relaxed) > 0)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void BlockingExecutor::WorkerLoop(std::size_t worker_index)
+	{
+		tls_blocking_executor = this;
+		tls_blocking_worker_index = worker_index;
+		auto& shard = *shards_[worker_index];
+		std::uint64_t rng_state = (static_cast<std::uint64_t>(worker_index) + 1) * 0x9e3779b97f4a7c15ull;
+
+		while (true)
+		{
+			shard.semaphore.acquire();
+
+			while (true)
+			{
+				Job job;
+				if (TryPopOwn(shard, job))
+				{
+					try
+					{
+						job();
+					}
+					catch (...)
+					{
+						std::terminate();
+					}
+					continue;
+				}
+
+				if (TrySteal(worker_index, rng_state, job))
+				{
+					try
+					{
+						job();
+					}
+					catch (...)
+					{
+						std::terminate();
+					}
+					continue;
+				}
+
+				if (stopping_.load(std::memory_order_acquire))
+				{
+					break;
+				}
+
+				if (!shard.semaphore.try_acquire_for(kStealBackoff))
+				{
+					break;
+				}
+			}
+
+			if (stopping_.load(std::memory_order_acquire) && !AnyShardNonEmpty())
+			{
+				break;
+			}
+		}
+		tls_blocking_executor = nullptr;
+		tls_blocking_worker_index = 0;
+	}
+
+	SerialExecutor::SerialExecutor()
 	    : worker_([this] { WorkerLoop(); })
 	{
 	}
 
-	SerialLane::~SerialLane()
+	SerialExecutor::~SerialExecutor()
 	{
 		{
 			std::lock_guard lock(mutex_);
@@ -269,7 +384,7 @@ namespace prism
 		cv_.notify_all();
 	}
 
-	void SerialLane::Submit(Job work)
+	void SerialExecutor::Submit(Job work)
 	{
 		{
 			std::lock_guard lock(mutex_);
@@ -278,21 +393,21 @@ namespace prism
 		cv_.notify_one();
 	}
 
-	bool SerialLane::Empty() const
+	bool SerialExecutor::Empty() const
 	{
 		std::lock_guard lock(mutex_);
 		return queue_.empty();
 	}
 
-	bool SerialLane::Done() const
+	bool SerialExecutor::Done() const
 	{
 		std::lock_guard lock(mutex_);
 		return queue_.empty() && !running_;
 	}
 
-	bool SerialLane::IsCurrentWorker() const noexcept { return worker_.joinable() && worker_.get_id() == std::this_thread::get_id(); }
+	bool SerialExecutor::IsCurrentWorker() const noexcept { return worker_.joinable() && worker_.get_id() == std::this_thread::get_id(); }
 
-	void SerialLane::WorkerLoop()
+	void SerialExecutor::WorkerLoop()
 	{
 		while (true)
 		{
@@ -325,56 +440,24 @@ namespace prism
 		}
 	}
 
-	ExecutorSchedulerAdapter::ExecutorSchedulerAdapter(IContinuationExecutor& executor)
-	    : executor_(&executor)
+	AsyncRuntime::AsyncRuntime(CpuThreadPool& cpu_pool, AsyncRuntimeOptions options)
+	    : cpu_executor_(cpu_pool)
+	    , db_read_executor_(
+	          options.db_read_threads != 4 ? options.db_read_threads : options.db_threads,
+	          BlockingExecutorRole::kDbRead,
+	          BlockingExecutorOptions{ .enable_stealing = true })
+	    , db_write_executor_()
+	    , blocking_io_executor_(options.blocking_io_threads, BlockingExecutorRole::kBlockingIo)
+	    , io_dispatcher_(blocking_io_executor_)
+	    , compaction_executor_(1, BlockingExecutorRole::kCompaction, BlockingExecutorOptions{ .enable_stealing = false })
+	    , serial_file_executor_()
 	{
 	}
 
-	void ExecutorSchedulerAdapter::Submit(Job job, std::size_t /*priority*/) { executor_->Submit(std::move(job)); }
-
-	RuntimeBundle::RuntimeBundle(ThreadPoolScheduler& scheduler)
-	    : cpu_executor(scheduler)
-	    , timer_source(&scheduler)
-	    , read_executor(kReadExecutorThreadCount, BlockingExecutorLane::kRead)
-	    , io_dispatcher(read_executor)
-	    , compaction_executor(1, BlockingExecutorLane::kCompaction)
-	    , serial_lane()
-	    , cpu_scheduler(cpu_executor)
-	    , read_scheduler(read_executor)
-	    , compaction_scheduler(compaction_executor)
-	    , serial_scheduler(serial_lane)
-	    , foreground_db_scheduler(cpu_executor)
+	bool AsyncRuntime::IsCurrentWorker() const noexcept
 	{
-	}
-
-	bool RuntimeBundle::IsCurrentWorker() const noexcept
-	{
-		return read_executor.IsCurrentWorker() || compaction_executor.IsCurrentWorker() || serial_lane.IsCurrentWorker();
-	}
-
-	std::shared_ptr<RuntimeBundle> AcquireRuntimeBundle(ThreadPoolScheduler& scheduler)
-	{
-		std::lock_guard lock(RegistryMutex());
-		auto& registry = RuntimeRegistry();
-		auto it = registry.find(&scheduler);
-		if (it != registry.end())
-		{
-			if (auto existing = it->second.lock())
-			{
-				return existing;
-			}
-		}
-
-		auto runtime = std::shared_ptr<RuntimeBundle>(new RuntimeBundle(scheduler), [](RuntimeBundle* runtime) {
-			if (runtime->IsCurrentWorker())
-			{
-				RuntimeDeletionQueue().Enqueue(runtime);
-				return;
-			}
-			delete runtime;
-		});
-		registry[&scheduler] = runtime;
-		return runtime;
+		return db_read_executor_.IsCurrentWorker() || db_write_executor_.IsCurrentWorker() || blocking_io_executor_.IsCurrentWorker()
+		    || compaction_executor_.IsCurrentWorker() || serial_file_executor_.IsCurrentWorker();
 	}
 
 } // namespace prism

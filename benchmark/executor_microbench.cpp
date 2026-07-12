@@ -60,7 +60,7 @@ namespace prism::bench
 
 	void RunExecutorMicrobench(int num_workers, int num_tasks)
 	{
-		BlockingExecutor executor(static_cast<std::size_t>(num_workers), BlockingExecutorLane::kGeneric);
+		BlockingExecutor executor(static_cast<std::size_t>(num_workers), BlockingExecutorRole::kGeneric);
 		ExecutorBenchStats stats;
 		std::atomic<uint64_t> counter{ 0 };
 		std::atomic<uint64_t> in_flight{ 0 };

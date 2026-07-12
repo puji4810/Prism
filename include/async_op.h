@@ -91,23 +91,15 @@ namespace prism
 		using ValueType = T;
 		using Work = std::move_only_function<T()>;
 
-		AsyncOp(IScheduler& scheduler, Work work)
-		    : state_(std::make_unique<State>(&scheduler, std::move(work)))
+		template <typename Executor>
+		AsyncOp(Executor& executor, Work work)
+		    : state_(std::make_unique<State>(ExecutorRef(executor), std::move(work)))
 		{
 		}
 
-		AsyncOp(ThreadPoolScheduler& scheduler, Work work)
-		    : state_(std::make_unique<State>(&scheduler, std::move(work)))
-		{
-		}
-
-		AsyncOp(IScheduler& scheduler, void* keep_alive, void (*release_keep_alive)(void*), Work work)
-		    : state_(std::make_unique<State>(&scheduler, keep_alive, release_keep_alive, std::move(work)))
-		{
-		}
-
-		AsyncOp(ThreadPoolScheduler& scheduler, void* keep_alive, void (*release_keep_alive)(void*), Work work)
-		    : state_(std::make_unique<State>(&scheduler, keep_alive, release_keep_alive, std::move(work)))
+		template <typename Executor>
+		AsyncOp(Executor& executor, void* keep_alive, void (*release_keep_alive)(void*), Work work)
+		    : state_(std::make_unique<State>(ExecutorRef(executor), keep_alive, release_keep_alive, std::move(work)))
 		{
 		}
 
@@ -154,14 +146,7 @@ namespace prism
 					}
 					st->handle.resume();
 				};
-				if (state->direct_scheduler != nullptr)
-				{
-					state->direct_scheduler->Submit(std::move(job));
-				}
-				else
-				{
-					state->scheduler->Submit(std::move(job));
-				}
+				state->executor.Submit(std::move(job));
 
 				// Coroutine tries to win the handshake: kSuspending → kSuspended.
 				auto expected = State::kSuspending;
@@ -216,34 +201,20 @@ namespace prism
 				void (*release)(void*) = nullptr;
 			};
 
-			State(IScheduler* sched, Work w)
-			    : scheduler(sched)
+			State(ExecutorRef exec, Work w)
+			    : executor(exec)
 			    , work(std::move(w))
 			{
 			}
 
-			State(ThreadPoolScheduler* sched, Work w)
-			    : direct_scheduler(sched)
-			    , work(std::move(w))
-			{
-			}
-
-			State(IScheduler* sched, void* keep_alive_ptr, void (*release_keep_alive)(void*), Work w)
-			    : scheduler(sched)
+			State(ExecutorRef exec, void* keep_alive_ptr, void (*release_keep_alive)(void*), Work w)
+			    : executor(exec)
 			    , keep_alive(keep_alive_ptr, release_keep_alive)
 			    , work(std::move(w))
 			{
 			}
 
-			State(ThreadPoolScheduler* sched, void* keep_alive_ptr, void (*release_keep_alive)(void*), Work w)
-			    : direct_scheduler(sched)
-			    , keep_alive(keep_alive_ptr, release_keep_alive)
-			    , work(std::move(w))
-			{
-			}
-
-			IScheduler* scheduler = nullptr;
-			ThreadPoolScheduler* direct_scheduler = nullptr;
+			ExecutorRef executor;
 			KeepAlive keep_alive;
 			Work work;
 			std::optional<T> value;
@@ -269,13 +240,9 @@ namespace prism
 	public:
 		using Work = std::move_only_function<void()>;
 
-		AsyncOp(IScheduler& scheduler, Work work)
-		    : state_(std::make_unique<State>(&scheduler, std::move(work)))
-		{
-		}
-
-		AsyncOp(ThreadPoolScheduler& scheduler, Work work)
-		    : state_(std::make_unique<State>(&scheduler, std::move(work)))
+		template <typename Executor>
+		AsyncOp(Executor& executor, Work work)
+		    : state_(std::make_unique<State>(ExecutorRef(executor), std::move(work)))
 		{
 		}
 
@@ -319,14 +286,7 @@ namespace prism
 					}
 					st->handle.resume();
 				};
-				if (state->direct_scheduler != nullptr)
-				{
-					state->direct_scheduler->Submit(std::move(job));
-				}
-				else
-				{
-					state->scheduler->Submit(std::move(job));
-				}
+				state->executor.Submit(std::move(job));
 
 				auto expected = State::kSuspending;
 				if (state->status.compare_exchange_strong(
@@ -357,20 +317,13 @@ namespace prism
 			static constexpr int kCompleted = 1;
 			static constexpr int kSuspended = 2;
 
-			State(IScheduler* sched, Work w)
-			    : scheduler(sched)
+			State(ExecutorRef exec, Work w)
+			    : executor(exec)
 			    , work(std::move(w))
 			{
 			}
 
-			State(ThreadPoolScheduler* sched, Work w)
-			    : direct_scheduler(sched)
-			    , work(std::move(w))
-			{
-			}
-
-			IScheduler* scheduler = nullptr;
-			ThreadPoolScheduler* direct_scheduler = nullptr;
+			ExecutorRef executor;
 			Work work;
 			std::exception_ptr exception;
 			std::coroutine_handle<> handle;

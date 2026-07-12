@@ -1,6 +1,7 @@
 #include "kv_bench_lib.h"
 #include "asyncdb.h"
 #include "db.h"
+#include "../src/async_runtime.h"
 #include "scheduler.h"
 
 #include "coro_task.h"
@@ -24,10 +25,10 @@ namespace
 		return std::move(db_result.value());
 	}
 
-	prism::AsyncDB OpenAsyncDatabase(prism::ThreadPoolScheduler& scheduler, const prism::Options& options, const std::string& db_dir)
+	prism::AsyncDB OpenAsyncDatabase(prism::AsyncRuntime& runtime, const prism::Options& options, const std::string& db_dir)
 	{
 		auto open_task = [&]() -> prism::tests::Task<prism::AsyncDB> {
-			auto db_result = co_await prism::AsyncDB ::OpenAsync(scheduler, options, db_dir);
+			auto db_result = co_await prism::AsyncDB::OpenAsync(runtime, options, db_dir);
 			if (!db_result.has_value())
 			{
 				throw std::runtime_error(db_result.error().ToString());
@@ -286,8 +287,9 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024 * 1024;
 
-		prism::ThreadPoolScheduler scheduler(2);
-		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+		prism::CpuThreadPool scheduler(2);
+		prism::AsyncRuntime runtime(scheduler);
+		auto async_db = OpenAsyncDatabase(runtime, options, db_dir);
 
 		prism::bench::Config cfg;
 		cfg.clients = 1;
@@ -314,8 +316,9 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024 * 1024;
 
-		prism::ThreadPoolScheduler scheduler(4);
-		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+		prism::CpuThreadPool scheduler(4);
+		prism::AsyncRuntime runtime(scheduler);
+		auto async_db = OpenAsyncDatabase(runtime, options, db_dir);
 
 		prism::bench::Config cfg;
 		cfg.clients = 1;
@@ -343,8 +346,9 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024 * 1024;
 
-		prism::ThreadPoolScheduler scheduler(4);
-		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+		prism::CpuThreadPool scheduler(4);
+		prism::AsyncRuntime runtime(scheduler);
+		auto async_db = OpenAsyncDatabase(runtime, options, db_dir);
 
 		prism::bench::Config cfg;
 		cfg.clients = 2;
@@ -373,7 +377,8 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024 * 1024;
 
-		prism::ThreadPoolScheduler scheduler(4);
+		prism::CpuThreadPool scheduler(4);
+		prism::AsyncRuntime runtime(scheduler);
 
 		prism::bench::Config cfg;
 		cfg.clients = 2;
@@ -391,7 +396,7 @@ namespace
 			PrefillDatabase(db, keys, cfg.ops_per_client, cfg.value_size);
 		}
 
-		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+		auto async_db = OpenAsyncDatabase(runtime, options, db_dir);
 		auto stats = prism::bench::RunAsyncMixed(async_db, scheduler, cfg, keys);
 
 		EXPECT_GE(stats.max_client_inflight, static_cast<std::size_t>(cfg.inflight_per_client));
@@ -429,8 +434,9 @@ namespace
 			prism::Options options;
 			options.create_if_missing = true;
 			options.write_buffer_size = 4 * 1024;
-			prism::ThreadPoolScheduler scheduler(2);
-			auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+			prism::CpuThreadPool scheduler(2);
+			prism::AsyncRuntime runtime(scheduler);
+			auto async_db = OpenAsyncDatabase(runtime, options, db_dir);
 
 			prism::bench::Config cfg;
 			cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
@@ -479,8 +485,9 @@ namespace
 			prism::Options options;
 			options.create_if_missing = true;
 			options.write_buffer_size = 4 * 1024;
-			prism::ThreadPoolScheduler scheduler(2);
-			auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+			prism::CpuThreadPool scheduler(2);
+			prism::AsyncRuntime runtime(scheduler);
+			auto async_db = OpenAsyncDatabase(runtime, options, db_dir);
 
 			prism::bench::Config cfg;
 			cfg.mode = prism::bench::BenchMode::kCompactionOverlap;
@@ -526,8 +533,9 @@ namespace
 			PrefillDatabase(db, keys, prefill_cfg.ops_per_client, prefill_cfg.value_size);
 		}
 
-		prism::ThreadPoolScheduler scheduler(2);
-		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+		prism::CpuThreadPool scheduler(2);
+		prism::AsyncRuntime runtime(scheduler);
+		auto async_db = OpenAsyncDatabase(runtime, options, db_dir);
 
 		prism::bench::Config cfg;
 		cfg.mode = prism::bench::BenchMode::kSstReadPipeline;
@@ -574,8 +582,9 @@ namespace
 		options.create_if_missing = true;
 		options.write_buffer_size = 4 * 1024 * 1024;
 
-		prism::ThreadPoolScheduler scheduler(2);
-		auto async_db = OpenAsyncDatabase(scheduler, options, db_dir);
+		prism::CpuThreadPool scheduler(2);
+		prism::AsyncRuntime runtime(scheduler);
+		auto async_db = OpenAsyncDatabase(runtime, options, db_dir);
 
 		prism::bench::Config cfg;
 		cfg.mode = prism::bench::BenchMode::kDurabilityWrite;

@@ -5,6 +5,12 @@
 
 namespace prism
 {
+	enum class ComparatorKind
+	{
+		kGeneric,
+		kBytewise,
+		kInternalKeyBytewise,
+	};
 
 	class Comparator
 	{
@@ -16,6 +22,10 @@ namespace prism
 		//   == 0 iff "a" == "b",
 		//   > 0 iff "a" > "b"
 		virtual int Compare(const Slice& a, const Slice& b) const = 0;
+
+		// Lets block iterators select equivalent non-virtual comparison paths
+		// for Prism's built-in key encodings. Custom comparators use kGeneric.
+		virtual ComparatorKind Kind() const noexcept { return ComparatorKind::kGeneric; }
 
 		// The name of the comparator.  Used to check for comparator
 		// mismatches (i.e., a DB created with one comparator is

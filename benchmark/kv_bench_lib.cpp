@@ -85,7 +85,7 @@ namespace prism::bench
 
 	StartGate::Awaiter StartGate::operator co_await() noexcept { return Awaiter{ this }; }
 
-	void StartGate::Open(ThreadPoolScheduler& scheduler)
+	void StartGate::Open(CpuThreadPool& scheduler)
 	{
 		std::vector<std::coroutine_handle<>> to_resume;
 		{
@@ -614,7 +614,7 @@ namespace prism::bench
 		co_return;
 	}
 
-	Stats RunAsyncMixed(AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	Stats RunAsyncMixed(AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
 		StartGate gate;
@@ -681,7 +681,7 @@ namespace prism::bench
 	}
 
 	Stats RunAsyncDiskRead(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	    AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
 		StartGate gate;
@@ -792,7 +792,7 @@ namespace prism::bench
 	}
 
 	Stats RunAsyncSstReadPipeline(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	    AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
 		StartGate gate;
@@ -953,7 +953,7 @@ namespace prism::bench
 	}
 
 	Stats RunAsyncCompactionOverlap(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	    AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
 		StartGate gate;
@@ -1083,7 +1083,7 @@ namespace prism::bench
 	}
 
 	Stats RunAsyncDurabilityWrite(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	    AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
 		StartGate gate;
@@ -1179,23 +1179,26 @@ namespace prism::bench
 		{
 			const uint64_t p50_ns = PercentileNs(stats.latency_ns, 0.50);
 			const uint64_t p95_ns = PercentileNs(stats.latency_ns, 0.95);
+			const uint64_t p99_ns = PercentileNs(stats.latency_ns, 0.99);
 			if (read_ratio_meaningful)
 			{
 				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=%d time=%.3fs ops/s=%.0f max_inflight=%zu "
-				            "p50_us=%.2f p95_us=%.2f scenario=%s inflight_cfg=%d max_client_inflight=%zu write_sync=%d "
+				            "p50_us=%.2f p95_us=%.2f p99_us=%.2f scenario=%s inflight_cfg=%d max_client_inflight=%zu write_sync=%d "
 				            "bg_sleeps=%d\n",
 				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, cfg.read_ratio,
 				    stats.seconds, ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0,
-				    scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync, stats.bg_sleeps);
+				    static_cast<double>(p99_ns) / 1000.0, scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight,
+				    stats.write_sync, stats.bg_sleeps);
 			}
 			else
 			{
 				std::printf("%s r=%d clients=%d workers=%d ops=%zu value=%zu read_ratio=ignored time=%.3fs ops/s=%.0f max_inflight=%zu "
-				            "p50_us=%.2f p95_us=%.2f scenario=%s inflight_cfg=%d max_client_inflight=%zu write_sync=%d "
+				            "p50_us=%.2f p95_us=%.2f p99_us=%.2f scenario=%s inflight_cfg=%d max_client_inflight=%zu write_sync=%d "
 				            "bg_sleeps=%d\n",
 				    std::string(name).c_str(), round, cfg.clients, cfg.workers, cfg.ops_per_client, cfg.value_size, stats.seconds,
-				    ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0, scenario.c_str(),
-				    cfg.inflight_per_client, stats.max_client_inflight, stats.write_sync, stats.bg_sleeps);
+				    ops_per_sec, max_inflight, static_cast<double>(p50_ns) / 1000.0, static_cast<double>(p95_ns) / 1000.0,
+				    static_cast<double>(p99_ns) / 1000.0, scenario.c_str(), cfg.inflight_per_client, stats.max_client_inflight,
+				    stats.write_sync, stats.bg_sleeps);
 			}
 		}
 	}
@@ -1280,6 +1283,7 @@ namespace prism::bench
 				std::printf("                                      steady-state, compaction-overlap-only\n");
 				std::printf("  --db_dir=<path>              Use existing dir for async DB (default: temp)\n");
 				std::printf("  --keep_db=<0|1>              Keep DB dir after run (default: 0)\n");
+				std::printf("  --round_isolation=<0|1>      Use fresh DB per measured async round (default: 0)\n");
 				std::printf("  --help                       Show this message\n");
 				exit(0);
 			}
@@ -1330,6 +1334,14 @@ namespace prism::bench
 				int tmp = 0;
 				(void)parse_int("--keep_db=", tmp);
 				cfg.keep_db = (tmp != 0);
+				handled = true;
+			}
+
+			if (arg.starts_with("--round_isolation="))
+			{
+				int tmp = 0;
+				(void)parse_int("--round_isolation=", tmp);
+				cfg.round_isolation = (tmp != 0);
 				handled = true;
 			}
 

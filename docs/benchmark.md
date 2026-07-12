@@ -47,6 +47,7 @@ Built from `benchmark/kv_bench.cpp` + `benchmark/kv_bench_lib.cpp`. Supports syn
 | `--prefill=<n>` | int (-1/0/1) | -1 | Prefill database before benchmark: -1=auto, 0=off, 1=force |
 | `--db_dir=<path>` | string | temp | Use existing directory (enables reuse across runs) |
 | `--keep_db=<0\|1>` | int | 0 | Keep DB directory after run |
+| `--round_isolation=<0\|1>` | int | 0 | Async only: create a fresh DB directory for each measured round |
 | `--sync` | flag | — | Run only sync benchmark (shorthand) |
 | `--async` | flag | — | Run only async benchmark (shorthand) |
 | `--no_latency` | flag | off | Skip p50/p95 percentile collection |
@@ -67,6 +68,20 @@ Example:
   --inflight_per_client=16 --db_dir=/tmp/prism_bench --keep_db=1
 ```
 
+For multi-round mixed read/write comparisons, use `--round_isolation=1` when
+`--prefill=1` or `--prefill=-1` would seed data before measurement. Without
+round isolation, measured rounds share one DB and writes from earlier rounds
+change the table/compaction/cache state seen by later rounds. With round
+isolation, each measured round uses `<db_dir>/round_N` or a fresh temp root, and
+`--keep_db=1` only controls whether those round directories are retained after
+the run. `--warmup_rounds` is ignored in this mode because warmup would mutate a
+different DB state than the measured fresh round.
+
+For CPU hotspot profiling, combine `--round_isolation=1` with `--no_latency` and
+build without `--runtime_metrics=y`. Enable `--runtime_metrics=y` only for lane
+queue-depth and executor timing diagnostics; it intentionally adds measurement
+overhead.
+
 ### Async DB Architecture Notes
 
 `AsyncDB` currently provides an asynchronous interface by wrapping the synchronous `DBImpl` engine and offloading operations to background executors. While this provides coroutine-friendly semantics, it is not yet "true" nonblocking I/O at the storage level.
@@ -75,6 +90,10 @@ Performance benefits from the coroutine model primarily come from **pipelining**
 
 - **Serialized Baseline (`inflight_per_client=1`)**: Measures the overhead of the coroutine machinery without any concurrency benefits.
 - **Pipelined Measurement (`inflight_per_client > 1`)**: Recommended sweeps include `{1, 2, 4, 8, 16}`. Pipelining benefits generally cap when the number of outstanding operations saturates the available CPU or read executor worker threads.
+- **SST read boundary**: `IoDispatcher` and `AsyncRandomAccessFile` exist, but
+  the DB table/cache read path still calls synchronous `RandomAccessFile::Read`
+  through `DBImpl::Get()`. True async SST reads require pushing an async read
+  seam through `TableCache`, `Table::InternalGet`, and `ReadBlock`.
 
 ### Building `kv_bench` for Perf Profiling
 

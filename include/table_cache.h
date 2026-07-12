@@ -4,10 +4,15 @@
 #include "cache.h"
 #include "table/table.h"
 #include "dbformat.h"
+#include "result.h"
+
+#include <functional>
+#include <string>
 
 namespace prism
 {
 	class Env;
+	class AsyncRuntime;
 
 	class TableCache
 	{
@@ -32,6 +37,14 @@ namespace prism
 		// call (*handle_result)(arg, found_key, found_value).
 		Status Get(const ReadOptions& options, uint64_t file_number, uint64_t file_size, const Slice& k, void* arg,
 		    prism::Table::HandleResult handle_result);
+		void GetAsyncCallback(AsyncRuntime& runtime,
+		    ReadOptions options,
+		    uint64_t file_number,
+		    uint64_t file_size,
+		    std::string key,
+		    void* arg,
+		    prism::Table::HandleResult handle_result,
+		    std::move_only_function<void(Status)> completion);
 
 		// Evict any entry for the specified file number
 		void Evict(uint64_t file_number);

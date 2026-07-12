@@ -11,13 +11,13 @@ using namespace std::chrono_literals;
 
 TEST(SchedulerStressTest, HighConcurrency)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 10000;
 
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, i % 10);
+		scheduler.SubmitWithPriority([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, i % 10);
 	}
 
 	// Poll with bounded timeout instead of sleep_for
@@ -35,7 +35,7 @@ TEST(SchedulerStressTest, HighConcurrency)
 
 TEST(SchedulerStressTest, AffinityTasks)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 1000;
 
@@ -66,14 +66,14 @@ TEST(SchedulerStressTest, AffinityTasks)
 
 TEST(SchedulerStressTest, MixedWorkload)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 	auto immediate = std::make_shared<std::atomic<int>>(0);
 	auto affinity = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 1000;
 
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([immediate]() { immediate->fetch_add(1, std::memory_order_relaxed); }, i % 5);
+		scheduler.SubmitWithPriority([immediate]() { immediate->fetch_add(1, std::memory_order_relaxed); }, i % 5);
 
 		scheduler.Submit([&scheduler, affinity]() {
 			auto ctx = scheduler.CaptureContext();
@@ -99,7 +99,7 @@ TEST(SchedulerStressTest, MixedWorkload)
 
 TEST(SchedulerStressTest, MixedAffinityAndStolenWorkCompletesAll)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 1000;
 
@@ -132,9 +132,11 @@ TEST(SchedulerStressTest, MixedAffinityAndStolenWorkCompletesAll)
 // ---------------------------------------------------------------------------
 TEST(SchedulerStressTest, StolenWorkProgressAssertions)
 {
+#ifdef PRISM_RUNTIME_METRICS
 	prism::RuntimeMetrics::Instance().Reset();
+#endif
 
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 5000;
 
@@ -150,6 +152,7 @@ TEST(SchedulerStressTest, StolenWorkProgressAssertions)
 
 	EXPECT_EQ(counter->load(), kNumTasks) << "Not all stealable tasks completed: " << counter->load() << "/" << kNumTasks;
 
+#ifdef PRISM_RUNTIME_METRICS
 	// Verify that some jobs were completed (whether local or stolen).
 	const auto total_completed = prism::RuntimeMetrics::Instance().worker_local_jobs_completed.load(std::memory_order_relaxed)
 	    + prism::RuntimeMetrics::Instance().stolen_jobs_completed.load(std::memory_order_relaxed);
@@ -167,6 +170,15 @@ TEST(SchedulerStressTest, StolenWorkProgressAssertions)
 	// No hard assertion on steal count since it depends on timing.
 	SUCCEED() << "Characterization: steal_attempts=" << steal_attempts << " steal_successes=" << steal_successes
 	          << " stolen_jobs_completed=" << prism::RuntimeMetrics::Instance().stolen_jobs_completed.load(std::memory_order_relaxed);
+#else
+	auto& metrics = prism::RuntimeMetrics::Instance();
+	EXPECT_EQ(metrics.foreground_fastpath_submits.load(std::memory_order_relaxed), 0u);
+	EXPECT_EQ(metrics.foreground_fallback_submits.load(std::memory_order_relaxed), 0u);
+	EXPECT_EQ(metrics.steal_attempts.load(std::memory_order_relaxed), 0u);
+	EXPECT_EQ(metrics.steal_successes.load(std::memory_order_relaxed), 0u);
+	EXPECT_EQ(metrics.worker_local_jobs_completed.load(std::memory_order_relaxed), 0u);
+	EXPECT_EQ(metrics.stolen_jobs_completed.load(std::memory_order_relaxed), 0u);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -177,9 +189,11 @@ TEST(SchedulerStressTest, StolenWorkProgressAssertions)
 // ---------------------------------------------------------------------------
 TEST(SchedulerStressTest, HighConcurrencyStolenWorkAllCompletes)
 {
+#ifdef PRISM_RUNTIME_METRICS
 	prism::RuntimeMetrics::Instance().Reset();
+#endif
 
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 10000;
 
@@ -208,9 +222,11 @@ TEST(SchedulerStressTest, HighConcurrencyStolenWorkAllCompletes)
 	EXPECT_EQ(counter->load(), kNumTasks * 2) << "High-concurrency stolen+affinity work incomplete: " << counter->load() << "/"
 	                                          << (kNumTasks * 2);
 
+#ifdef PRISM_RUNTIME_METRICS
 	const auto total_completed = prism::RuntimeMetrics::Instance().worker_local_jobs_completed.load(std::memory_order_relaxed)
 	    + prism::RuntimeMetrics::Instance().stolen_jobs_completed.load(std::memory_order_relaxed);
 
 	EXPECT_GE(total_completed, static_cast<uint64_t>(kNumTasks * 2))
 	    << "Total completed jobs (" << total_completed << ") less than submitted (" << (kNumTasks * 2) << ")";
+#endif
 }

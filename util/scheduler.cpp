@@ -1,5 +1,8 @@
 #include "scheduler.h"
+
+#ifdef PRISM_RUNTIME_METRICS
 #include "runtime_metrics.h"
+#endif
 
 #include <algorithm>
 #include <limits>
@@ -31,17 +34,17 @@ namespace prism
 		}
 	}
 
-	thread_local const ThreadPoolScheduler* ThreadPoolScheduler::current_scheduler_ = nullptr;
-	thread_local std::size_t ThreadPoolScheduler::current_worker_index_ = 0;
+	thread_local const CpuThreadPool* CpuThreadPool::current_scheduler_ = nullptr;
+	thread_local std::size_t CpuThreadPool::current_worker_index_ = 0;
 
-	ThreadPoolScheduler::Context ThreadPoolScheduler::CaptureContext() const
+	CpuThreadPool::Context CpuThreadPool::CaptureContext() const
 	{
 		if (current_scheduler_ == this)
 			return Context(this, current_worker_index_);
 		return Context{ };
 	}
 
-	ThreadPoolScheduler::ThreadPoolScheduler(std::size_t num_threads)
+	CpuThreadPool::CpuThreadPool(std::size_t num_threads)
 	    : work_threads_(DefaultThreadCount(num_threads))
 	{
 		for (std::size_t i = 0; i < work_threads_.size(); ++i)
@@ -53,7 +56,7 @@ namespace prism
 		priority_thread_ = std::jthread([this] { PriorityLoop(); });
 	}
 
-	ThreadPoolScheduler::~ThreadPoolScheduler()
+	CpuThreadPool::~CpuThreadPool()
 	{
 		Exit();
 
@@ -100,9 +103,9 @@ namespace prism
 		current_scheduler_ = prev_scheduler;
 	}
 
-	bool ThreadPoolScheduler::IsExitRequested() const noexcept { return exit_flag_.load(std::memory_order_acquire); }
+	bool CpuThreadPool::IsExitRequested() const noexcept { return exit_flag_.load(std::memory_order_acquire); }
 
-	void ThreadPoolScheduler::Exit() noexcept
+	void CpuThreadPool::Exit() noexcept
 	{
 		if (exit_flag_.exchange(true, std::memory_order_acq_rel))
 		{
@@ -119,21 +122,21 @@ namespace prism
 
 	// ── Policy helpers ─────────────────────────────────────────────────
 
-	bool ThreadPoolScheduler::ShouldUseFastPath(std::size_t priority) noexcept { return priority == 0; }
+	bool CpuThreadPool::ShouldUseFastPath(std::size_t priority) noexcept { return priority == 0; }
 
-	bool ThreadPoolScheduler::ShouldAcceptSubmitDuringShutdown() const noexcept
+	bool CpuThreadPool::ShouldAcceptSubmitDuringShutdown() const noexcept
 	{
 		return !IsExitRequested() || (current_scheduler_ == this);
 	}
 
-	bool ThreadPoolScheduler::ShouldPromoteLazyTask(const LazyTask& task, std::chrono::steady_clock::time_point now) noexcept
+	bool CpuThreadPool::ShouldPromoteLazyTask(const LazyTask& task, std::chrono::steady_clock::time_point now) noexcept
 	{
 		return task.deadline <= now;
 	}
 
 	// ── Mechanics helpers ──────────────────────────────────────────────
 
-	void ThreadPoolScheduler::PushToPriorityQueue(Job job, std::size_t priority, bool wake)
+	void CpuThreadPool::PushToPriorityQueue(Job job, std::size_t priority, bool wake)
 	{
 		{
 			std::lock_guard lock(priority_mutex_);
@@ -145,22 +148,27 @@ namespace prism
 		}
 	}
 
-	void ThreadPoolScheduler::Submit(Job job, std::size_t priority)
+	void CpuThreadPool::Submit(Job job)
+	{
+		SubmitJob(std::move(job), 0);
+	}
+
+	void CpuThreadPool::SubmitWithPriority(Job job, std::size_t priority)
 	{
 		SubmitJob(std::move(job), priority);
 	}
 
-	void ThreadPoolScheduler::SubmitAfter(std::chrono::steady_clock::time_point deadline, Job job)
+	void CpuThreadPool::SubmitAfter(std::chrono::steady_clock::time_point deadline, Job job)
 	{
 		SubmitAfterJob(deadline, std::move(job));
 	}
 
-	void ThreadPoolScheduler::SubmitIn(Context ctx, Job job)
+	void CpuThreadPool::SubmitIn(Context ctx, Job job)
 	{
 		SubmitInJob(ctx, std::move(job));
 	}
 
-	bool ThreadPoolScheduler::TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable)
+	bool CpuThreadPool::TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable)
 	{
 		if (worker_index >= work_threads_.size())
 		{
@@ -179,7 +187,7 @@ namespace prism
 		return true;
 	}
 
-	std::size_t ThreadPoolScheduler::ChooseLeastLoadedWorker() const
+	std::size_t CpuThreadPool::ChooseLeastLoadedWorker() const
 	{
 		std::size_t best_index = 0;
 		std::size_t best_load = work_threads_.front().Load();
@@ -195,7 +203,7 @@ namespace prism
 		return best_index;
 	}
 
-	std::size_t ThreadPoolScheduler::ChooseSubmissionWorker()
+	std::size_t CpuThreadPool::ChooseSubmissionWorker()
 	{
 		const auto worker_count = work_threads_.size();
 		if (worker_count == 0)
@@ -205,7 +213,7 @@ namespace prism
 		return submit_cursor_.fetch_add(1, std::memory_order_relaxed) % worker_count;
 	}
 
-	void ThreadPoolScheduler::DispatchExpiredTask(LazyTask&& task)
+	void CpuThreadPool::DispatchExpiredTask(LazyTask&& task)
 	{
 		const auto worker_index = ChooseLeastLoadedWorker();
 		if (!TryPushToWorker(std::move(task.job), worker_index, true, true))
@@ -214,7 +222,7 @@ namespace prism
 		}
 	}
 
-	void ThreadPoolScheduler::PromoteLazyResidueToWorkers()
+	void CpuThreadPool::PromoteLazyResidueToWorkers()
 	{
 		while (!lazy_queue_.empty())
 		{
@@ -228,7 +236,7 @@ namespace prism
 		}
 	}
 
-	void ThreadPoolScheduler::DrainLazyQueueToEmpty(bool& work_remains)
+	void CpuThreadPool::DrainLazyQueueToEmpty(bool& work_remains)
 	{
 		while (!lazy_queue_.empty())
 		{
@@ -251,7 +259,7 @@ namespace prism
 		}
 	}
 
-	void ThreadPoolScheduler::DrainPriorityQueueToEmpty(bool& work_remains)
+	void CpuThreadPool::DrainPriorityQueueToEmpty(bool& work_remains)
 	{
 		while (!priority_queue_.empty())
 		{
@@ -274,7 +282,7 @@ namespace prism
 		}
 	}
 
-	void ThreadPoolScheduler::DrainWorkerLocalQueues(bool& work_remains)
+	void CpuThreadPool::DrainWorkerLocalQueues(bool& work_remains)
 	{
 		for (auto& t : work_threads_)
 		{
@@ -283,7 +291,7 @@ namespace prism
 		}
 	}
 
-	void ThreadPoolScheduler::PriorityLoop()
+	void CpuThreadPool::PriorityLoop()
 	{
 		while (true)
 		{
@@ -312,7 +320,7 @@ namespace prism
 		}
 	}
 
-	void ThreadPoolScheduler::LazyLoop()
+	void CpuThreadPool::LazyLoop()
 	{
 		while (true)
 		{
@@ -352,12 +360,12 @@ namespace prism
 		}
 	}
 
-	void ThreadPoolScheduler::WorkThread::Start(ThreadPoolScheduler& scheduler, std::size_t worker_index)
+	void CpuThreadPool::WorkThread::Start(CpuThreadPool& scheduler, std::size_t worker_index)
 	{
 		thread_ = std::jthread([this, &scheduler, worker_index] { Consume(scheduler, worker_index); });
 	}
 
-	void ThreadPoolScheduler::WorkThread::Join()
+	void CpuThreadPool::WorkThread::Join()
 	{
 		if (thread_.joinable())
 		{
@@ -365,7 +373,7 @@ namespace prism
 		}
 	}
 
-	bool ThreadPoolScheduler::WorkThread::DrainRemaining() noexcept
+	bool CpuThreadPool::WorkThread::DrainRemaining() noexcept
 	{
 		// Called from destructor after thread has been joined — no concurrent access.
 		bool did_work = false;
@@ -387,9 +395,9 @@ namespace prism
 		return did_work;
 	}
 
-	std::thread::id ThreadPoolScheduler::WorkThread::Id() const { return thread_.get_id(); }
+	std::thread::id CpuThreadPool::WorkThread::Id() const { return thread_.get_id(); }
 
-	void ThreadPoolScheduler::WorkThread::Push(Job job)
+	void CpuThreadPool::WorkThread::Push(Job job)
 	{
 		{
 			std::lock_guard lock(mutex_);
@@ -399,7 +407,7 @@ namespace prism
 		semaphore_.release();
 	}
 
-	void ThreadPoolScheduler::WorkThread::Push(Job job, bool stealable)
+	void CpuThreadPool::WorkThread::Push(Job job, bool stealable)
 	{
 		{
 			std::lock_guard lock(mutex_);
@@ -409,7 +417,7 @@ namespace prism
 		semaphore_.release();
 	}
 
-	void ThreadPoolScheduler::WorkThread::PushDispatched(Job job)
+	void CpuThreadPool::WorkThread::PushDispatched(Job job)
 	{
 		{
 			std::lock_guard lock(mutex_);
@@ -419,13 +427,15 @@ namespace prism
 		semaphore_.release();
 	}
 
-	std::size_t ThreadPoolScheduler::WorkThread::Load() const noexcept { return load_.load(std::memory_order_relaxed); }
+	std::size_t CpuThreadPool::WorkThread::Load() const noexcept { return load_.load(std::memory_order_relaxed); }
 
-	void ThreadPoolScheduler::WorkThread::Wake() { semaphore_.release(); }
+	void CpuThreadPool::WorkThread::Wake() { semaphore_.release(); }
 
-	bool ThreadPoolScheduler::WorkThread::TrySteal(ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state)
+	bool CpuThreadPool::WorkThread::TrySteal(CpuThreadPool& scheduler, std::size_t worker_index, std::uint64_t& rng_state)
 	{
+#ifdef PRISM_RUNTIME_METRICS
 		RuntimeMetrics::Instance().steal_attempts.fetch_add(1, std::memory_order_relaxed);
+#endif
 
 		if (scheduler.work_threads_.size() <= 1)
 		{
@@ -478,17 +488,21 @@ namespace prism
 
 		for (auto& queued : stolen)
 		{
+#ifdef PRISM_RUNTIME_METRICS
 			queued.stolen = true;
+#endif
 			queue_.push_front(std::move(queued));
 		}
 		victim.load_.fetch_sub(stolen.size(), std::memory_order_relaxed);
 		load_.fetch_add(stolen.size(), std::memory_order_relaxed);
 
+#ifdef PRISM_RUNTIME_METRICS
 		RuntimeMetrics::Instance().steal_successes.fetch_add(1, std::memory_order_relaxed);
+#endif
 		return true;
 	}
 
-	bool ThreadPoolScheduler::WorkThread::TryDequeueJob(QueuedJob& out)
+	bool CpuThreadPool::WorkThread::TryDequeueJob(QueuedJob& out)
 	{
 		std::lock_guard lock(mutex_);
 		if (queue_.empty())
@@ -499,7 +513,7 @@ namespace prism
 		return true;
 	}
 
-	bool ThreadPoolScheduler::WorkThread::HandleJobCompletion(QueuedJob& job, ThreadPoolScheduler& scheduler) noexcept
+	bool CpuThreadPool::WorkThread::HandleJobCompletion(QueuedJob& job, CpuThreadPool& scheduler) noexcept
 	{
 		try
 		{
@@ -510,6 +524,7 @@ namespace prism
 			std::terminate();
 		}
 
+#ifdef PRISM_RUNTIME_METRICS
 		if (job.stolen)
 		{
 			RuntimeMetrics::Instance().stolen_jobs_completed.fetch_add(1, std::memory_order_relaxed);
@@ -518,6 +533,7 @@ namespace prism
 		{
 			RuntimeMetrics::Instance().worker_local_jobs_completed.fetch_add(1, std::memory_order_relaxed);
 		}
+#endif
 
 		if (scheduler.IsExitRequested())
 		{
@@ -527,7 +543,7 @@ namespace prism
 		return false;
 	}
 
-	void ThreadPoolScheduler::WorkThread::Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept
+	void CpuThreadPool::WorkThread::Consume(CpuThreadPool& scheduler, std::size_t worker_index) noexcept
 	{
 		// Register this thread with the scheduler instance so CaptureContext() can validate.
 		current_scheduler_ = &scheduler;
@@ -580,14 +596,16 @@ namespace prism
 		current_worker_index_ = 0;
 	}
 
-	void ThreadPoolScheduler::RecordForegroundFastPathSubmit() noexcept
+#ifdef PRISM_RUNTIME_METRICS
+	void CpuThreadPool::RecordForegroundFastPathSubmit() noexcept
 	{
 		RuntimeMetrics::Instance().foreground_fastpath_submits.fetch_add(1, std::memory_order_relaxed);
 	}
 
-	void ThreadPoolScheduler::RecordForegroundFallbackSubmit() noexcept
+	void CpuThreadPool::RecordForegroundFallbackSubmit() noexcept
 	{
 		RuntimeMetrics::Instance().foreground_fallback_submits.fetch_add(1, std::memory_order_relaxed);
 	}
+#endif
 
 }

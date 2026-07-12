@@ -4,12 +4,13 @@
 #include "io_reactor.h"
 #include "scheduler.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
-#include <functional>
-#include <memory>
 #include <mutex>
+#include <new>
+#include <semaphore>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -17,51 +18,48 @@
 
 namespace prism
 {
-	// The interface for all continuation executors
-	// All the async execution backends should implement this interface
-	class IContinuationExecutor
-	{
-	public:
-		using Job = IScheduler::Job;
-
-		virtual ~IContinuationExecutor() = default;
-		virtual void Submit(Job work) = 0;
-	};
-
-	enum class BlockingExecutorLane
+	enum class BlockingExecutorRole
 	{
 		kGeneric,
-		kRead,
+		kDbRead,
+		kBlockingIo,
 		kCompaction,
 	};
 
-	// A thread pool executor that uses a ThreadPoolScheduler to execute CPU-bound work
-	// Works in ThreadPoolExecutor are CPU bound
-	// which with no blocking
-	class ThreadPoolExecutor final: public IContinuationExecutor
+	struct BlockingExecutorOptions
 	{
-	public:
-		explicit ThreadPoolExecutor(ThreadPoolScheduler& scheduler);
-
-		void Submit(Job work) override;
-		template <typename F>
-		    requires(!std::is_same_v<std::decay_t<F>, Job>)
-		void Submit(F&& work)
-		{
-			scheduler_->Submit(std::forward<F>(work), 0);
-		}
-
-	private:
-		ThreadPoolScheduler* scheduler_;
+		bool enable_stealing = true;
 	};
 
-	// For IO or other likely blocking operations.
-	// Thread count is caller-selected per lane.
-	class BlockingExecutor final: public IContinuationExecutor
+	// BlockingExecutor: sharded-queue + work-stealing thread pool.
+	//
+	// Architecture:
+	// - N worker threads, each owning a Shard (deque + mutex + semaphore + load counter).
+	// - Submit() routes to a target shard:
+	//     * Re-entrant submit from a worker of this executor -> that worker's own shard
+	//       (preserves locality for recursive-submit / continuation patterns).
+	//     * External submit -> round-robin via atomic submit_cursor_.
+	// - WorkerLoop: pop from own shard; when empty, steal from peers (random victim,
+	//   steal up to half of victim's stealable jobs, LIFO-biased for cache locality);
+	//   when nothing stealable, block on the semaphore with a short try_acquire_for
+	//   backoff so shutdown stays responsive.
+	// - Shutdown: stopping_ is set, all shard semaphores are released; workers drain
+	//   remaining queued work (own + stealable from peers) before exiting. Destructor
+	//   joins all workers and then sequentially drains any residue (defensive).
+	//
+	// Public API is identical to the prior single-deque implementation:
+	//   ctor(thread_count, role), dtor, Submit(Job), Empty(), IsCurrentWorker().
+	// No caller depends on global FIFO ordering across the queue; with N>1 workers
+	// such ordering was already non-deterministic. Lane isolation between distinct
+	// BlockingExecutor instances is preserved (each instance has its own shards).
+	class BlockingExecutor final
 	{
 	public:
+		using Job = InlineJob;
+
 		explicit BlockingExecutor(std::size_t thread_count = 1,
-		    BlockingExecutorLane lane = BlockingExecutorLane::kGeneric);
+		    BlockingExecutorRole role = BlockingExecutorRole::kGeneric,
+		    BlockingExecutorOptions options = {});
 		~BlockingExecutor();
 
 		BlockingExecutor(const BlockingExecutor&) = delete;
@@ -69,35 +67,62 @@ namespace prism
 		BlockingExecutor(BlockingExecutor&&) = delete;
 		BlockingExecutor& operator=(BlockingExecutor&&) = delete;
 
-		void Submit(Job work) override;
+		void Submit(Job work);
+		// Execute immediately only when called re-entrantly from one of this
+		// executor's workers. Returning false lets the caller construct the
+		// queued fallback lazily, after the hot inline check.
+		template <typename F>
+		    requires(!std::is_same_v<std::decay_t<F>, Job> && std::is_invocable_r_v<void, std::decay_t<F>&>)
+		bool TryRunInline(F&& work)
+		{
+			if (!IsCurrentWorker())
+			{
+				return false;
+			}
+			work();
+			return true;
+		}
 		bool Empty() const;
 		bool IsCurrentWorker() const noexcept;
 
 	private:
-		void WorkerLoop();
+		struct alignas(64) Shard
+		{
+			std::mutex mutex;
+			std::deque<Job> queue;
+			std::counting_semaphore<> semaphore{ 0 };
+			std::atomic<std::size_t> load{ 0 };
+		};
 
-		mutable std::mutex mutex_;
-		std::condition_variable cv_;
-		std::deque<Job> queue_;
-		BlockingExecutorLane lane_{ BlockingExecutorLane::kGeneric };
-		bool stopping_{ false };
+		void WorkerLoop(std::size_t worker_index);
+		bool TryPopOwn(Shard& shard, Job& out);
+		bool TrySteal(std::size_t self_index, std::uint64_t& rng_state, Job& out);
+		void WakeAll();
+		bool AnyShardNonEmpty() const noexcept;
+		static std::size_t NextVictim(std::size_t self_index, std::size_t worker_count, std::uint64_t& rng_state);
+
+		BlockingExecutorRole role_{ BlockingExecutorRole::kGeneric };
+		BlockingExecutorOptions options_;
+		std::atomic<bool> stopping_{ false };
+		std::atomic<std::size_t> submit_cursor_{ 0 };
+		std::vector<std::unique_ptr<Shard>> shards_;
 		std::vector<std::jthread> workers_;
 	};
 
-	// A FIFO lane that executes submitted work serially
-	// Executes work in submission order
-	class SerialLane final: public IContinuationExecutor
+	class SerialExecutor final
 	{
 	public:
-		SerialLane();
-		~SerialLane();
+		using Job = InlineJob;
 
-		SerialLane(const SerialLane&) = delete;
-		SerialLane& operator=(const SerialLane&) = delete;
-		SerialLane(SerialLane&&) = delete;
-		SerialLane& operator=(SerialLane&&) = delete;
+		SerialExecutor();
+		~SerialExecutor();
 
-		void Submit(Job work) override;
+		SerialExecutor(const SerialExecutor&) = delete;
+		SerialExecutor& operator=(const SerialExecutor&) = delete;
+		SerialExecutor(SerialExecutor&&) = delete;
+		SerialExecutor& operator=(SerialExecutor&&) = delete;
+
+		void Submit(Job work);
 		bool Empty() const;
 		bool Done() const;
 		bool IsCurrentWorker() const noexcept;
@@ -113,103 +138,44 @@ namespace prism
 		bool running_{ false };
 	};
 
-	class ExecutorSchedulerAdapter final: public IScheduler
+	struct AsyncRuntimeOptions
+	{
+		std::size_t db_read_threads = 4;
+		std::size_t db_threads = 4;
+		std::size_t blocking_io_threads = 4;
+	};
+
+	class AsyncRuntime
 	{
 	public:
-		explicit ExecutorSchedulerAdapter(IContinuationExecutor& executor);
+		explicit AsyncRuntime(CpuThreadPool& cpu_pool, AsyncRuntimeOptions options = {});
 
-		void Submit(Job job, std::size_t priority = 0) override;
+		AsyncRuntime(const AsyncRuntime&) = delete;
+		AsyncRuntime& operator=(const AsyncRuntime&) = delete;
+		AsyncRuntime(AsyncRuntime&&) = delete;
+		AsyncRuntime& operator=(AsyncRuntime&&) = delete;
 
-	private:
-		IContinuationExecutor* executor_;
-	};
+		CpuThreadPool& CpuExecutor() noexcept { return cpu_executor_; }
+		BlockingExecutor& DbReadExecutor() noexcept { return db_read_executor_; }
+		BlockingExecutor& DbExecutor() noexcept { return db_read_executor_; }
+		SerialExecutor& DbWriteExecutor() noexcept { return db_write_executor_; }
+		BlockingExecutor& BlockingIoExecutor() noexcept { return blocking_io_executor_; }
+		BlockingExecutor& CompactionExecutor() noexcept { return compaction_executor_; }
+		SerialExecutor& SerialFileExecutor() noexcept { return serial_file_executor_; }
+		IoDispatcher& Io() noexcept { return io_dispatcher_; }
 
-	// RuntimeBundle owns the complete async execution environment for a DB instance.
-	// It concretely constructs executors and scheduler adapters.
-	//
-	// Physical threads (only 4 sources):
-	//   ThreadPoolScheduler (external, shared) — N worker threads, priority + timer
-	//   BlockingExecutor(4) — async file-I/O / metadata lane
-	//   BlockingExecutor(1) — background compaction lane (single-flight preserved)
-	//   SerialLane — 1 FIFO worker for ordered file writes
-	//
-	// Scheduler routing:
-	//   foreground_db_scheduler.Submit(job) → cpu_executor → ThreadPoolScheduler::Submit(job, 0)
-	//     (worker-local fast path / stealing-enabled shared CPU pool)
-	//   read_scheduler.Submit(job) → read_executor
-	//   compaction_scheduler.Submit(job) → compaction_executor
-	//   serial_scheduler.Submit(job) → serial_lane
-	//
-	// Ownership: RuntimeBundle is held via shared_ptr and registered by ThreadPoolScheduler
-	// key in a global weak registry (AcquireRuntimeBundle). If the last reference is
-	// released from a bundle-owned worker, deletion is deferred to a cleanup thread
-	// so no executor ever joins itself.
-	struct RuntimeBundle
-	{
-		explicit RuntimeBundle(ThreadPoolScheduler& scheduler);
+		const CpuThreadPool& CpuExecutor() const noexcept { return cpu_executor_; }
 		bool IsCurrentWorker() const noexcept;
 
-		RuntimeBundle(const RuntimeBundle&) = delete;
-		RuntimeBundle& operator=(const RuntimeBundle&) = delete;
-		RuntimeBundle(RuntimeBundle&&) = delete;
-		RuntimeBundle& operator=(RuntimeBundle&&) = delete;
-
-		// -- Physical executors (IContinuationExecutor, owns or wraps threads) --
-
-		// cpu_executor wraps the shared ThreadPoolScheduler for CPU-bound continuations.
-		ThreadPoolExecutor cpu_executor;
-
-		// timer_source points to the same ThreadPoolScheduler, used as a registry key
-		// by AcquireRuntimeBundle(). Named "timer_source" because ThreadPoolScheduler
-		// provides SubmitAfter() — reserved for future timer use.
-		ThreadPoolScheduler* timer_source;
-
-		// read_executor: async file-I/O blocking lane. AsyncEnv defaults here so
-		// file reads and metadata calls stay isolated from foreground DB work and
-		// from the single-flight compaction lane.
-		BlockingExecutor read_executor;
-
-		// io_dispatcher: prefers io_uring-backed reads/writes when a permanent file
-		// descriptor is available, and falls back to read_executor for platforms/files
-		// that cannot use the reactor path.
-		IoDispatcher io_dispatcher;
-
-		// compaction_executor: single-threaded FIFO dedicated to background
-		// compaction/flush work. Kept isolated to preserve one-compaction-per-DB
-		// semantics without contending with foreground reads.
-		BlockingExecutor compaction_executor;
-
-		// serial_lane: single-threaded FIFO for ordered write-side control flow
-		// (Flush/Sync/Close and file lifecycle). Append data can bypass this lane
-		// when the writable file exposes a stable descriptor and the reactor is live.
-		SerialLane serial_lane;
-
-		// -- Scheduler adapters (IScheduler, wraps an IContinuationExecutor) --
-
-		// cpu_scheduler: wraps cpu_executor_impl, so work runs on the shared CPU pool.
-		ExecutorSchedulerAdapter cpu_scheduler;
-
-		// read_scheduler: wraps read_executor. Blocking work runs on this lane, while
-		// AsyncOp resumes inline on the completing worker to avoid a second queue hop.
-		// RuntimeBundle destruction is deferred by AcquireRuntimeBundle() if the last
-		// reference is released here.
-		ExecutorSchedulerAdapter read_scheduler;
-
-		// compaction_scheduler: wraps compaction_executor. Used only for explicit
-		// direct background work submission to the isolated compaction lane.
-		ExecutorSchedulerAdapter compaction_scheduler;
-
-		// serial_scheduler: wraps serial_lane for ordered writes.
-		ExecutorSchedulerAdapter serial_scheduler;
-
-		// foreground_db_scheduler: wraps cpu_executor_impl. AsyncDB foreground operations use this
-		// adapter so CPU-resident DB work lands on ThreadPoolScheduler::Submit(job, 0),
-		// bypassing the old priority dispatcher/read-lane bottleneck while preserving
-		// explicit read/compaction/serial isolation for blocking subsystems.
-		ExecutorSchedulerAdapter foreground_db_scheduler;
+	private:
+		CpuThreadPool& cpu_executor_;
+		BlockingExecutor db_read_executor_;
+		SerialExecutor db_write_executor_;
+		BlockingExecutor blocking_io_executor_;
+		IoDispatcher io_dispatcher_;
+		BlockingExecutor compaction_executor_;
+		SerialExecutor serial_file_executor_;
 	};
-
-	std::shared_ptr<RuntimeBundle> AcquireRuntimeBundle(ThreadPoolScheduler& scheduler);
 
 } // namespace prism
 

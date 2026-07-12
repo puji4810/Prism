@@ -182,8 +182,8 @@ namespace prism
 			}
 		}
 
-		Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const override
-		{
+			Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const override
+			{
 			int fd = fd_;
 			if (!has_permanent_fd_)
 			{
@@ -250,10 +250,20 @@ namespace prism
 			}
 
 			*result = Slice(mmap_base_ + offset, n);
-			return Status::OK();
-		}
+				return Status::OK();
+			}
 
-	private:
+			Result<std::optional<Slice>> TryReadView(uint64_t offset, size_t n) const override
+			{
+				const uint64_t length = static_cast<uint64_t>(length_);
+				if (offset > length || static_cast<uint64_t>(n) > length - offset)
+				{
+					return std::unexpected(PosixError(filename_, EINVAL));
+				}
+				return std::optional<Slice>(std::in_place, mmap_base_ + offset, n);
+			}
+
+		private:
 		char* const mmap_base_;
 		const size_t length_;
 		Limiter* const mmap_limiter_;

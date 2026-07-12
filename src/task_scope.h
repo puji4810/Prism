@@ -142,7 +142,9 @@ namespace prism
 				{
 					completed_ = true;
 					quarantined_ = true;
+#ifdef PRISM_RUNTIME_METRICS
 					RuntimeMetrics::Instance().cancelled_before_start.fetch_add(1, std::memory_order_relaxed);
+#endif
 					quarantine_->StoreCancelled();
 				}
 				return false;
@@ -157,7 +159,9 @@ namespace prism
 			{
 				completed_ = true;
 				quarantined_ = true;
+#ifdef PRISM_RUNTIME_METRICS
 				RuntimeMetrics::Instance().cancelled_before_start.fetch_add(1, std::memory_order_relaxed);
+#endif
 				quarantine_->StoreCancelled();
 				return false;
 			}
@@ -173,7 +177,9 @@ namespace prism
 			{
 				completed_ = true;
 				quarantined_ = true;
+#ifdef PRISM_RUNTIME_METRICS
 				RuntimeMetrics::Instance().cancelled_before_start.fetch_add(1, std::memory_order_relaxed);
+#endif
 				quarantine_->StoreCancelled();
 			}
 		}
@@ -202,7 +208,9 @@ namespace prism
 
 			if (quarantine_value)
 			{
+#ifdef PRISM_RUNTIME_METRICS
 				RuntimeMetrics::Instance().late_completion_quarantined.fetch_add(1, std::memory_order_relaxed);
+#endif
 				quarantine_->StoreValue(std::move(value));
 				return;
 			}
@@ -280,7 +288,9 @@ namespace prism
 				{
 					completed_ = true;
 					quarantined_ = true;
+#ifdef PRISM_RUNTIME_METRICS
 					RuntimeMetrics::Instance().cancelled_before_start.fetch_add(1, std::memory_order_relaxed);
+#endif
 					quarantine_->StoreCancelled();
 				}
 				return false;
@@ -295,7 +305,9 @@ namespace prism
 			{
 				completed_ = true;
 				quarantined_ = true;
+#ifdef PRISM_RUNTIME_METRICS
 				RuntimeMetrics::Instance().cancelled_before_start.fetch_add(1, std::memory_order_relaxed);
+#endif
 				quarantine_->StoreCancelled();
 				return false;
 			}
@@ -311,7 +323,9 @@ namespace prism
 			{
 				completed_ = true;
 				quarantined_ = true;
+#ifdef PRISM_RUNTIME_METRICS
 				RuntimeMetrics::Instance().cancelled_before_start.fetch_add(1, std::memory_order_relaxed);
+#endif
 				quarantine_->StoreCancelled();
 			}
 		}
@@ -340,7 +354,9 @@ namespace prism
 
 			if (quarantine_unit)
 			{
+#ifdef PRISM_RUNTIME_METRICS
 				RuntimeMetrics::Instance().late_completion_quarantined.fetch_add(1, std::memory_order_relaxed);
+#endif
 				quarantine_->StoreUnit();
 				return;
 			}
@@ -393,9 +409,27 @@ namespace prism
 	class TaskScope
 	{
 	public:
-		explicit TaskScope(IContinuationExecutor& executor);
-		TaskScope(IContinuationExecutor& executor, StopToken parent_token);
-		TaskScope(IContinuationExecutor& executor, StopSource& parent_source);
+		explicit TaskScope(ExecutorRef executor);
+		TaskScope(ExecutorRef executor, StopToken parent_token);
+
+		template <typename Executor>
+		    requires(!std::is_same_v<std::decay_t<Executor>, ExecutorRef>)
+		explicit TaskScope(Executor& executor)
+		    : TaskScope(ExecutorRef(executor))
+		{
+		}
+		template <typename Executor>
+		    requires(!std::is_same_v<std::decay_t<Executor>, ExecutorRef>)
+		TaskScope(Executor& executor, StopToken parent_token)
+		    : TaskScope(ExecutorRef(executor), std::move(parent_token))
+		{
+		}
+		template <typename Executor>
+		    requires(!std::is_same_v<std::decay_t<Executor>, ExecutorRef>)
+		TaskScope(Executor& executor, StopSource& parent_source)
+		    : TaskScope(ExecutorRef(executor), parent_source.Token())
+		{
+		}
 		~TaskScope();
 
 		TaskScope(const TaskScope&) = delete;
@@ -416,10 +450,13 @@ namespace prism
 		{
 			BeginChild();
 			StopToken token = GetStopToken();
-			executor_->Submit([this, token = std::move(token), fn = std::forward<Fn>(fn)]() mutable {
+			auto job = std::make_shared<std::move_only_function<void()>>(
+			    [this, token = std::move(token), fn = std::forward<Fn>(fn)]() mutable {
 				if (token.StopRequested())
 				{
+#ifdef PRISM_RUNTIME_METRICS
 					RuntimeMetrics::Instance().cancelled_before_start.fetch_add(1, std::memory_order_relaxed);
+#endif
 					quarantine_->StoreCancelled();
 					FinishChild();
 					return;
@@ -436,6 +473,7 @@ namespace prism
 
 				FinishChild();
 			});
+			executor_.Submit([job = std::move(job)]() mutable { (*job)(); });
 		}
 
 		template <typename Work, typename Apply>
@@ -447,7 +485,8 @@ namespace prism
 
 			BeginChild();
 			StopToken token = GetStopToken();
-			executor_->Submit([this, token = std::move(token), state, work = std::forward<Work>(work)]() mutable {
+			auto job = std::make_shared<std::move_only_function<void()>>(
+			    [this, token = std::move(token), state, work = std::forward<Work>(work)]() mutable {
 				if (!state->TryStart())
 				{
 					FinishChild();
@@ -473,6 +512,7 @@ namespace prism
 
 				FinishChild();
 			});
+			executor_.Submit([job = std::move(job)]() mutable { (*job)(); });
 
 			return state;
 		}
@@ -481,7 +521,7 @@ namespace prism
 		void BeginChild();
 		void FinishChild() noexcept;
 
-		IContinuationExecutor* executor_;
+		ExecutorRef executor_;
 		StopSource stop_source_;
 		StopToken parent_token_;
 		std::shared_ptr<Quarantine> quarantine_;

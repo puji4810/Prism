@@ -16,13 +16,20 @@ namespace
 	class AsyncCancellationTest: public ::testing::Test
 	{
 	protected:
-		void SetUp() override { RuntimeMetrics::Instance().Reset(); }
+		void SetUp() override
+		{
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().Reset();
+#endif
+		}
 	};
 
-	class ManualExecutor: public IContinuationExecutor
+	class ManualExecutor
 	{
 	public:
-		void Submit(Job work) override
+		using Job = InlineJob;
+
+		void Submit(Job work)
 		{
 			std::lock_guard lock(mutex_);
 			queue_.push(std::move(work));
@@ -59,7 +66,9 @@ TEST_F(AsyncCancellationTest, PreStartCancelledPayloadNeverExecutes)
 
 	EXPECT_EQ(ran.load(std::memory_order_acquire), 0);
 	EXPECT_EQ(scope.QuarantineSink().Count(Quarantine::EntryKind::kCancelled), 1);
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_GE(RuntimeMetrics::Instance().cancelled_before_start.load(std::memory_order_relaxed), 1u);
+#endif
 }
 
 TEST_F(AsyncCancellationTest, RunningCpuTaskStopsAtCheckpoint)
@@ -91,7 +100,9 @@ TEST_F(AsyncCancellationTest, RunningCpuTaskStopsAtCheckpoint)
 	EXPECT_TRUE(stopped.load(std::memory_order_acquire));
 	EXPECT_EQ(checkpoints.load(std::memory_order_acquire), 1);
 	EXPECT_EQ(scope.QuarantineSink().Size(), 0);
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_GE(RuntimeMetrics::Instance().cooperative_checkpoint_cancel.load(std::memory_order_relaxed), 1u);
+#endif
 }
 
 TEST_F(AsyncCancellationTest, LateCompletionIsQuarantinedInsteadOfApplied)
@@ -119,5 +130,7 @@ TEST_F(AsyncCancellationTest, LateCompletionIsQuarantinedInsteadOfApplied)
 	EXPECT_TRUE(state->WasQuarantined());
 	EXPECT_FALSE(state->WasApplied());
 	EXPECT_EQ(scope.QuarantineSink().Count(Quarantine::EntryKind::kValue), 1);
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_GE(RuntimeMetrics::Instance().late_completion_quarantined.load(std::memory_order_relaxed), 1u);
+#endif
 }

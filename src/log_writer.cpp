@@ -10,63 +10,62 @@ namespace prism::log
 {
 	namespace
 	{
-		void InitTypeCrc(uint32_t* type_crc)
+		uint32_t TypeCrc(RecordType type)
 		{
-			for (int i = 0; i <= kMaxRecordType; ++i)
-			{
-				const char t = static_cast<char>(i);
-				type_crc[i] = crc32c::Crc32c(&t, 1);
-			}
+			const char t = static_cast<char>(type);
+			return crc32c::Crc32c(&t, 1);
+		}
+
+		void AppendPhysicalRecord(std::string* dst, RecordType type, const char* ptr, size_t length)
+		{
+			assert(dst != nullptr);
+			assert(length <= 0xffff);
+
+			uint32_t crc = crc32c::Extend(TypeCrc(type), reinterpret_cast<const uint8_t*>(ptr), length);
+			crc = Mask(crc);
+
+			Header header;
+			header.checksum = crc;
+			header.length = static_cast<uint16_t>(length);
+			header.type = type;
+
+			char buf[kHeaderSize];
+			header.EncodeTo(buf);
+			dst->append(buf, kHeaderSize);
+			dst->append(ptr, length);
 		}
 	}
 
-	Writer::Writer(WritableFile* dest)
-	    : dest_(dest)
-	    , block_offset_(0)
+	Result<EncodedRecord> EncodeRecordFragments(const Slice& record, int starting_block_offset)
 	{
-		assert(dest_ != nullptr);
-		InitTypeCrc(type_crc_);
-	}
+		if (starting_block_offset < 0 || starting_block_offset >= kBlockSize)
+		{
+			return std::unexpected(Status::InvalidArgument("invalid WAL block offset"));
+		}
 
-	Writer::Writer(WritableFile* dest, uint64_t dest_length)
-	    : dest_(dest)
-	    , block_offset_(static_cast<int>(dest_length % kBlockSize))
-	{
-		assert(dest_ != nullptr);
-		InitTypeCrc(type_crc_);
-	}
-
-	Status Writer::AddRecord(const Slice& record)
-	{
+		EncodedRecord encoded;
+		int block_offset = starting_block_offset;
 		const char* ptr = record.data();
 		size_t left = record.size();
 
-		// Fragment the record if necessary and emit it.
-		// Note that if record is empty, we still want to iterate once
-		// to emit a single zero-length record.
 		bool begin = true;
 		do
 		{
-			const int leftover = kBlockSize - block_offset_;
+			const int leftover = kBlockSize - block_offset;
 			assert(leftover >= 0);
 
 			if (leftover < kHeaderSize)
 			{
-				// Switch to a new block.
 				if (leftover > 0)
 				{
 					const char zeros[kHeaderSize] = { 0 };
-					Status s = dest_->Append(Slice(zeros, static_cast<size_t>(leftover)));
-					if (!s.ok())
-					{
-						return s;
-					}
+					encoded.bytes.append(zeros, static_cast<size_t>(leftover));
 				}
-				block_offset_ = 0;
+				block_offset = 0;
 			}
 
-			assert(kBlockSize - block_offset_ - kHeaderSize >= 0);
-			const size_t avail = static_cast<size_t>(kBlockSize - block_offset_ - kHeaderSize);
+			assert(kBlockSize - block_offset - kHeaderSize >= 0);
+			const size_t avail = static_cast<size_t>(kBlockSize - block_offset - kHeaderSize);
 			const size_t fragment_length = (left < avail) ? left : avail;
 
 			RecordType type;
@@ -88,45 +87,56 @@ namespace prism::log
 				type = RecordType::kMiddleType;
 			}
 
-			Status s = EmitPhysicalRecord(type, ptr, fragment_length);
-			if (!s.ok())
-			{
-				return s;
-			}
+			AppendPhysicalRecord(&encoded.bytes, type, ptr, fragment_length);
+			++encoded.physical_records;
+			block_offset += kHeaderSize + static_cast<int>(fragment_length);
 
 			ptr += fragment_length;
 			left -= fragment_length;
 			begin = false;
 		} while (left > 0);
 
-		return Status::OK();
+		encoded.ending_block_offset = (block_offset == kBlockSize) ? 0 : block_offset;
+		return encoded;
 	}
 
-	Status Writer::EmitPhysicalRecord(RecordType type, const char* ptr, size_t length)
+	Writer::Writer(WritableFile* dest)
+	    : dest_(dest)
+	    , block_offset_(0)
 	{
-		assert(length <= 0xffff);
-		assert(block_offset_ + kHeaderSize + static_cast<int>(length) <= kBlockSize);
+		assert(dest_ != nullptr);
+	}
 
-		uint32_t crc = crc32c::Extend(type_crc_[static_cast<int>(type)], reinterpret_cast<const uint8_t*>(ptr), length);
-		crc = Mask(crc);
+	Writer::Writer(WritableFile* dest, uint64_t dest_length)
+	    : dest_(dest)
+	    , block_offset_(static_cast<int>(dest_length % kBlockSize))
+	{
+		assert(dest_ != nullptr);
+	}
 
-		Header header;
-		header.checksum = crc;
-		header.length = static_cast<uint16_t>(length);
-		header.type = type;
-
-		char buf[kHeaderSize];
-		header.EncodeTo(buf);
-
-		Status s = dest_->Append(Slice(buf, kHeaderSize));
-		if (s.ok())
+	Status Writer::AddRecord(const Slice& record)
+	{
+		auto encoded = EncodeRecordFragments(record, block_offset_);
+		if (!encoded.has_value())
 		{
-			s = dest_->Append(Slice(ptr, length));
+			return encoded.error();
 		}
+		Status s = dest_->Append(Slice(encoded->bytes));
 		if (s.ok())
 		{
-			block_offset_ += kHeaderSize + static_cast<int>(length);
+			block_offset_ = encoded->ending_block_offset;
 		}
 		return s;
+	}
+
+	Result<EncodedRecord> Writer::ReserveRecord(const Slice& record)
+	{
+		auto encoded = EncodeRecordFragments(record, block_offset_);
+		if (!encoded.has_value())
+		{
+			return encoded;
+		}
+		block_offset_ = encoded->ending_block_offset;
+		return encoded;
 	}
 }

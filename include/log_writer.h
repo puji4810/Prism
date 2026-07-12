@@ -2,8 +2,10 @@
 #define LOG_WRITER_H_
 
 #include <cstdint>
+#include <string>
 #include "slice.h"
 #include "status.h"
+#include "result.h"
 #include "log_format.h"
 
 namespace prism
@@ -12,6 +14,15 @@ namespace prism
 
 	namespace log
 	{
+		struct EncodedRecord
+		{
+			std::string bytes;
+			int ending_block_offset = 0;
+			std::size_t physical_records = 0;
+		};
+
+		Result<EncodedRecord> EncodeRecordFragments(const Slice& record, int starting_block_offset);
+
 		class Writer
 		{
 		public:
@@ -24,12 +35,10 @@ namespace prism
 			Writer& operator=(Writer&&) = delete;
 
 			Status AddRecord(const Slice& record);
+			Result<EncodedRecord> ReserveRecord(const Slice& record);
 
 		private:
-			Status EmitPhysicalRecord(RecordType type, const char* ptr, size_t length);
-
 			WritableFile* dest_;
-			uint32_t type_crc_[kMaxRecordType + 1]; // crc32c values for all supported record types.
 			int block_offset_;  // Current offset in block
 		};
 	} // namespace log

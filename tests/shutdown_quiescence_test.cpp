@@ -20,7 +20,12 @@ namespace
 	class ShutdownQuiescenceTest: public ::testing::Test
 	{
 	protected:
-		void SetUp() override { RuntimeMetrics::Instance().Reset(); }
+		void SetUp() override
+		{
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().Reset();
+#endif
+		}
 	};
 
 	bool WaitUntil(const std::function<bool()>& condition, std::chrono::milliseconds timeout)
@@ -114,7 +119,9 @@ TEST_F(ShutdownQuiescenceTest, ShutdownQuarantinesLateResultsAfterStop)
 
 	EXPECT_EQ(applied.load(std::memory_order_acquire), 0);
 	EXPECT_TRUE(state->WasQuarantined());
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_GE(RuntimeMetrics::Instance().late_completion_quarantined.load(std::memory_order_relaxed), 1u);
+#endif
 }
 
 TEST_F(ShutdownQuiescenceTest, CompactionShutdownQuiescesCleanly)
@@ -143,8 +150,10 @@ TEST_F(ShutdownQuiescenceTest, CompactionShutdownQuiescesCleanly)
 
 	ASSERT_TRUE(WaitUntil([&destroyed] { return destroyed.load(std::memory_order_acquire); }, 5s));
 	destroy_thread.join();
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_GE(RuntimeMetrics::Instance().shutdown_wait_count.load(std::memory_order_relaxed), 1u);
 	EXPECT_GT(RuntimeMetrics::Instance().shutdown_wait_duration_us.load(std::memory_order_relaxed), 0u);
+#endif
 
 	std::filesystem::remove_all("test_compaction_shutdown_quiesces_cleanly", ec);
 }

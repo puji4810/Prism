@@ -12,19 +12,21 @@ namespace prism
 	// Append the fixed32, fixed64, varint32, varint64, and length prefixed slice to the string
 	void PutFixed32(std::string& dst, uint32_t value);
 	void PutFixed64(std::string& dst, uint64_t value);
-	void PutVarint32(std::string& dst, uint32_t value);
+	inline void PutVarint32(std::string& dst, uint32_t value);
 	void PutVarint64(std::string& dst, uint64_t value);
-	void PutLengthPrefixedSlice(std::string& dst, const Slice& value);
+	inline void PutLengthPrefixedSlice(std::string& dst, const Slice& value);
 
-	bool GetVarint32(Slice* src, uint32_t* value);
+	inline bool GetVarint32(Slice* src, uint32_t* value);
 	bool GetVarint64(Slice* src, uint64_t* value);
-	bool GetLengthPrefixedSlice(Slice* src, Slice* value);
+	inline bool GetLengthPrefixedSlice(Slice* src, Slice* value);
 
 	// Returns the length of the varint32 or varint64 encoding of "v"
 	int VarintLength(uint64_t v);
 
 	char* EncodeVarint32(char* dst, uint32_t value);
 	char* EncodeVarint64(char* dst, uint64_t value);
+	const char* GetVarint32Ptr(const char* p, const char* limit, uint32_t* value);
+	const char* GetVarint64Ptr(const char* p, const char* limit, uint64_t* value);
 
 	inline static void EncodeFixed32(char* dst, uint32_t value)
 	{
@@ -63,11 +65,59 @@ namespace prism
 		    | (static_cast<uint64_t>(buffer[6]) << 48) | (static_cast<uint64_t>(buffer[7]) << 56);
 	}
 
-	// get the varint32 from the pointer, and advance the pointer
-	const char* GetVarint32Ptr(const char* p, const char* limit, uint32_t* value);
+	inline void PutVarint32(std::string& dst, uint32_t value)
+	{
+		if (value < 128)
+		{
+			dst.push_back(static_cast<char>(value));
+			return;
+		}
+		char buffer[5];
+		char* end = EncodeVarint32(buffer, value);
+		dst.append(buffer, static_cast<size_t>(end - buffer));
+	}
 
-	// get the varint64 from the pointer, and advance the pointer
-	const char* GetVarint64Ptr(const char* p, const char* limit, uint64_t* value);
+	inline void PutLengthPrefixedSlice(std::string& dst, const Slice& value)
+	{
+		PutVarint32(dst, static_cast<uint32_t>(value.size()));
+		dst.append(value.data(), value.size());
+	}
+
+	inline bool GetVarint32(Slice* src, uint32_t* value)
+	{
+		if (src->empty())
+		{
+			return false;
+		}
+		const auto first = static_cast<uint8_t>((*src)[0]);
+		if (first < 128)
+		{
+			*value = first;
+			src->remove_prefix(1);
+			return true;
+		}
+
+		const char* begin = src->data();
+		const char* end = GetVarint32Ptr(begin, begin + src->size(), value);
+		if (end == nullptr)
+		{
+			return false;
+		}
+		src->remove_prefix(static_cast<size_t>(end - begin));
+		return true;
+	}
+
+	inline bool GetLengthPrefixedSlice(Slice* src, Slice* value)
+	{
+		uint32_t length = 0;
+		if (!GetVarint32(src, &length) || src->size() < static_cast<size_t>(length))
+		{
+			return false;
+		}
+		*value = Slice(src->data(), static_cast<size_t>(length));
+		src->remove_prefix(static_cast<size_t>(length));
+		return true;
+	}
 
 	// try to decode the varint32 from the slice, and return the value if successful
 	std::optional<uint32_t> TryDecodeVarint32(Slice in);

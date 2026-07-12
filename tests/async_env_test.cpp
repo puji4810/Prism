@@ -1,4 +1,5 @@
 #include "async_env.h"
+#include "../src/async_runtime.h"
 
 #include <atomic>
 #include <array>
@@ -51,8 +52,9 @@ namespace
 // Happy path: write a file via sync Env, read it back via AsyncEnv::ReadAtStringAsync.
 TEST_F(AsyncEnvTest, ReadAtStringAsync)
 {
-	ThreadPoolScheduler scheduler(4);
-	AsyncEnv async_env(scheduler, env_);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+	AsyncEnv async_env(runtime, env_);
 
 	const std::string path = TestFile("read_string.txt");
 
@@ -85,8 +87,9 @@ TEST_F(AsyncEnvTest, ReadAtStringAsync)
 // Read via ReadAtAsync into a caller-owned std::vector<std::byte>.
 TEST_F(AsyncEnvTest, ReadAtAsync)
 {
-	ThreadPoolScheduler scheduler(4);
-	AsyncEnv async_env(scheduler, env_);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+	AsyncEnv async_env(runtime, env_);
 
 	const std::string path = TestFile("read_bytes.txt");
 	const std::string kContent = "async_read";
@@ -122,8 +125,9 @@ TEST_F(AsyncEnvTest, ReadAtAsync)
 // Partial read: request a range that matches actual file size.
 TEST_F(AsyncEnvTest, ReadAtStringAsyncExact)
 {
-	ThreadPoolScheduler scheduler(4);
-	AsyncEnv async_env(scheduler, env_);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+	AsyncEnv async_env(runtime, env_);
 
 	const std::string path = TestFile("read_exact.txt");
 
@@ -154,8 +158,9 @@ TEST_F(AsyncEnvTest, ReadAtStringAsyncExact)
 // Non-existent file should return an error, not crash.
 TEST_F(AsyncEnvTest, NewRandomAccessFileAsyncFailure)
 {
-	ThreadPoolScheduler scheduler(4);
-	AsyncEnv async_env(scheduler, env_);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+	AsyncEnv async_env(runtime, env_);
 
 	auto task = [&]() -> Task<void> {
 		auto file_res = co_await async_env.NewRandomAccessFileAsync(TestFile("no_such_file.txt"));
@@ -167,8 +172,9 @@ TEST_F(AsyncEnvTest, NewRandomAccessFileAsyncFailure)
 // AppendAfterClose: append after CloseAsync returns IOError.
 TEST_F(AsyncEnvTest, AppendAfterClose)
 {
-	ThreadPoolScheduler scheduler(4);
-	AsyncEnv async_env(scheduler, env_);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+	AsyncEnv async_env(runtime, env_);
 	const std::string path = TestFile("append_after_close.txt");
 
 	auto task = [&]() -> Task<void> {
@@ -196,14 +202,15 @@ TEST_F(AsyncEnvTest, AppendAfterClose)
 // Uses a sequencing counter to ensure deterministic ordering without sleep_for.
 TEST_F(AsyncEnvTest, ConcurrentAppendFIFO)
 {
-	ThreadPoolScheduler scheduler(8);
+	CpuThreadPool scheduler(8);
+	AsyncRuntime runtime(scheduler);
 	const std::string path = TestFile("fifo_order.txt");
 	constexpr int kCount = 16;
 
 	// Create the writable file and wrap it.
 	auto wf_res_raw = env_->NewWritableFile(path);
 	ASSERT_TRUE(wf_res_raw.has_value()) << wf_res_raw.error().ToString();
-	auto async_wf = std::make_shared<AsyncWritableFile>(scheduler, std::move(wf_res_raw.value()));
+	auto async_wf = std::make_shared<AsyncWritableFile>(runtime, std::move(wf_res_raw.value()));
 
 	// Ordered handoff synchronization: main thread serializes AppendAsync submissions.
 	// Each worker thread has a 'go' flag and a 'ready' flag.
@@ -288,7 +295,8 @@ TEST_F(AsyncEnvTest, ConcurrentAppendFIFO)
 // Env::Default() and the scheduler (kept alive here) outlive the op.
 TEST_F(AsyncEnvTest, DestroyBeforeAwait)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	const std::string path = TestFile("destroy_before_await.txt");
 
 	// Write a file so the read can actually succeed.
@@ -303,7 +311,7 @@ TEST_F(AsyncEnvTest, DestroyBeforeAwait)
 
 	// Obtain the AsyncOp while async_env is alive, then destroy async_env.
 	AsyncOp<Result<AsyncRandomAccessFile>> op = [&] {
-		AsyncEnv async_env(scheduler, env_);
+		AsyncEnv async_env(runtime, env_);
 		return async_env.NewRandomAccessFileAsync(path);
 	}(); // async_env destroyed here
 
@@ -321,12 +329,13 @@ TEST_F(AsyncEnvTest, DestroyBeforeAwait)
 // Either way, no deadlock, no crash.
 TEST_F(AsyncEnvTest, CloseInterleaving)
 {
-	ThreadPoolScheduler scheduler(8);
+	CpuThreadPool scheduler(8);
+	AsyncRuntime runtime(scheduler);
 	const std::string path = TestFile("close_interleave.txt");
 
 	auto wf_raw = env_->NewWritableFile(path);
 	ASSERT_TRUE(wf_raw.has_value()) << wf_raw.error().ToString();
-	auto async_wf = std::make_shared<AsyncWritableFile>(scheduler, std::move(wf_raw.value()));
+	auto async_wf = std::make_shared<AsyncWritableFile>(runtime, std::move(wf_raw.value()));
 
 	// Issue CloseAsync and AppendAsync concurrently from two threads.
 	// Both get tickets under the mutex — whichever ran first determines the outcome.
@@ -354,12 +363,13 @@ TEST_F(AsyncEnvTest, CloseInterleaving)
 
 TEST_F(AsyncEnvTest, QueuedSecondCloseReturnsIoError)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	const std::string path = TestFile("queued_second_close.txt");
 
 	auto wf_raw = env_->NewWritableFile(path);
 	ASSERT_TRUE(wf_raw.has_value()) << wf_raw.error().ToString();
-	auto async_wf = std::make_shared<AsyncWritableFile>(scheduler, std::move(wf_raw.value()));
+	auto async_wf = std::make_shared<AsyncWritableFile>(runtime, std::move(wf_raw.value()));
 
 	auto first_close = async_wf->CloseAsync();
 	auto second_close = async_wf->CloseAsync();
@@ -378,13 +388,14 @@ TEST_F(AsyncEnvTest, QueuedSecondCloseReturnsIoError)
 // safety semantics, and no UAF occurs after wrapper destruction.
 TEST_F(AsyncEnvTest, AsyncWritableFileMoveAndDestroySafety)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	const std::string path = TestFile("move_safety.txt");
 
 	// Create original AsyncWritableFile
 	auto wf_raw = env_->NewWritableFile(path);
 	ASSERT_TRUE(wf_raw.has_value()) << wf_raw.error().ToString();
-	auto async_wf1 = std::make_shared<AsyncWritableFile>(scheduler, std::move(wf_raw.value()));
+	auto async_wf1 = std::make_shared<AsyncWritableFile>(runtime, std::move(wf_raw.value()));
 
 	// Move-construct a second AsyncWritableFile from the first
 	auto async_wf2 = std::make_shared<AsyncWritableFile>(std::move(*async_wf1));
@@ -417,11 +428,12 @@ TEST_F(AsyncEnvTest, AsyncWritableFileMoveAndDestroySafety)
 }
 
 // AsyncEnv has a single file-I/O routing policy: metadata and factory
-// operations use the RuntimeBundle read lane.
+// operations use the AsyncRuntime read lane.
 TEST_F(AsyncEnvTest, FileOperationsUseDefaultReadLane)
 {
-	ThreadPoolScheduler scheduler(4);
-	AsyncEnv async_env(scheduler, env_);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+	AsyncEnv async_env(runtime, env_);
 
 	const std::string dir_path = TestFile("read_lane");
 	auto mkdir_task = [&]() -> Task<void> {

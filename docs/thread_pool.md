@@ -1,32 +1,32 @@
 # Thread Pool Scheduler Architecture
 
-This document describes the design and implementation of the `ThreadPoolScheduler`, Prism's CPU continuation executor for short async operations and coroutine resumes.
+This document describes the design and implementation of the `CpuThreadPool`, Prism's CPU continuation executor for short async operations and coroutine resumes.
 
-The `ThreadPoolScheduler` handles **CPU continuations and non-IO work only**. Blocking synchronous operations (such as filesystem I/O, compaction, and long-running sync work) are routed to the `BlockingExecutor` or `SerialLane`. This split prevents blocking work from starving lightweight coroutine continuations.
+The `CpuThreadPool` handles **CPU continuations and non-IO work only**. Blocking synchronous operations (such as filesystem I/O, compaction, and long-running sync work) are routed to the `BlockingExecutor` or `SerialExecutor`. This split prevents blocking work from starving lightweight coroutine continuations.
 
 ## 1. Core Abstractions
 
-The system is built around the `IScheduler` interface to allow for dependency injection and deterministic testing.
+Runtime components use concrete executors. Generic awaitable code stores a small `ExecutorRef` submit thunk so it can target any executor with `Submit(InlineJob)` without virtual dispatch.
 
-### `IScheduler`
+### `ExecutorRef`
 
-A minimal abstract interface for work submission:
+A non-owning submit reference:
 
-- `Submit(job, priority)`: Enqueue a job for immediate execution.
+- `Submit(job)`: Enqueue a job on the referenced executor.
 
 ### `Job`
 
-A `Job` is a `std::function<void()>`. For coroutines, this typically wraps a `std::coroutine_handle<>::resume()` call.
+A `Job` is an `InlineJob`, a move-only `void()` wrapper with inline storage and heap fallback for larger callables. For coroutines, this often wraps a `std::coroutine_handle<>::resume()` call.
 
 ---
 
 ## 2. Architecture Overview
 
-The `ThreadPoolScheduler` uses a **multi-queue dispatch** architecture with dedicated dispatcher threads and worker-local queues.
+The `CpuThreadPool` uses a **multi-queue dispatch** architecture with dedicated dispatcher threads and worker-local queues.
 
 ### Components
 
-1. **ThreadPoolScheduler**: Orchestrates worker threads and dispatchers. Maintains a `pending_list_` of idle workers.
+1. **CpuThreadPool**: Orchestrates worker threads and dispatchers. Maintains a `pending_list_` of idle workers.
 2. **WorkThread**: A pool of $N$ worker threads. Each thread has a private mutex-protected `std::deque` and a `std::counting_semaphore`.
 3. **Priority Dispatcher**: Processes a global `priority_queue_` and assigns tasks to idle workers.
 4. **Lazy Dispatcher**: Manages delayed tasks in a `lazy_queue_`. It promotes tasks to the priority dispatcher or directly to workers when their deadline expires.
@@ -36,7 +36,9 @@ The `ThreadPoolScheduler` uses a **multi-queue dispatch** architecture with dedi
 ```mermaid
 flowchart TD
     subgraph Submission
-        Submit[Submit / SubmitAfter]
+        Submit[Submit]
+        SubmitPri[SubmitWithPriority]
+        SubmitAfter[SubmitAfter]
         SubmitIn[SubmitIn: Affinity]
     end
 
@@ -56,7 +58,8 @@ flowchart TD
         Wn[Worker N]
     end
 
-    Submit --> PriorityQ
+    Submit --> WorkerQ
+    SubmitPri --> PriorityQ
     SubmitAfter --> LazyQ
     SubmitIn -.->|Bypass Dispatcher| WorkerQ
 
@@ -76,9 +79,13 @@ flowchart TD
 
 ## 3. Task Submission Paths
 
-### `Submit(job, priority)`
+### `Submit(job)`
 
-Tasks are pushed into a global priority queue. The **Priority Dispatcher** thread monitors this queue. When a task is available and there is an idle worker in the `pending_list_`, the dispatcher assigns the task to that worker's local queue.
+Priority-0 tasks are pushed directly to a worker-local queue. A worker self-submit returns to the same worker queue; external submits use a round-robin worker choice. Work stealing remains available for balance.
+
+### `SubmitWithPriority(job, priority)`
+
+Priority-0 submissions use the same direct path as `Submit(job)`. Non-zero priorities enter the fallback priority queue, where the **Priority Dispatcher** assigns work to idle workers.
 
 ### `SubmitAfter(deadline, job)`
 
@@ -133,9 +140,9 @@ The scheduler enforces a **fail-fast** exception policy:
 
 ---
 
-## 7. BlockingExecutor and SerialLane
+## 7. BlockingExecutor and SerialExecutor
 
-While `ThreadPoolScheduler` owns the CPU continuation pool, Prism's runtime includes two additional specialized executors managed through `RuntimeBundle`:
+While `CpuThreadPool` owns the CPU continuation pool, Prism's runtime includes two additional specialized executors managed through `AsyncRuntime`:
 
 ### BlockingExecutor
 
@@ -146,19 +153,19 @@ The `BlockingExecutor` runs long-running synchronous operations on a dedicated t
 
 By isolating these operations from the CPU thread pool, the `BlockingExecutor` ensures that a multi-second compaction never delays a sub-microsecond coroutine resume.
 
-### SerialLane
+### SerialExecutor
 
-The `SerialLane` provides strict FIFO ordering on a single dedicated thread. It is used for:
+The `SerialExecutor` provides strict FIFO ordering on a single dedicated thread. It is used for:
 
-- **Ordered file writes** — `AsyncWritableFile` serializes append/sync operations through `SerialLane`, guaranteeing that writes complete in submission order without ticket-based condition variable overhead.
+- **Ordered file writes** — `AsyncWritableFile` serializes append/sync operations through `SerialExecutor`, guaranteeing that writes complete in submission order without ticket-based condition variable overhead.
 
-Unlike the `ThreadPoolScheduler`, `SerialLane` does not support priority dispatch or work-stealing. It is a simple single-threaded queue designed for correctness (ordering) rather than throughput parallelism.
+Unlike the `CpuThreadPool`, `SerialExecutor` does not support priority dispatch or work-stealing. It is a simple single-threaded queue designed for correctness (ordering) rather than throughput parallelism.
 
 ---
 
 ## 8. Structured Shutdown with TaskScope
 
-The `ThreadPoolScheduler` participates in Prism's structured concurrency model through `TaskScope`:
+The `CpuThreadPool` participates in Prism's structured concurrency model through `TaskScope`:
 
 - On database destruction, `DBImpl::~DBImpl()` requests compaction stop via `CompactionController::RequestStop()`, waits for the active lane to drain through `background_work_finished_signal_`, and calls `ControllerWaitQuiescent()` to confirm the lane is idle before joining threads.
 - `TaskScope` governs short-lived async operations, not database-level background compaction. The compaction controller owns its own stop token and quiescence contract.

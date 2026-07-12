@@ -15,6 +15,7 @@ namespace prism
 		const char* Name() const override { return "Prism.BytewiseComparator"; }
 
 		int Compare(const Slice& a, const Slice& b) const override { return a.compare(b); }
+		ComparatorKind Kind() const noexcept override { return ComparatorKind::kBytewise; }
 
 		void FindShortestSeparator(std::string* start, const Slice& limit) const override
 		{

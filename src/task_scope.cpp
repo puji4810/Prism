@@ -34,14 +34,16 @@ namespace prism
 
 	bool StopToken::StopRequested() const noexcept
 	{
-		auto current = chain_;
+		// chain_ owns the entire immutable parent chain for the duration of this
+		// call, so traversal does not need a shared_ptr ref/unref at every node.
+		const ChainNode* current = chain_.get();
 		while (current)
 		{
 			if (current->state && current->state->stop_requested.load(std::memory_order_acquire))
 			{
 				return true;
 			}
-			current = current->parent;
+			current = current->parent.get();
 		}
 		return false;
 	}
@@ -51,7 +53,9 @@ namespace prism
 		const bool stop_requested = StopRequested();
 		if (stop_requested)
 		{
+#ifdef PRISM_RUNTIME_METRICS
 			RuntimeMetrics::Instance().cooperative_checkpoint_cancel.fetch_add(1, std::memory_order_relaxed);
+#endif
 		}
 		return stop_requested;
 	}
@@ -100,21 +104,16 @@ namespace prism
 		return entries_;
 	}
 
-	TaskScope::TaskScope(IContinuationExecutor& executor)
-	    : executor_(&executor)
+	TaskScope::TaskScope(ExecutorRef executor)
+	    : executor_(executor)
 	    , quarantine_(std::make_shared<Quarantine>())
 	{
 	}
 
-	TaskScope::TaskScope(IContinuationExecutor& executor, StopToken parent_token)
-	    : executor_(&executor)
+	TaskScope::TaskScope(ExecutorRef executor, StopToken parent_token)
+	    : executor_(executor)
 	    , parent_token_(std::move(parent_token))
 	    , quarantine_(std::make_shared<Quarantine>())
-	{
-	}
-
-	TaskScope::TaskScope(IContinuationExecutor& executor, StopSource& parent_source)
-	    : TaskScope(executor, parent_source.Token())
 	{
 	}
 

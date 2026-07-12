@@ -6,6 +6,16 @@ add_requires("crc32c", "gtest")
 
 set_languages("cxx23")
 
+option("runtime_metrics")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable runtime metrics instrumentation")
+option_end()
+
+if has_config("runtime_metrics") then
+    add_defines("PRISM_RUNTIME_METRICS")
+end
+
 local common_files = {"src/*.cpp", "util/*.cpp", "include/table/*.cpp"}
 local generated_configdir = "$(builddir)/generated"
 local common_includedirs = {generated_configdir, "include", "src", "util"}

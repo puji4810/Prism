@@ -82,7 +82,7 @@ namespace prism::bench
 		{
 		}
 		~ScopedScheduler() = default;
-		ThreadPoolScheduler sched;
+		CpuThreadPool sched;
 	};
 
 	void RunFunctionOverheadBench()
@@ -184,7 +184,7 @@ namespace prism::bench
 		{
 			ScopedScheduler scoped(1);
 			auto& sched = scoped.sched;
-			BlockingExecutor exec(1, BlockingExecutorLane::kRead);
+			BlockingExecutor exec(1, BlockingExecutorRole::kBlockingIo);
 
 			// Small-capture case: like continuation
 			auto p = std::make_shared<int>(42);
@@ -223,7 +223,7 @@ namespace prism::bench
 		{
 			ScopedScheduler scoped(1);
 			auto& sched = scoped.sched;
-			BlockingExecutor exec(1, BlockingExecutorLane::kRead);
+			BlockingExecutor exec(1, BlockingExecutorRole::kBlockingIo);
 
 			auto p = std::make_shared<int>(42);
 			auto big_key = std::string(1000, 'x');
@@ -264,7 +264,7 @@ namespace prism::bench
 		{
 			ScopedScheduler scoped(1);
 			auto& sched = scoped.sched;
-			BlockingExecutor exec(1, BlockingExecutorLane::kRead);
+			BlockingExecutor exec(1, BlockingExecutorRole::kBlockingIo);
 
 			auto p = std::make_shared<int>(42);
 			auto big_key = std::string(1000, 'x');

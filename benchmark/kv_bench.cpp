@@ -1,6 +1,7 @@
 #include "kv_bench_lib.h"
 
 #include "asyncdb.h"
+#include "async_runtime.h"
 #include "bench_env_wrapper.h"
 #include "db.h"
 #include "db_impl.h"
@@ -138,12 +139,12 @@ namespace prism::bench
 		(void)std::filesystem::remove_all(dir);
 	}
 
-	static Detached RunAsyncOpen(std::optional<AsyncDB>& out_db, ThreadPoolScheduler& scheduler, const Options& options,
+	static Detached RunAsyncOpen(std::optional<AsyncDB>& out_db, AsyncRuntime& runtime, const Options& options,
 	    const std::string& dir, std::binary_semaphore& sem, std::exception_ptr& exc)
 	{
 		try
 		{
-			auto result = co_await AsyncDB ::OpenAsync(scheduler, options, dir);
+			auto result = co_await AsyncDB::OpenAsync(runtime, options, dir);
 			if (result.has_value())
 			{
 				out_db.emplace(std::move(result.value()));
@@ -157,202 +158,127 @@ namespace prism::bench
 		co_return;
 	}
 
-	static void RunAsyncBenchmark(const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	static std::string AsyncRoundDir(const Config& cfg, const std::string& base_dir, int round)
 	{
-		const std::string dir = cfg.db_dir.empty() ? MakeTempDir("bench_async") : cfg.db_dir;
-		ThreadPoolScheduler scheduler(static_cast<std::size_t>(cfg.workers));
-		Options options;
-		options.create_if_missing = true;
-		options.write_buffer_size = cfg.write_buffer_size;
-
-		if (cfg.mode == BenchMode::kDiskRead)
+		if (!cfg.round_isolation)
 		{
-			options.write_buffer_size = std::min<std::size_t>(options.write_buffer_size, 4 * 1024);
+			return base_dir;
 		}
+		auto root = cfg.db_dir.empty() ? std::filesystem::path(base_dir) : std::filesystem::path(cfg.db_dir);
+		return (root / ("round_" + std::to_string(round))).string();
+	}
 
-		BenchEnvWrapper env_wrapper(Env::Default());
-		Env* env_to_use = Env::Default();
-		if (cfg.mode == BenchMode::kCompactionOverlap)
-		{
-			env_to_use = &env_wrapper;
-			options.env = &env_wrapper;
-		}
-
-		const bool should_prefill = (cfg.mode == BenchMode::kSstReadPipeline) || (cfg.prefill == 1)
-		    || (cfg.mode == BenchMode::kCompactionOverlap)
+	static bool AsyncShouldPrefill(const Config& cfg)
+	{
+		return (cfg.mode == BenchMode::kSstReadPipeline) || (cfg.prefill == 1) || (cfg.mode == BenchMode::kCompactionOverlap)
 		    || (cfg.prefill == -1 && (cfg.mode == BenchMode::kDiskRead || cfg.read_ratio > 0));
+	}
 
-		if (should_prefill)
+	static bool PrefillAsyncDbDir(const Config& cfg, const Options& options, Env* env_to_use,
+	    const std::vector<std::vector<std::string>>& keys, const std::string& dir)
+	{
+		if (!AsyncShouldPrefill(cfg))
 		{
-			if (cfg.profile_pause_prefill)
-				__itt_pause();
-			Options prefill_options = options;
-			prefill_options.env = env_to_use;
-			auto pre = Database::Open(prefill_options, dir);
-			if (!pre.has_value())
-			{
-				std::fprintf(stderr, "async prefill open failed: %s\n", pre.error().ToString().c_str());
-				if (cfg.profile_pause_prefill)
-					__itt_resume();
-				return;
-			}
-			auto pre_db = std::move(pre.value());
-			Prefill(pre_db, keys, cfg.ops_per_client, cfg.value_size);
+			return true;
+		}
+		if (cfg.profile_pause_prefill)
+			__itt_pause();
+		Options prefill_options = options;
+		prefill_options.env = env_to_use;
+		auto pre = Database::Open(prefill_options, dir);
+		if (!pre.has_value())
+		{
+			std::fprintf(stderr, "async prefill open failed: %s\n", pre.error().ToString().c_str());
 			if (cfg.profile_pause_prefill)
 				__itt_resume();
+			return false;
 		}
+		auto pre_db = std::move(pre.value());
+		Prefill(pre_db, keys, cfg.ops_per_client, cfg.value_size);
+		if (cfg.profile_pause_prefill)
+			__itt_resume();
+		return true;
+	}
 
+	static std::optional<AsyncDB> OpenAsyncDbForBenchmark(AsyncRuntime& runtime, const Options& options, const std::string& dir)
+	{
 		auto open_sem = std::binary_semaphore(0);
 		std::optional<AsyncDB> adb;
 		std::exception_ptr open_exc;
-		RunAsyncOpen(adb, scheduler, options, dir, open_sem, open_exc);
+		RunAsyncOpen(adb, runtime, options, dir, open_sem, open_exc);
 
 		open_sem.acquire();
 		if (open_exc)
 		{
 			std::rethrow_exception(open_exc);
 		}
+		return adb;
+	}
 
-		std::printf("phase=%s scheduler_threads=%zu inflight_per_client=%d\n", PhaseName(cfg.phase).c_str(), scheduler.WorkerCount(),
-		    cfg.inflight_per_client);
-
-		// prefill-only: prefill already done above, return early
-		if (cfg.phase == PhaseMode::kPrefillOnly)
+	static Stats RunAsyncMeasuredRound(AsyncDB& adb, CpuThreadPool& scheduler, BenchEnvWrapper& env_wrapper, const Config& cfg,
+	    const std::vector<std::vector<std::string>>& keys, int round)
+	{
+		if (cfg.mode == BenchMode::kCompactionOverlap)
 		{
-			std::printf("phase=prefill-only: prefill completed, exiting (no measurement)\n");
-			if (!cfg.keep_db)
-			{
-				(void)std::filesystem::remove_all(dir);
-			}
-			return;
+			env_wrapper.Reset();
 		}
 
-		for (int w = 0; w < cfg.warmup_rounds; ++w)
+		Stats stats;
+		if (cfg.mode == BenchMode::kDiskRead)
 		{
-			if (cfg.mode == BenchMode::kDiskRead)
+			stats = RunAsyncDiskRead(adb, scheduler, cfg, keys);
+			PrintLine("async_disk", cfg, round, stats, stats.max_inflight_observed);
+		}
+		else if (cfg.mode == BenchMode::kSstReadPipeline)
+		{
+			stats = RunAsyncSstReadPipeline(adb, scheduler, cfg, keys);
+			PrintLine("async_sst_read_pipeline", cfg, round, stats, stats.max_inflight_observed);
+		}
+		else if (cfg.mode == BenchMode::kDurabilityWrite)
+		{
+			stats = RunAsyncDurabilityWrite(adb, scheduler, cfg, keys);
+			PrintLine("async_durability_write", cfg, round, stats, stats.max_inflight_observed);
+		}
+		else if (cfg.mode == BenchMode::kCompactionOverlap)
+		{
+			stats = RunAsyncCompactionOverlap(adb, scheduler, cfg, keys);
+			stats.bg_sleeps = env_wrapper.SleepCalls();
+			PrintLine("async_compaction_overlap", cfg, round, stats, stats.max_inflight_observed);
+		}
+		else
+		{
+			stats = RunAsyncMixed(adb, scheduler, cfg, keys);
+			PrintLine("async", cfg, round, stats, stats.max_inflight_observed);
+		}
+		return stats;
+	}
+
+	static void AddAsyncRoundStats(const Config& cfg, const Stats& stats, std::vector<uint64_t>& all_lat, double& total_seconds,
+	    std::size_t& total_max_inflight_observed, std::size_t& total_max_client_inflight, int& total_write_sync, int& total_bg_sleeps)
+	{
+		total_seconds += stats.seconds;
+		if (stats.max_inflight_observed > total_max_inflight_observed)
+		{
+			total_max_inflight_observed = stats.max_inflight_observed;
+		}
+		if (stats.max_client_inflight > total_max_client_inflight)
+		{
+			total_max_client_inflight = stats.max_client_inflight;
+		}
+		total_write_sync = stats.write_sync;
+		total_bg_sleeps += stats.bg_sleeps;
+		if (!cfg.no_latency)
+		{
+			auto it = all_lat.insert(all_lat.end(), stats.latency_ns.begin(), stats.latency_ns.end());
+			if (it == all_lat.end())
 			{
-				(void)RunAsyncDiskRead(*adb, scheduler, cfg, keys);
-			}
-			else if (cfg.mode == BenchMode::kSstReadPipeline)
-			{
-				(void)RunAsyncSstReadPipeline(*adb, scheduler, cfg, keys);
-			}
-			else if (cfg.mode == BenchMode::kDurabilityWrite)
-			{
-				(void)RunAsyncDurabilityWrite(*adb, scheduler, cfg, keys);
-			}
-			else if (cfg.mode == BenchMode::kCompactionOverlap)
-			{
-				(void)RunAsyncCompactionOverlap(*adb, scheduler, cfg, keys);
-			}
-			else
-			{
-				(void)RunAsyncMixed(*adb, scheduler, cfg, keys);
+				std::terminate();
 			}
 		}
+	}
 
-		// warmup-only: warmup already done above, return early
-		if (cfg.phase == PhaseMode::kWarmupOnly)
-		{
-			std::printf("phase=warmup-only: warmup completed, exiting (no measurement)\n");
-			if (!cfg.keep_db)
-			{
-				(void)std::filesystem::remove_all(dir);
-			}
-			return;
-		}
-
-		// ── Phase-aware compaction/quiescence annotation ──────────────────
-		// Query compaction state before steady-state measurement to detect
-		// whether background work overlaps the profiling window.
-		DBImpl* dbi = CompactionStateAccess::GetDBImpl(CompactionStateAccess::GetDatabase(*adb));
-		if (cfg.phase == PhaseMode::kSteadyState)
-		{
-			const auto cs = dbi->GetCompactionState();
-			std::printf("phase=steady-state compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
-			            " compaction_start_count=%lu compaction_finish_count=%lu\n",
-			    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight), static_cast<int>(cs.write_stalled),
-			    static_cast<unsigned long>(cs.compaction_start_count), static_cast<unsigned long>(cs.compaction_finish_count));
-		}
-		else if (cfg.phase == PhaseMode::kCompactionOverlapOnly)
-		{
-			const auto cs = dbi->GetCompactionState();
-			std::printf("phase=compaction-overlap-only compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
-			            " compaction_start_count=%lu compaction_finish_count=%lu\n",
-			    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight), static_cast<int>(cs.write_stalled),
-			    static_cast<unsigned long>(cs.compaction_start_count), static_cast<unsigned long>(cs.compaction_finish_count));
-		}
-
-		std::vector<uint64_t> all_lat;
-		double total_seconds = 0;
-		std::size_t total_max_inflight_observed = 0;
-		std::size_t total_max_client_inflight = 0;
-		int total_write_sync = 0;
-		int total_bg_sleeps = 0;
-
-		for (int r = 1; r <= cfg.rounds; ++r)
-		{
-			if (cfg.mode == BenchMode::kCompactionOverlap)
-			{
-				env_wrapper.Reset();
-			}
-
-			Stats stats;
-			if (cfg.mode == BenchMode::kDiskRead)
-			{
-				stats = RunAsyncDiskRead(*adb, scheduler, cfg, keys);
-				PrintLine("async_disk", cfg, r, stats, stats.max_inflight_observed);
-			}
-			else if (cfg.mode == BenchMode::kSstReadPipeline)
-			{
-				stats = RunAsyncSstReadPipeline(*adb, scheduler, cfg, keys);
-				PrintLine("async_sst_read_pipeline", cfg, r, stats, stats.max_inflight_observed);
-			}
-			else if (cfg.mode == BenchMode::kDurabilityWrite)
-			{
-				stats = RunAsyncDurabilityWrite(*adb, scheduler, cfg, keys);
-				PrintLine("async_durability_write", cfg, r, stats, stats.max_inflight_observed);
-			}
-			else if (cfg.mode == BenchMode::kCompactionOverlap)
-			{
-				stats = RunAsyncCompactionOverlap(*adb, scheduler, cfg, keys);
-				stats.bg_sleeps = env_wrapper.SleepCalls();
-				PrintLine("async_compaction_overlap", cfg, r, stats, stats.max_inflight_observed);
-			}
-			else
-			{
-				stats = RunAsyncMixed(*adb, scheduler, cfg, keys);
-				PrintLine("async", cfg, r, stats, stats.max_inflight_observed);
-			}
-
-			total_seconds += stats.seconds;
-			if (stats.max_inflight_observed > total_max_inflight_observed)
-			{
-				total_max_inflight_observed = stats.max_inflight_observed;
-			}
-			if (stats.max_client_inflight > total_max_client_inflight)
-			{
-				total_max_client_inflight = stats.max_client_inflight;
-			}
-			total_write_sync = stats.write_sync;
-			total_bg_sleeps += stats.bg_sleeps;
-			if (!cfg.no_latency)
-			{
-				auto it = all_lat.insert(all_lat.end(), stats.latency_ns.begin(), stats.latency_ns.end());
-				if (it == all_lat.end())
-				{
-					std::terminate();
-				}
-			}
-		}
-
-		Stats total;
-		total.seconds = total_seconds / static_cast<double>(cfg.rounds);
-		total.latency_ns = std::move(all_lat);
-		total.max_inflight_observed = total_max_inflight_observed;
-		total.max_client_inflight = total_max_client_inflight;
-		total.write_sync = total_write_sync;
-		total.bg_sleeps = total_bg_sleeps;
+	static void PrintAsyncTotal(const Config& cfg, Stats total)
+	{
 		if (cfg.mode == BenchMode::kDiskRead)
 		{
 			PrintLine("async_disk_total", cfg, 0, total, total.max_inflight_observed);
@@ -373,7 +299,183 @@ namespace prism::bench
 		{
 			PrintLine("async_total", cfg, 0, total, total.max_inflight_observed);
 		}
+	}
 
+	static void RunAsyncBenchmark(const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	{
+		const std::string dir = cfg.db_dir.empty() ? MakeTempDir("bench_async") : cfg.db_dir;
+		CpuThreadPool scheduler(static_cast<std::size_t>(cfg.workers));
+		AsyncRuntimeOptions opts;
+		opts.db_read_threads = static_cast<std::size_t>(cfg.workers);
+		opts.blocking_io_threads = static_cast<std::size_t>(cfg.workers);
+		AsyncRuntime runtime(scheduler, opts);
+		Options options;
+		options.create_if_missing = true;
+		options.write_buffer_size = cfg.write_buffer_size;
+
+		if (cfg.mode == BenchMode::kDiskRead)
+		{
+			options.write_buffer_size = std::min<std::size_t>(options.write_buffer_size, 4 * 1024);
+		}
+
+		BenchEnvWrapper env_wrapper(Env::Default());
+		Env* env_to_use = Env::Default();
+		if (cfg.mode == BenchMode::kCompactionOverlap)
+		{
+			env_to_use = &env_wrapper;
+			options.env = &env_wrapper;
+		}
+
+		if (cfg.round_isolation && cfg.warmup_rounds > 0)
+		{
+			std::printf("round_isolation=1: ignoring warmup_rounds=%d because each measured round uses a fresh DB\n",
+			    cfg.warmup_rounds);
+		}
+
+		if (!cfg.round_isolation && !PrefillAsyncDbDir(cfg, options, env_to_use, keys, dir))
+		{
+			return;
+		}
+
+		std::optional<AsyncDB> adb;
+		if (!cfg.round_isolation)
+		{
+			adb = OpenAsyncDbForBenchmark(runtime, options, dir);
+		}
+
+		std::printf("phase=%s scheduler_threads=%zu inflight_per_client=%d round_isolation=%d db_dir=%s\n",
+		    PhaseName(cfg.phase).c_str(), scheduler.WorkerCount(), cfg.inflight_per_client, static_cast<int>(cfg.round_isolation),
+		    dir.c_str());
+
+		// prefill-only: prefill already done above, return early
+		if (cfg.phase == PhaseMode::kPrefillOnly)
+		{
+			std::printf("phase=prefill-only: prefill completed, exiting (no measurement)\n");
+			if (!cfg.keep_db)
+			{
+				(void)std::filesystem::remove_all(dir);
+			}
+			return;
+		}
+
+		if (!cfg.round_isolation)
+		{
+			for (int w = 0; w < cfg.warmup_rounds; ++w)
+			{
+				if (cfg.mode == BenchMode::kDiskRead)
+				{
+					(void)RunAsyncDiskRead(*adb, scheduler, cfg, keys);
+				}
+				else if (cfg.mode == BenchMode::kSstReadPipeline)
+				{
+					(void)RunAsyncSstReadPipeline(*adb, scheduler, cfg, keys);
+				}
+				else if (cfg.mode == BenchMode::kDurabilityWrite)
+				{
+					(void)RunAsyncDurabilityWrite(*adb, scheduler, cfg, keys);
+				}
+				else if (cfg.mode == BenchMode::kCompactionOverlap)
+				{
+					(void)RunAsyncCompactionOverlap(*adb, scheduler, cfg, keys);
+				}
+				else
+				{
+					(void)RunAsyncMixed(*adb, scheduler, cfg, keys);
+				}
+			}
+		}
+
+		// warmup-only: warmup already done above, return early
+		if (cfg.phase == PhaseMode::kWarmupOnly)
+		{
+			std::printf("phase=warmup-only: warmup completed, exiting (no measurement)\n");
+			if (!cfg.keep_db)
+			{
+				(void)std::filesystem::remove_all(dir);
+			}
+			return;
+		}
+
+		// ── Phase-aware compaction/quiescence annotation ──────────────────
+		// Query compaction state before steady-state measurement to detect
+		// whether background work overlaps the profiling window.
+		if (!cfg.round_isolation)
+		{
+			DBImpl* dbi = CompactionStateAccess::GetDBImpl(CompactionStateAccess::GetDatabase(*adb));
+			if (cfg.phase == PhaseMode::kSteadyState)
+			{
+				const auto cs = dbi->GetCompactionState();
+				std::printf("phase=steady-state compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
+				            " compaction_start_count=%lu compaction_finish_count=%lu\n",
+				    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight), static_cast<int>(cs.write_stalled),
+				    static_cast<unsigned long>(cs.compaction_start_count), static_cast<unsigned long>(cs.compaction_finish_count));
+			}
+			else if (cfg.phase == PhaseMode::kCompactionOverlapOnly)
+			{
+				const auto cs = dbi->GetCompactionState();
+				std::printf("phase=compaction-overlap-only compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
+				            " compaction_start_count=%lu compaction_finish_count=%lu\n",
+				    static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight), static_cast<int>(cs.write_stalled),
+				    static_cast<unsigned long>(cs.compaction_start_count), static_cast<unsigned long>(cs.compaction_finish_count));
+			}
+		}
+
+		std::vector<uint64_t> all_lat;
+		double total_seconds = 0;
+		std::size_t total_max_inflight_observed = 0;
+		std::size_t total_max_client_inflight = 0;
+		int total_write_sync = 0;
+		int total_bg_sleeps = 0;
+
+		for (int r = 1; r <= cfg.rounds; ++r)
+		{
+			Stats stats;
+			if (cfg.round_isolation)
+			{
+				const std::string round_dir = AsyncRoundDir(cfg, dir, r);
+				(void)std::filesystem::remove_all(round_dir);
+				(void)std::filesystem::create_directories(std::filesystem::path(round_dir).parent_path());
+				if (!PrefillAsyncDbDir(cfg, options, env_to_use, keys, round_dir))
+				{
+					(void)std::filesystem::remove_all(round_dir);
+					return;
+				}
+				auto round_db = OpenAsyncDbForBenchmark(runtime, options, round_dir);
+				if (cfg.phase == PhaseMode::kSteadyState || cfg.phase == PhaseMode::kCompactionOverlapOnly)
+				{
+					DBImpl* dbi = CompactionStateAccess::GetDBImpl(CompactionStateAccess::GetDatabase(*round_db));
+					const auto cs = dbi->GetCompactionState();
+					std::printf("round_db=%s compaction_in_flight=%d flush_in_flight=%d write_stalled=%d"
+					            " compaction_start_count=%lu compaction_finish_count=%lu\n",
+					    round_dir.c_str(), static_cast<int>(cs.compaction_in_flight), static_cast<int>(cs.flush_in_flight),
+					    static_cast<int>(cs.write_stalled), static_cast<unsigned long>(cs.compaction_start_count),
+					    static_cast<unsigned long>(cs.compaction_finish_count));
+				}
+				stats = RunAsyncMeasuredRound(*round_db, scheduler, env_wrapper, cfg, keys, r);
+				round_db.reset();
+				if (!cfg.keep_db)
+				{
+					(void)std::filesystem::remove_all(round_dir);
+				}
+			}
+			else
+			{
+				stats = RunAsyncMeasuredRound(*adb, scheduler, env_wrapper, cfg, keys, r);
+			}
+			AddAsyncRoundStats(
+			    cfg, stats, all_lat, total_seconds, total_max_inflight_observed, total_max_client_inflight, total_write_sync, total_bg_sleeps);
+		}
+
+		Stats total;
+		total.seconds = total_seconds / static_cast<double>(cfg.rounds);
+		total.latency_ns = std::move(all_lat);
+		total.max_inflight_observed = total_max_inflight_observed;
+		total.max_client_inflight = total_max_client_inflight;
+		total.write_sync = total_write_sync;
+		total.bg_sleeps = total_bg_sleeps;
+		PrintAsyncTotal(cfg, std::move(total));
+
+		adb.reset();
 		if (!cfg.keep_db)
 		{
 			(void)std::filesystem::remove_all(dir);

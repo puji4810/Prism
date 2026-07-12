@@ -286,8 +286,7 @@ TEST_F(ObsoleteFilesTest, RecoveryRemovesDeadLogsButKeepsLiveTables)
 		ASSERT_TRUE(db->Put("keep_key_" + std::to_string(i), std::string(64, 'y')).ok());
 	}
 
-	auto live_tables = ListTableFiles();
-	ASSERT_FALSE(live_tables.empty());
+	ASSERT_FALSE(ListTableFiles().empty());
 	db.reset();
 
 	const std::string stale_log = LogFileName(kDbName, 1);
@@ -299,11 +298,32 @@ TEST_F(ObsoleteFilesTest, RecoveryRemovesDeadLogsButKeepsLiveTables)
 	auto reopened = std::move(reopen_res.value());
 	auto* impl = reopened.get();
 
+	// Pin a Version and assert against its manifest-live SSTs. A raw directory
+	// snapshot can also contain files made obsolete by a concurrent compaction,
+	// especially in sanitizer builds where this timing window is much wider.
+	auto live_iterator = reopened->NewIterator(ReadOptions());
+	ASSERT_NE(live_iterator, nullptr);
+	std::vector<std::string> live_tables;
+	for (int level = 0; level < kNumLevels; ++level)
+	{
+		for (const auto& file : impl->TEST_LevelFilesCopy(level))
+		{
+			live_tables.push_back(TableFileName(kDbName, file.number));
+		}
+	}
+	ASSERT_FALSE(live_tables.empty());
+
 	impl->TEST_RemoveObsoleteFiles();
 	EXPECT_FALSE(std::filesystem::exists(stale_log));
 	for (const auto& table_file : live_tables)
 	{
 		EXPECT_TRUE(std::filesystem::exists(table_file));
+	}
+	for (int i = 0; i < 32; ++i)
+	{
+		auto value = reopened->Get("keep_key_" + std::to_string(i));
+		ASSERT_TRUE(value.has_value());
+		EXPECT_EQ(value.value(), std::string(64, 'y'));
 	}
 }
 

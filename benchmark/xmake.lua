@@ -11,9 +11,9 @@ target("kv_bench")
     add_includedirs(common_includedirs)
     add_includedirs("$(projectdir)/benchmark")
     add_packages("crc32c")
-    option("runtime_metrics")
+    if has_config("runtime_metrics") then
         add_defines("PRISM_RUNTIME_METRICS")
-    option_end()
+    end
 
 target("async_bench")
     set_kind("binary")
@@ -31,6 +31,6 @@ target("func_overhead_bench")
     add_includedirs(common_includedirs)
     add_includedirs("$(projectdir)/benchmark")
     add_packages("crc32c")
-    option("runtime_metrics")
+    if has_config("runtime_metrics") then
         add_defines("PRISM_RUNTIME_METRICS")
-    option_end()
+    end

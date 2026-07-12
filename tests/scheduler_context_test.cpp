@@ -30,7 +30,7 @@ static bool PollUntil(Pred pred, std::chrono::milliseconds timeout = 5000ms)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, MainThreadCaptureIsInvalid)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 	auto ctx = scheduler.CaptureContext();
 	EXPECT_FALSE(ctx.IsValid()) << "CaptureContext() called on main thread must return an invalid Context";
 }
@@ -40,7 +40,7 @@ TEST(SchedulerContextTest, MainThreadCaptureIsInvalid)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, WorkerThreadCaptureIsValid)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 	std::atomic<bool> valid_captured{ false };
 
 	scheduler.Submit([&scheduler, &valid_captured]() {
@@ -59,11 +59,11 @@ TEST(SchedulerContextTest, WorkerThreadCaptureIsValid)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, ForeignSchedulerCaptureIsInvalid)
 {
-	ThreadPoolScheduler sched_a(2);
-	ThreadPoolScheduler sched_b(2);
+	CpuThreadPool sched_a(2);
+	CpuThreadPool sched_b(2);
 
 	// Capture a context from sched_b's worker
-	ThreadPoolScheduler::Context foreign_ctx;
+	CpuThreadPool::Context foreign_ctx;
 	std::atomic<bool> done{ false };
 
 	sched_b.Submit([&sched_b, &foreign_ctx, &done]() {
@@ -88,7 +88,7 @@ TEST(SchedulerContextTest, ForeignSchedulerCaptureIsInvalid)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, DefaultContextIsInvalid)
 {
-	ThreadPoolScheduler::Context ctx;
+	CpuThreadPool::Context ctx;
 	EXPECT_FALSE(ctx.IsValid());
 }
 
@@ -100,7 +100,7 @@ TEST(SchedulerContextTest, SubmitInSameThread)
 	// Use a single-worker pool so the captured context unambiguously pins to that worker.
 	// kMinThreads is 2, so 2 workers — we still capture the exact worker and verify
 	// it self-submits back to the same thread.
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	std::atomic<bool> done{ false };
 	std::thread::id outer_tid;
@@ -128,9 +128,9 @@ TEST(SchedulerContextTest, SubmitInSameThread)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, SubmitInInvalidContextFallsBack)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
-	ThreadPoolScheduler::Context invalid_ctx; // default = invalid
+	CpuThreadPool::Context invalid_ctx; // default = invalid
 	ASSERT_FALSE(invalid_ctx.IsValid());
 
 	std::atomic<bool> ran{ false };
@@ -146,7 +146,7 @@ TEST(SchedulerContextTest, SubmitInInvalidContextFallsBack)
 TEST(SchedulerContextTest, AllWorkersProduceDistinctValidContexts)
 {
 	constexpr std::size_t kWorkers = 4;
-	ThreadPoolScheduler scheduler(kWorkers);
+	CpuThreadPool scheduler(kWorkers);
 
 	std::atomic<int> valid_count{ 0 };
 	std::atomic<int> task_count{ 0 };
@@ -171,11 +171,11 @@ TEST(SchedulerContextTest, AllWorkersProduceDistinctValidContexts)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, ContextsDoNotCrossValidate)
 {
-	ThreadPoolScheduler sched_a(2);
-	ThreadPoolScheduler sched_b(2);
+	CpuThreadPool sched_a(2);
+	CpuThreadPool sched_b(2);
 
 	// Capture a context on sched_a's worker and verify it is NOT valid on sched_b
-	ThreadPoolScheduler::Context ctx_a;
+	CpuThreadPool::Context ctx_a;
 	std::atomic<bool> captured{ false };
 
 	sched_a.Submit([&sched_a, &ctx_a, &captured]() {
@@ -199,10 +199,10 @@ TEST(SchedulerContextTest, ContextsDoNotCrossValidate)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, DistinctWorkerContextsNotEqual)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 
-	ThreadPoolScheduler::Context ctx_a;
-	ThreadPoolScheduler::Context ctx_b;
+	CpuThreadPool::Context ctx_a;
+	CpuThreadPool::Context ctx_b;
 	std::atomic<bool> captured_a{ false };
 	std::atomic<bool> captured_b{ false };
 
@@ -232,7 +232,7 @@ TEST(SchedulerContextTest, DistinctWorkerContextsNotEqual)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, HighVolumeSubmitInAllComplete)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	std::atomic<int> done{ 0 };
 	constexpr int kNumJobs = 1000;
@@ -271,12 +271,12 @@ TEST(SchedulerContextTest, HighVolumeSubmitInAllComplete)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, SubmitInOutOfRangeWorkerIndexFallsBack)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	// Capture a valid context then manually construct one with a bad index.
 	// We use IsValid()==true case but with worker_index_ outside range.
 	std::atomic<bool> captured{ false };
-	ThreadPoolScheduler::Context valid_ctx;
+	CpuThreadPool::Context valid_ctx;
 
 	scheduler.Submit([&scheduler, &valid_ctx, &captured]() {
 		valid_ctx = scheduler.CaptureContext();
@@ -302,7 +302,7 @@ TEST(SchedulerContextTest, SubmitInOutOfRangeWorkerIndexFallsBack)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, CaptureContextFromExternalThreadIsInvalid)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 	std::atomic<bool> ctx_invalid{ false };
 
 	std::thread external([&scheduler, &ctx_invalid]() {

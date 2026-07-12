@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <coroutine>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -13,11 +15,71 @@
 
 // Forward-declared to avoid exposing internal runtime types in public header.
 // Defined in src/async_runtime.h; included in src/async_env.cpp.
-namespace prism { struct RuntimeBundle; }
+namespace prism { class AsyncRuntime; }
 
 namespace prism
 {
 	class IoDispatcher;
+
+	void ReadAtAsyncCallback(AsyncRuntime& runtime,
+	    RandomAccessFile& file,
+	    uint64_t offset,
+	    std::span<std::byte> dst,
+	    std::move_only_function<void(Result<std::size_t>)> completion);
+
+	class AsyncReadAtOp
+	{
+	public:
+		struct State;
+		struct Awaiter
+		{
+			std::shared_ptr<State> state;
+
+			~Awaiter();
+			bool await_ready() const noexcept;
+			bool await_suspend(std::coroutine_handle<> handle) const;
+			Result<std::size_t> await_resume() const;
+		};
+
+		AsyncReadAtOp(AsyncRuntime& runtime, std::shared_ptr<RandomAccessFile> file, uint64_t offset, std::span<std::byte> dst);
+		~AsyncReadAtOp();
+		AsyncReadAtOp(AsyncReadAtOp&&) noexcept;
+		AsyncReadAtOp& operator=(AsyncReadAtOp&&) noexcept;
+		AsyncReadAtOp(const AsyncReadAtOp&) = delete;
+		AsyncReadAtOp& operator=(const AsyncReadAtOp&) = delete;
+
+		Awaiter operator co_await() && noexcept;
+
+	private:
+		std::shared_ptr<State> state_;
+	};
+
+	class AsyncReadAtStringOp
+	{
+	public:
+		struct State;
+		struct Awaiter
+		{
+			std::shared_ptr<State> state;
+
+			~Awaiter();
+			bool await_ready() const noexcept;
+			bool await_suspend(std::coroutine_handle<> handle) const;
+			Result<std::string> await_resume() const;
+		};
+
+		AsyncReadAtStringOp(AsyncRuntime& runtime, std::shared_ptr<RandomAccessFile> file, uint64_t offset, std::size_t n);
+		~AsyncReadAtStringOp();
+		AsyncReadAtStringOp(AsyncReadAtStringOp&&) noexcept;
+		AsyncReadAtStringOp& operator=(AsyncReadAtStringOp&&) noexcept;
+		AsyncReadAtStringOp(const AsyncReadAtStringOp&) = delete;
+		AsyncReadAtStringOp& operator=(const AsyncReadAtStringOp&) = delete;
+
+		Awaiter operator co_await() && noexcept;
+
+	private:
+		std::shared_ptr<State> state_;
+	};
 
 	// AsyncRandomAccessFile: Asynchronous wrapper for random-access file reads.
 	//
@@ -35,7 +97,7 @@ namespace prism
 	class AsyncRandomAccessFile
 	{
 	public:
-		AsyncRandomAccessFile(ThreadPoolScheduler& scheduler, std::shared_ptr<RandomAccessFile> file);
+		AsyncRandomAccessFile(AsyncRuntime& runtime, std::shared_ptr<RandomAccessFile> file);
 		~AsyncRandomAccessFile();
 
 		AsyncRandomAccessFile(const AsyncRandomAccessFile&) = delete;
@@ -47,30 +109,31 @@ namespace prism
 		// Precondition: dst buffer must remain valid until the AsyncOp completes.
 		// (i.e., until the awaiting coroutine resumes).
 		// Returns number of bytes actually read.
-		AsyncOp<Result<std::size_t>> ReadAtAsync(uint64_t offset, std::span<std::byte> dst) const;
+		AsyncReadAtOp ReadAtAsync(uint64_t offset, std::span<std::byte> dst) const;
+		void ReadAtAsyncCallback(
+		    uint64_t offset, std::span<std::byte> dst, std::move_only_function<void(Result<std::size_t>)> completion) const;
 
 		// ReadAtStringAsync: Convenience method that allocates and returns std::string.
 		// Simpler to use but involves heap allocation.
-		AsyncOp<Result<std::string>> ReadAtStringAsync(uint64_t offset, std::size_t n) const;
+		AsyncReadAtStringOp ReadAtStringAsync(uint64_t offset, std::size_t n) const;
 
 	private:
-		std::shared_ptr<RuntimeBundle> runtime_;
+		AsyncRuntime* runtime_;
 		std::shared_ptr<RandomAccessFile> file_;
-		IoDispatcher* dispatcher_{ nullptr };
 	};
 
 	// AsyncWritableFile: Asynchronous wrapper for writable files (append-only).
 	//
 	// Serialization Contract:
 	// - All async operations execute in FIFO (submission) order regardless of thread scheduling.
-	// - RuntimeBundle::serial_scheduler provides one-at-a-time execution without blocking shared workers.
+	// - AsyncRuntime::SerialFileExecutor() provides one-at-a-time execution without blocking shared workers.
 	// - After CloseAsync completes, subsequent Append/Flush/Sync ops return IOError("file closed").
 	//
 	// Lifetime: file_ is held via shared_ptr; wrapper may be destroyed while ops are in-flight.
 	class AsyncWritableFile
 	{
 	public:
-		AsyncWritableFile(ThreadPoolScheduler& scheduler, std::unique_ptr<WritableFile> file);
+		AsyncWritableFile(AsyncRuntime& runtime, std::unique_ptr<WritableFile> file);
 		~AsyncWritableFile();
 
 		AsyncWritableFile(const AsyncWritableFile&) = delete;
@@ -91,7 +154,7 @@ namespace prism
 			bool closed{ false };
 		};
 
-		std::shared_ptr<RuntimeBundle> runtime_;
+		AsyncRuntime* runtime_;
 		std::shared_ptr<WritableFile> file_;
 		std::shared_ptr<WriteState> write_state_;
 	};
@@ -111,7 +174,7 @@ namespace prism
 	class AsyncEnv
 	{
 	public:
-		AsyncEnv(ThreadPoolScheduler& scheduler, Env* env);
+		AsyncEnv(AsyncRuntime& runtime, Env* env);
 
 		// All file factory methods return by-value handles (e.g., Result<AsyncWritableFile>).
 		// The previous unique_ptr-returning signatures are deprecated.
@@ -124,7 +187,7 @@ namespace prism
 		AsyncOp<Result<std::size_t>> GetFileSizeAsync(std::string fname);
 
 	private:
-		std::shared_ptr<RuntimeBundle> runtime_;
+		AsyncRuntime* runtime_;
 		Env* env_;
 	};
 }

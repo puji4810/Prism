@@ -45,7 +45,7 @@ TEST(SchedulerShutdownTest, ImmediateTasks)
 	constexpr int kNumTasks = 1000;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 		for (int i = 0; i < kNumTasks; ++i)
 		{
 			scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
@@ -67,10 +67,10 @@ TEST(SchedulerShutdownTest, ImmediateTasksWithPriority)
 	constexpr int kNumTasks = 1000;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 		for (int i = 0; i < kNumTasks; ++i)
 		{
-			scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 10));
+			scheduler.SubmitWithPriority([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 10));
 		}
 	}
 
@@ -89,7 +89,7 @@ TEST(SchedulerShutdownTest, DelayedTasksShortDeadline)
 	constexpr int kNumTasks = 200;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 
 		// Use a deadline in the past so tasks are immediately eligible.
 		auto past = std::chrono::steady_clock::now() - 1s;
@@ -119,7 +119,7 @@ TEST(SchedulerShutdownTest, DelayedTasksPromotedOnShutdown)
 	constexpr int kNumTasks = 200;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 
 		// Deadline 30 seconds in the future — will NOT expire naturally before
 		// the scheduler destructs, so drain must promote them.
@@ -146,12 +146,12 @@ TEST(SchedulerShutdownTest, MixedTasks)
 	constexpr int kNumEach = 500;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 
 		// Immediate tasks
 		for (int i = 0; i < kNumEach; ++i)
 		{
-			scheduler.Submit(
+			scheduler.SubmitWithPriority(
 			    [immediate_counter]() { immediate_counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 5));
 		}
 
@@ -179,7 +179,7 @@ TEST(SchedulerShutdownTest, HighBacklogImmediate)
 
 	{
 		// Use 2 threads to maximise backlog pressure.
-		ThreadPoolScheduler scheduler(2);
+		CpuThreadPool scheduler(2);
 		for (int i = 0; i < kNumTasks; ++i)
 		{
 			scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); });
@@ -202,7 +202,7 @@ TEST(SchedulerShutdownTest, LateSubmissionsDuringShutdown)
 	constexpr int kOuter = 100;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 		for (int i = 0; i < kOuter; ++i)
 		{
 			scheduler.Submit([&scheduler, outer_counter, inner_counter]() {
@@ -231,7 +231,7 @@ TEST(SchedulerShutdownTest, RetiredCloseWorkDrainedDuringShutdown)
 	constexpr int kNumCloseTasks = 100;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 
 		// Model retired-WAL close as delayed tasks with future deadlines.
 		// These simulate scheduled background-close work that must be promoted
@@ -269,12 +269,12 @@ TEST(SchedulerShutdownTest, AllSubmissionPathsDrainedOnShutdown)
 	constexpr int kNumEach = 100;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 
 		// 1. Priority queue (immediate tasks with varying priority)
 		for (int i = 0; i < kNumEach; ++i)
 		{
-			scheduler.Submit(
+			scheduler.SubmitWithPriority(
 			    [priority_counter]() { priority_counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 5));
 		}
 
@@ -316,7 +316,7 @@ TEST(SchedulerShutdownTest, NoDoubleExecutionDuringDrain)
 	constexpr int kNumTasks = 500;
 
 	{
-		ThreadPoolScheduler scheduler(2);
+		CpuThreadPool scheduler(2);
 
 		// Mixed workload:
 		// - Immediate tasks that may or may not run before shutdown starts
@@ -353,7 +353,7 @@ TEST(SchedulerShutdownTest, WorkerLocalReentrantSubmitDuringShutdownDrain)
 	constexpr int kOuter = 200;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 		for (int i = 0; i < kOuter; ++i)
 		{
 			scheduler.Submit([&scheduler, outer_counter, inner_counter]() {
@@ -381,7 +381,7 @@ TEST(SchedulerShutdownTest, DelayedTaskPromotesDuringShutdownWithFallback)
 	constexpr int kNumTasks = 200;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 
 		auto future = std::chrono::steady_clock::now() + 30s;
 		for (int i = 0; i < kNumTasks; ++i)
@@ -405,7 +405,7 @@ TEST(SchedulerShutdownTest, NestedDelayedTasksPromotedDuringShutdown)
 	auto inner_counter = std::make_shared<std::atomic<int>>(0);
 
 	{
-		ThreadPoolScheduler scheduler(2);
+		CpuThreadPool scheduler(2);
 
 		auto far_future = std::chrono::steady_clock::now() + 30s;
 		scheduler.SubmitAfter(far_future, [&scheduler, outer_counter, inner_counter]() {
@@ -432,7 +432,7 @@ TEST(SchedulerShutdownTest, VeryLargeDelayedTaskBatchPromotedOnShutdown)
 	constexpr int kNumTasks = 5000;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 
 		auto future = std::chrono::steady_clock::now() + 30s;
 		for (int i = 0; i < kNumTasks; ++i)
@@ -458,7 +458,7 @@ TEST(SchedulerShutdownTest, ImmediatePlusDelayedZeroPriorityShutdown)
 	constexpr int kNumEach = 500;
 
 	{
-		ThreadPoolScheduler scheduler(4);
+		CpuThreadPool scheduler(4);
 
 		for (int i = 0; i < kNumEach; ++i)
 		{

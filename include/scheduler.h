@@ -160,23 +160,27 @@ namespace prism
 		bool heap_allocated_{ false };
 	};
 
-	// IScheduler: Minimal abstract scheduler interface.
-	// Allows AsyncOp and other components to submit work without depending on
-	// the concrete ThreadPoolScheduler. Enables deterministic test doubles.
-	class IScheduler
+	struct ExecutorRef
 	{
-	public:
 		using Job = InlineJob;
 
-		virtual ~IScheduler() = default;
+		void* executor = nullptr;
+		void (*submit)(void*, Job) = nullptr;
 
-		// Submit a job with the given priority (higher = sooner).
-		// Thread-safe. Must be callable from any thread.
-		virtual void Submit(Job job, std::size_t priority = 0) = 0;
+		ExecutorRef() = default;
 
+		template <typename Executor>
+		    requires(!std::is_same_v<std::decay_t<Executor>, ExecutorRef>)
+		explicit ExecutorRef(Executor& target)
+		    : executor(&target)
+		    , submit([](void* ptr, Job job) { static_cast<Executor*>(ptr)->Submit(std::move(job)); })
+		{
+		}
+
+		void Submit(Job job) const { submit(executor, std::move(job)); }
 	};
 
-	// ThreadPoolScheduler: Worker-local thread pool with fallback priority and delayed task support.
+	// CpuThreadPool: Worker-local thread pool with fallback priority and delayed task support.
 	//
 	// Architecture (split-role topology):
 	// - N worker threads (WorkThread), each with its own task queue
@@ -185,18 +189,21 @@ namespace prism
 	// - 1 lazy dispatcher thread: processes delayed tasks (lazy_queue_), dispatches when ready
 	//
 	// Task Submission Paths:
-	// 1. Submit(job, priority): Immediate execution
-	//    - priority == 0: throughput-first fast path to worker-local queue
-	//      * worker self-submit -> same worker queue
-	//      * external submit -> round-robin worker queue
-	//    - priority > 0: fallback/background priority queue
+	// 1. Submit(job): Immediate priority-0 execution
+	//    - throughput-first fast path to worker-local queue
+	//    - worker self-submit -> same worker queue
+	//    - external submit -> round-robin worker queue
 	//
-	// 2. SubmitAfter(deadline, job): Delayed execution
+	// 2. SubmitWithPriority(job, priority): Background/fallback execution
+	//    - priority == 0 uses the same fast path as Submit(job)
+	//    - priority > 0 uses the fallback/background priority queue
+	//
+	// 3. SubmitAfter(deadline, job): Delayed execution
 	//    - Stored in lazy_queue_ until deadline expires
 	//    - LazyLoop wakes up at deadline, pushes directly to a worker when possible
 	//    - Falls back to priority queue (max priority) if direct routing is unsuitable
 	//
-	// 3. SubmitIn(ctx, job): Strict affinity to specific worker thread
+	// 4. SubmitIn(ctx, job): Strict affinity to specific worker thread
 	//    - When ctx is valid for this scheduler: directly pushes to that worker's local queue
 	//    - Jobs remain stealable (work-stealing still applies even to affinity-pinned tasks)
 	//    - When ctx is invalid or belongs to a different scheduler: falls back to Submit()
@@ -223,14 +230,14 @@ namespace prism
 	// - lazy_queue_: protected by lazy_mutex_
 	// - Each WorkThread's queue_: protected by its own mutex_
 	// - Semaphores (priority_waiter_, lazy_waiter_, WorkThread::semaphore_) for coordination
-	class ThreadPoolScheduler : public IScheduler
+	class CpuThreadPool
 	{
 	public:
 		// Context: Opaque handle to a worker thread, captured by CaptureContext().
 		// Used for affinity-based task submission (SubmitIn).
 		class Context
 		{
-			friend class ThreadPoolScheduler;
+			friend class CpuThreadPool;
 
 		public:
 			Context() = default;
@@ -240,40 +247,48 @@ namespace prism
 			bool IsValid() const noexcept { return scheduler_ != nullptr; }
 
 		private:
-			explicit Context(const ThreadPoolScheduler* scheduler, std::size_t worker_index)
+			explicit Context(const CpuThreadPool* scheduler, std::size_t worker_index)
 			    : scheduler_(scheduler)
 			    , worker_index_(worker_index)
 			{
 			}
 
-			const ThreadPoolScheduler* scheduler_{ nullptr };
+			const CpuThreadPool* scheduler_{ nullptr };
 			std::size_t worker_index_{ 0 };
 		};
 
-		using Job = IScheduler::Job;
+		using Job = InlineJob;
 
 		// Constructs thread pool with `num_threads` workers.
 		// If num_threads == 0, defaults to max(hardware_concurrency, kMinThreads).
 		// If num_threads > 0, uses exactly max(num_threads, kMinThreads) workers.
 
-		explicit ThreadPoolScheduler(std::size_t num_threads = 0);
-		~ThreadPoolScheduler();
+		explicit CpuThreadPool(std::size_t num_threads = 0);
+		~CpuThreadPool();
 
-		ThreadPoolScheduler(const ThreadPoolScheduler&) = delete;
-		ThreadPoolScheduler& operator=(const ThreadPoolScheduler&) = delete;
-		ThreadPoolScheduler(ThreadPoolScheduler&&) = delete;
-		ThreadPoolScheduler& operator=(ThreadPoolScheduler&&) = delete;
+		CpuThreadPool(const CpuThreadPool&) = delete;
+		CpuThreadPool& operator=(const CpuThreadPool&) = delete;
+		CpuThreadPool(CpuThreadPool&&) = delete;
+		CpuThreadPool& operator=(CpuThreadPool&&) = delete;
 
 		// Captures current thread context for SubmitIn().
 		// Returns a valid Context only if called from a worker thread of THIS scheduler instance.
 		// Returns an invalid Context if called from any other thread (including workers of other schedulers).
 		Context CaptureContext() const;
 
-		// Submit job with priority (higher number = higher priority).
-		void Submit(Job job, std::size_t priority = 0) override;
+		void Submit(Job job);
 		template <typename F>
 		    requires(!std::is_same_v<std::decay_t<F>, Job>)
-		void Submit(F&& job, std::size_t priority = 0)
+		void Submit(F&& job)
+		{
+			SubmitJob(std::forward<F>(job), 0);
+		}
+
+		// Submit job with priority (higher number = higher priority).
+		void SubmitWithPriority(Job job, std::size_t priority);
+		template <typename F>
+		    requires(!std::is_same_v<std::decay_t<F>, Job>)
+		void SubmitWithPriority(F&& job, std::size_t priority)
 		{
 			SubmitJob(std::forward<F>(job), priority);
 		}
@@ -334,7 +349,7 @@ namespace prism
 			WorkThread(WorkThread&&) = delete;
 			WorkThread& operator=(WorkThread&&) = delete;
 
-			void Start(ThreadPoolScheduler& scheduler, std::size_t worker_index);
+			void Start(CpuThreadPool& scheduler, std::size_t worker_index);
 			void Join();
 			std::thread::id Id() const;
 
@@ -382,13 +397,15 @@ namespace prism
 
 				Job job;
 				bool stealable{ true };
+#ifdef PRISM_RUNTIME_METRICS
 				bool stolen{ false };
+#endif
 			};
 
-			void Consume(ThreadPoolScheduler& scheduler, std::size_t worker_index) noexcept;
-			bool TrySteal(ThreadPoolScheduler& scheduler, std::size_t worker_index, std::uint64_t& rng_state);
+			void Consume(CpuThreadPool& scheduler, std::size_t worker_index) noexcept;
+			bool TrySteal(CpuThreadPool& scheduler, std::size_t worker_index, std::uint64_t& rng_state);
 			bool TryDequeueJob(QueuedJob& out);
-			bool HandleJobCompletion(QueuedJob& job, ThreadPoolScheduler& scheduler) noexcept;
+			bool HandleJobCompletion(QueuedJob& job, CpuThreadPool& scheduler) noexcept;
 
 			std::counting_semaphore<> semaphore_{ 0z };
 			std::jthread thread_{};
@@ -515,7 +532,9 @@ namespace prism
 				{
 					if (TryEmplaceToWorker(std::forward<F>(job), current_worker_index_, false, true))
 					{
+#ifdef PRISM_RUNTIME_METRICS
 						RecordForegroundFastPathSubmit();
+#endif
 						return;
 					}
 				}
@@ -523,12 +542,16 @@ namespace prism
 				const auto worker_index = ChooseSubmissionWorker();
 				if (TryEmplaceToWorker(std::forward<F>(job), worker_index, false, true))
 				{
+#ifdef PRISM_RUNTIME_METRICS
 					RecordForegroundFastPathSubmit();
+#endif
 					return;
 				}
 			}
 
+#ifdef PRISM_RUNTIME_METRICS
 			RecordForegroundFallbackSubmit();
+#endif
 			PushToPriorityQueue(std::forward<F>(job), priority, /*wake=*/true);
 		}
 
@@ -579,10 +602,12 @@ namespace prism
 
 		std::atomic<bool> exit_flag_{ false };
 
+#ifdef PRISM_RUNTIME_METRICS
 		static void RecordForegroundFastPathSubmit() noexcept;
 		static void RecordForegroundFallbackSubmit() noexcept;
+#endif
 
-		static thread_local const ThreadPoolScheduler* current_scheduler_;
+		static thread_local const CpuThreadPool* current_scheduler_;
 		static thread_local std::size_t current_worker_index_;
 	};
 }

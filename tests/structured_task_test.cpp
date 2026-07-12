@@ -28,16 +28,18 @@ namespace
 		return pred();
 	}
 
-	class InlineExecutor: public IContinuationExecutor
+	class InlineExecutor
 	{
 	public:
-		void Submit(Job work) override { work(); }
+		using Job = InlineJob;
+
+		void Submit(Job work) { work(); }
 	};
 }
 
-TEST(StructuredTaskTest, SerialLanePreservesSubmissionOrder)
+TEST(StructuredTaskTest, SerialExecutorPreservesSubmissionOrder)
 {
-	SerialLane lane;
+	SerialExecutor lane;
 	std::mutex mutex;
 	std::vector<int> observed;
 	std::atomic<int> done{ 0 };
@@ -71,14 +73,13 @@ TEST(StructuredTaskTest, BlockingExecutorRunsSubmittedWork)
 	EXPECT_EQ(value.load(std::memory_order_acquire), 7);
 }
 
-TEST(StructuredTaskTest, ThreadPoolExecutorForwardsToWrappedScheduler)
+TEST(StructuredTaskTest, CpuThreadPoolRunsSubmittedWork)
 {
-	ThreadPoolScheduler scheduler(2);
-	ThreadPoolExecutor executor(scheduler);
+	CpuThreadPool scheduler(2);
 	std::binary_semaphore finished(0);
 	std::atomic<int> value{ 0 };
 
-	executor.Submit([&] {
+	scheduler.Submit([&] {
 		value.store(11, std::memory_order_release);
 		finished.release();
 	});
@@ -87,33 +88,33 @@ TEST(StructuredTaskTest, ThreadPoolExecutorForwardsToWrappedScheduler)
 	EXPECT_EQ(value.load(std::memory_order_acquire), 11);
 }
 
-TEST(StructuredTaskTest, RuntimeBundleConstructsAndDrainsResources)
+TEST(StructuredTaskTest, AsyncRuntimeConstructsAndDrainsResources)
 {
 	std::binary_semaphore blocking_done(0);
 	std::binary_semaphore serial_done(0);
 	std::binary_semaphore cpu_done(0);
 
 	{
-		ThreadPoolScheduler scheduler(2);
-		RuntimeBundle runtime(scheduler);
+		CpuThreadPool scheduler(2);
+		AsyncRuntime runtime(scheduler);
 
-		runtime.read_executor.Submit([&] { blocking_done.release(); });
-		runtime.serial_lane.Submit([&] { serial_done.release(); });
-		runtime.cpu_executor.Submit([&] { cpu_done.release(); });
+		runtime.BlockingIoExecutor().Submit([&] { blocking_done.release(); });
+		runtime.SerialFileExecutor().Submit([&] { serial_done.release(); });
+		runtime.CpuExecutor().Submit([&] { cpu_done.release(); });
 
 		ASSERT_TRUE(blocking_done.try_acquire_for(5s));
 		ASSERT_TRUE(serial_done.try_acquire_for(5s));
 		ASSERT_TRUE(cpu_done.try_acquire_for(5s));
-		EXPECT_TRUE(runtime.read_executor.Empty());
-		EXPECT_TRUE(runtime.compaction_executor.Empty());
-		EXPECT_TRUE(runtime.serial_lane.Done());
+		EXPECT_TRUE(runtime.BlockingIoExecutor().Empty());
+		EXPECT_TRUE(runtime.CompactionExecutor().Empty());
+		EXPECT_TRUE(runtime.SerialFileExecutor().Done());
 	}
 }
 
-TEST(StructuredTaskTest, SchedulerAdapterSubmitsToWrappedExecutor)
+TEST(StructuredTaskTest, ExecutorRefSubmitsToWrappedExecutor)
 {
 	InlineExecutor executor;
-	ExecutorSchedulerAdapter scheduler(executor);
+	ExecutorRef scheduler(executor);
 	std::atomic<int> submitted{ 0 };
 
 	scheduler.Submit([&submitted] { submitted.fetch_add(1, std::memory_order_relaxed); });

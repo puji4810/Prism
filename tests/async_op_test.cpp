@@ -37,20 +37,21 @@ namespace prism::tests
 
 	// ---------------------------------------------------------------------------
 	// InlineScheduler: executes every job synchronously on the calling thread.
-	// This is the minimal IScheduler implementation needed for deterministic tests.
 	// ---------------------------------------------------------------------------
-	class InlineScheduler: public IScheduler
+	class InlineScheduler
 	{
 	public:
-		// Submit executes `job()` immediately before returning.
-		// priority is intentionally ignored (single-threaded inline execution has no ordering concept).
-		void Submit(Job job, std::size_t /*priority*/ = 0) override { job(); }
+		using Job = InlineJob;
+
+		void Submit(Job job) { job(); }
 	};
 
-	class ManualScheduler: public IScheduler
+	class ManualScheduler
 	{
 	public:
-		void Submit(Job job, std::size_t /*priority*/ = 0) override { queue_.push_back(std::move(job)); }
+		using Job = InlineJob;
+
+		void Submit(Job job) { queue_.push_back(std::move(job)); }
 
 		bool Empty() const { return queue_.empty(); }
 		std::size_t Size() const { return queue_.size(); }
@@ -66,10 +67,12 @@ namespace prism::tests
 		std::deque<Job> queue_;
 	};
 
-	class ManualAsyncScheduler: public IScheduler
+	class ManualAsyncScheduler
 	{
 	public:
-		void Submit(Job job, std::size_t priority = 0) override { blocking.Submit(std::move(job), priority); }
+		using Job = InlineJob;
+
+		void Submit(Job job) { blocking.Submit(std::move(job)); }
 
 		ManualScheduler blocking;
 	};
@@ -77,7 +80,8 @@ namespace prism::tests
 	// ---------------------------------------------------------------------------
 	// Helper: build an AsyncOp<int> that returns a fixed value via an inline scheduler.
 	// ---------------------------------------------------------------------------
-	static AsyncOp<int> MakeIntOp(IScheduler& sched, int value)
+	template <typename Executor>
+	static AsyncOp<int> MakeIntOp(Executor& sched, int value)
 	{
 		return AsyncOp<int>(sched, [value] { return value; });
 	}
@@ -85,7 +89,8 @@ namespace prism::tests
 	// ---------------------------------------------------------------------------
 	// Helper: build an AsyncOp<void> that increments an atomic counter.
 	// ---------------------------------------------------------------------------
-	static AsyncOp<void> MakeVoidOp(IScheduler& sched, std::atomic<int>& counter)
+	template <typename Executor>
+	static AsyncOp<void> MakeVoidOp(Executor& sched, std::atomic<int>& counter)
 	{
 		return AsyncOp<void>(sched, [&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
 	}

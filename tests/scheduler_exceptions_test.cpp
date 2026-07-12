@@ -17,7 +17,7 @@ TEST(SchedulerExceptionsTest, WorkerLoopThrowTerminates)
 {
 	ASSERT_DEATH(
 	    {
-		    ThreadPoolScheduler scheduler(2);
+		    CpuThreadPool scheduler(2);
 		    std::binary_semaphore job_started{ 0 };
 
 		    scheduler.Submit([&job_started]() {
@@ -42,7 +42,7 @@ TEST(SchedulerExceptionsTest, AffinityJobThrowTerminates)
 {
 	ASSERT_DEATH(
 	    {
-		    ThreadPoolScheduler scheduler(2);
+		    CpuThreadPool scheduler(2);
 		    std::binary_semaphore affinity_submitted{ 0 };
 
 		    // Submit a job that captures its own context and re-submits a
@@ -70,7 +70,7 @@ TEST(SchedulerExceptionsTest, DestructorDrainLazyThrowTerminates)
 {
 	ASSERT_DEATH(
 	    {
-		    ThreadPoolScheduler scheduler(2);
+		    CpuThreadPool scheduler(2);
 
 		    // Deadline far in the future — will not fire normally; must be
 		    // promoted by the destructor drain.
@@ -94,7 +94,7 @@ TEST(SchedulerExceptionsTest, DestructorDrainPriorityThrowTerminates)
 		    // Use 2 workers; block both to saturate the thread pool so the
 		    // throwing job stays in the priority queue until destructor drain.
 		    constexpr int kWorkers = 2;
-		    ThreadPoolScheduler scheduler(kWorkers);
+		    CpuThreadPool scheduler(kWorkers);
 
 		    std::atomic<int> blockers_entered{ 0 };
 		    std::atomic<bool> exit_requested{ false };
@@ -152,7 +152,7 @@ TEST(SchedulerExceptionsTest, DrainRemainingThrowTerminates)
 {
 	ASSERT_DEATH(
 	    {
-		    ThreadPoolScheduler scheduler(2);
+		    CpuThreadPool scheduler(2);
 		    // Schedule a trampoline with a far-future deadline so it never fires
 		    // normally and is guaranteed to stay in lazy_queue_ until destructor.
 		    auto far_future = std::chrono::steady_clock::now() + std::chrono::hours(24);
@@ -187,7 +187,7 @@ TEST(SchedulerExceptionsTest, DrainRemainingThrowTerminates)
 // ---------------------------------------------------------------------------
 TEST(SchedulerExceptionsTest, CaughtExceptionDoesNotAffectScheduler)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	std::atomic<int> before_counter{ 0 };
 	std::atomic<int> after_counter{ 0 };
@@ -231,7 +231,7 @@ TEST(SchedulerExceptionsTest, CaughtExceptionDoesNotAffectScheduler)
 // ---------------------------------------------------------------------------
 TEST(SchedulerExceptionsTest, MultipleWorkersHandleInternalExceptions)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 
 	std::atomic<int> exception_tasks_done{ 0 };
 	std::atomic<int> followup_tasks_done{ 0 };
@@ -279,7 +279,7 @@ TEST(SchedulerExceptionsTest, MultipleWorkersHandleInternalExceptions)
 // ---------------------------------------------------------------------------
 TEST(SchedulerExceptionsTest, AffinityJobCaughtExceptionWorkerRemainsHealthy)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	std::atomic<bool> outer_done{ false };
 	std::thread::id outer_tid;

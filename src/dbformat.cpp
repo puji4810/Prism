@@ -1,7 +1,5 @@
 #include "dbformat.h"
 #include "coding.h"
-#include <algorithm>
-#include <cstring>
 #include <sstream>
 
 namespace prism
@@ -11,28 +9,6 @@ namespace prism
 		assert(seq <= kMaxSequenceNumber);
 		assert(t <= kValueTypeForSeek);
 		return (seq << 8) | t;
-	}
-
-	static int BytewiseCompare(const char* a_data, size_t a_size, const char* b_data, size_t b_size)
-	{
-		const size_t min_size = std::min(a_size, b_size);
-		if (min_size > 0)
-		{
-			const int r = std::memcmp(a_data, b_data, min_size);
-			if (r != 0)
-			{
-				return r;
-			}
-		}
-		if (a_size < b_size)
-		{
-			return -1;
-		}
-		if (a_size > b_size)
-		{
-			return 1;
-		}
-		return 0;
 	}
 
 	size_t InternalKeyEncodingLength(const ParsedInternalKey& key) { return key.user_key.size() + 8; }
@@ -65,40 +41,7 @@ namespace prism
 
 	const char* InternalKeyComparator::Name() const { return "Prism.InternalKeyComparator"; }
 
-	int InternalKeyComparator::Compare(const Slice& a, const Slice& b) const
-	{
-		// Order by:
-		//    increasing user key (according to user-supplied comparator)
-		//    decreasing sequence number
-		//    decreasing type (though sequence# should be enough to disambiguate)
-		assert(a.size() >= 8);
-		assert(b.size() >= 8);
-		const size_t a_user_size = a.size() - 8;
-		const size_t b_user_size = b.size() - 8;
-		int r;
-		if (is_bytewise_)
-		{
-			r = BytewiseCompare(a.data(), a_user_size, b.data(), b_user_size);
-		}
-		else
-		{
-			const Slice a_user_key(a.data(), a_user_size);
-			const Slice b_user_key(b.data(), b_user_size);
-			r = user_comparator_->Compare(a_user_key, b_user_key);
-		}
-		if (r == 0)
-		{
-			// compare the sequence and type
-			// docs/dbformat.md: InternalKey comparison follows these rules
-			const uint64_t anum = DecodeFixed64(a.data() + a.size() - 8);
-			const uint64_t bnum = DecodeFixed64(b.data() + b.size() - 8);
-			if (anum > bnum) // newer sequence comes first
-				r = -1;
-			else if (anum < bnum)
-				r = 1;
-		}
-		return r;
-	}
+	int InternalKeyComparator::Compare(const Slice& a, const Slice& b) const { return CompareEncoded(a, b); }
 
 	void InternalKeyComparator::FindShortestSeparator(std::string* start, const Slice& limit) const
 	{

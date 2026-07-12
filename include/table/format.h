@@ -2,6 +2,9 @@
 #define PRISM_TABLE_FORMAT_H
 
 #include <cstdint>
+#include <coroutine>
+#include <functional>
+#include <memory>
 #include <string>
 #include "status.h"
 #include "env.h"
@@ -9,6 +12,8 @@
 
 namespace prism
 {
+	class AsyncRuntime;
+	class AsyncRandomAccessFile;
 
 	class BlockHandle
 	{
@@ -84,6 +89,40 @@ namespace prism
 	// Read the block identified by "handle" from "file".  On failure
 	// return non-OK.  On success fill *result and return OK.
 	Status ReadBlock(RandomAccessFile* file, const ReadOptions& options, const BlockHandle& handle, BlockContents* result);
+	using AsyncBlockReadCallback = std::move_only_function<void(Result<BlockContents>)>;
+	void ReadBlockAsyncCallback(
+	    const AsyncRandomAccessFile& file, const ReadOptions& options, const BlockHandle& handle, AsyncBlockReadCallback completion);
+	void ReadBlockAsyncCallback(
+	    AsyncRuntime& runtime, RandomAccessFile& file, const ReadOptions& options, const BlockHandle& handle, AsyncBlockReadCallback completion);
+
+	class AsyncBlockReadOp
+	{
+	public:
+		struct State;
+		struct Awaiter
+		{
+			std::shared_ptr<State> state;
+
+			~Awaiter();
+			bool await_ready() const noexcept;
+			bool await_suspend(std::coroutine_handle<> handle) const;
+			Result<BlockContents> await_resume() const;
+		};
+
+		AsyncBlockReadOp(const AsyncRandomAccessFile& file, ReadOptions options, BlockHandle handle);
+		~AsyncBlockReadOp();
+		AsyncBlockReadOp(AsyncBlockReadOp&&) noexcept;
+		AsyncBlockReadOp& operator=(AsyncBlockReadOp&&) noexcept;
+		AsyncBlockReadOp(const AsyncBlockReadOp&) = delete;
+		AsyncBlockReadOp& operator=(const AsyncBlockReadOp&) = delete;
+
+		Awaiter operator co_await() && noexcept;
+
+	private:
+		std::shared_ptr<State> state_;
+	};
+
+	AsyncBlockReadOp ReadBlockAsync(const AsyncRandomAccessFile& file, const ReadOptions& options, const BlockHandle& handle);
 
 	// Implementation details follow.  Clients should ignore
 	inline BlockHandle::BlockHandle()

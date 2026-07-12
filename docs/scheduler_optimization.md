@@ -2,56 +2,74 @@
 
 Date: 2026-06-01
 
-This note answers the current scheduler/routing concern directly: the old design had too many logical scheduler roles on the hot path. The recommended direction is to keep physical isolation only where it protects correctness or prevents blocking, and to collapse foreground DB work onto the shared CPU scheduler fast path.
+This note answers the scheduler/routing concern directly: the old design had too many logical scheduler roles on the hot path. The current direction is to keep concrete physical isolation where it protects correctness or prevents blocking, while avoiding forwarding adapters and implicit runtime ownership.
 
 ## Executive Summary
 
 The scheduler design is partially over-built. The useful parts are:
 
-- `ThreadPoolScheduler`: keep as the shared CPU executor, timer source, affinity source, and work-stealing pool.
-- `read_scheduler`: keep for file I/O calls that may block and for metadata operations.
-- `serial_scheduler`: keep for ordered writable-file lifecycle operations.
-- `compaction_scheduler`: keep only as a physical single-lane executor for background compaction/flush isolation.
+- `CpuThreadPool`: keep as the caller-owned CPU executor, timer source, affinity source, work-stealing pool, and reactor-read resume target.
+- `db_read_executor`: keep for `AsyncDB::GetAsync` calls into synchronous `DBImpl::Get`, because those calls can block on table reads, cache misses, and DB metadata locks.
+- `db_write_executor`: keep as a fixed single-thread lane for per-DB `WriteCoordinator` drain and grouped WAL commit control.
+- `blocking_io_executor`: keep for file I/O calls that may block and for metadata operations.
+- `serial_file_executor`: keep for ordered writable-file lifecycle operations.
+- `compaction_executor`: keep only as a physical single-lane executor for background compaction/flush isolation.
 
 The redundant or high-cost parts addressed by the current cleanup are:
 
-- Foreground `AsyncDB::{Get,Put,Write,Delete}` should not route through a blocking/read lane. These operations are CPU-resident DB operations from the async API perspective and should use the shared CPU pool.
-- `BlockingScheduler()` / `ContinuationScheduler()` were no longer justified. `AsyncOp` now submits to the scheduler it receives and resumes inline on the completing worker, so the split-routing hooks were removed from `IScheduler`.
+- `AsyncDB::GetAsync` should not route through the CPU continuation pool. It is synchronous DB read work from the implementation perspective and should use `db_read_executor`.
+- `AsyncDB::{PutAsync,DeleteAsync,WriteAsync}` should not be generic executor lambdas. They enqueue `AsyncWriteOp` requests into the DB-owned coordinator.
+- Split routing hooks are no longer justified. `AsyncOp` now submits to the executor reference it receives and resumes inline on the completing worker, except reactor-backed reads, which schedule coroutine resume on `CpuThreadPool`.
 - The priority dispatcher should not sit on the normal priority-0 foreground path. It is useful for non-zero priority/background fallback and delayed tasks, but it is too expensive as the default submit path.
-- `AsyncEnvBackendMode::kThreadPool` and `kBlockingLane` resolved to the same `read_scheduler`; the runtime enum was removed and `AsyncEnv` now has one explicit file-I/O policy.
+- `AsyncEnvBackendMode::kThreadPool` and `kBlockingLane` resolved to the same `blocking_io_executor`; the runtime enum was removed and `AsyncEnv` now has one explicit file-I/O policy.
 
 ## Current Target Topology
 
 Use this as the intended design:
 
 ```text
-AsyncDB foreground operations
-  -> RuntimeBundle::foreground_db_scheduler
-  -> ThreadPoolExecutor
-  -> ThreadPoolScheduler::Submit(priority = 0)
-  -> worker-local queue + stealing
-  -> coroutine resumes inline on completing worker
+AsyncDB open
+  -> AsyncRuntime::BlockingIoExecutor()
+  -> BlockingExecutor(4)
+  -> coroutine resumes inline on completing blocking-I/O worker
+
+AsyncDB reads
+  -> AsyncRuntime::DbReadExecutor()
+  -> BlockingExecutor(4, stealing enabled)
+  -> coroutine resumes inline on completing DB read worker
+
+AsyncDB writes
+  -> DBImpl::WriteCoordinator
+  -> AsyncRuntime::DbWriteExecutor()
+  -> SerialExecutor(1)
 
 AsyncEnv file and metadata operations that may block
-  -> RuntimeBundle::read_scheduler
+  -> AsyncRuntime::BlockingIoExecutor()
   -> BlockingExecutor(4)
-  -> coroutine resumes inline on completing read worker
+  -> coroutine resumes inline on completing blocking-I/O worker
+
+AsyncEnv reactor random-access reads
+  -> AsyncRuntime::Io().SubmitRead(...)
+  -> completion stores result
+  -> AsyncRuntime::CpuExecutor().Submit(resume)
 
 Writable file ordering
-  -> RuntimeBundle::serial_scheduler
-  -> SerialLane(1)
+  -> AsyncRuntime::SerialFileExecutor()
+  -> SerialExecutor(1)
 
 Background compaction/flush isolation
-  -> RuntimeBundle::compaction_scheduler
+  -> AsyncRuntime::CompactionExecutor()
   -> BlockingExecutor(1)
 ```
 
-This topology gives the project four physical execution sources:
+This topology gives the project six physical execution sources:
 
-- Shared CPU pool: `ThreadPoolScheduler`
-- Blocking read/file lane: `BlockingExecutor(4)`
+- Caller-owned CPU pool: `CpuThreadPool`
+- DB read lane: `BlockingExecutor(4)`
+- DB write lane: `SerialExecutor(1)`
+- Blocking file lane: `BlockingExecutor(4)`
 - Compaction lane: `BlockingExecutor(1)`
-- Ordered write-control lane: `SerialLane(1)`
+- Ordered file lane: `SerialExecutor(1)`
 
 That is a reasonable amount of machinery. The complexity becomes excessive only when every logical role is treated as a separate scheduler hop on foreground operations.
 
@@ -59,17 +77,19 @@ That is a reasonable amount of machinery. The complexity becomes excessive only 
 
 The current worktree contains these aligned changes:
 
-- `AsyncDB::{OpenAsync,GetAsync,PutAsync,DeleteAsync,WriteAsync}` route through `foreground_db_scheduler`, so foreground DB work uses the shared CPU pool instead of the read lane.
-- `ThreadPoolExecutor::Submit()` submits with priority `0`, enabling the direct worker-local fast path.
-- `ThreadPoolScheduler::Submit(priority=0)` routes directly to worker-local queues:
+- `AsyncDB::OpenAsync` routes through `blocking_io_executor`.
+- `AsyncDB::GetAsync` routes through `db_read_executor`, keeping synchronous DB reads off the CPU continuation pool.
+- `AsyncDB::{PutAsync,DeleteAsync,WriteAsync}` enqueue `AsyncWriteOp` requests into the per-DB `WriteCoordinator`, which drains on `db_write_executor`.
+- `CpuThreadPool::Submit()` submits with priority `0`, enabling the direct worker-local fast path.
+- `CpuThreadPool::SubmitWithPriority(job, 0)` routes directly to worker-local queues:
   - worker self-submit goes back to the same worker;
   - external submit uses a round-robin worker choice;
   - stealing remains available to balance load.
-- `AsyncOp<T>` and `AsyncOp<void>` resume the awaiting coroutine inline on the worker that completed the operation, avoiding a second queue hop through `ContinuationScheduler()`.
+- `AsyncOp<T>` and `AsyncOp<void>` resume the awaiting coroutine inline on the worker that completed the operation, avoiding a second queue hop for generic executor work.
 - `AsyncOp` state no longer uses a virtual `StateBase::Execute()/ConsumeValue()` dispatch layer.
-- `IScheduler` is now submit-only. This makes the scheduling semantic explicit: a scheduler is an execution target, not a routing policy object.
-- `ExecutorSchedulerAdapter` now only wraps an executor. It no longer stores optional blocking/continuation scheduler pointers.
-- `AsyncEnvBackendMode` was removed from `RuntimeBundle`; `AsyncEnv` file and metadata operations always route to `read_scheduler`.
+- `ExecutorRef` is submit-only. This makes the execution target explicit without a virtual scheduler interface.
+- Forwarding adapters were removed from the runtime hot path.
+- `AsyncEnvBackendMode` was removed from `AsyncRuntime`; `AsyncEnv` file and metadata operations always route to `blocking_io_executor`.
 - `kv_bench --no_latency` now skips per-operation `NowNs()` calls, which makes perf sampling less dominated by measurement overhead.
 
 ## Evidence Collected
@@ -260,9 +280,9 @@ Interpretation: short steady-state runs are still around the previously observed
 Implemented after the mutex/callable cleanup:
 
 - Added `InlineJob`, a move-only `void()` job wrapper with 128-byte inline storage and heap fallback for larger or over-aligned callables.
-- Changed `IScheduler::Job`, `IContinuationExecutor` queues, `BlockingExecutor`, `SerialLane`, and `ThreadPoolExecutor` to use `InlineJob` instead of `std::move_only_function<void()>`.
-- Added C++20 `requires`-constrained `ThreadPoolScheduler::Submit(F&&)`, `SubmitAfter(F&&)`, and `SubmitIn(F&&)` overloads. Concrete scheduler call sites now construct the callable directly inside the target queue entry where possible.
-- Added a direct `ThreadPoolScheduler` path in `AsyncOp` and routed `AsyncDB` foreground operations through `RuntimeBundle::timer_source`, bypassing the foreground adapter/`IContinuationExecutor` hop for the hot DB path.
+- Changed executor queues and `CpuThreadPool` submissions to use `InlineJob` instead of `std::move_only_function<void()>`.
+- Added C++20 `requires`-constrained `CpuThreadPool::Submit(F&&)`, `SubmitAfter(F&&)`, and `SubmitIn(F&&)` overloads. Concrete scheduler call sites now construct the callable directly inside the target queue entry where possible.
+- Routed generic async work through `ExecutorRef` so `AsyncDB`, file I/O, and structured task code can target concrete executors without adapters.
 
 Validation:
 
@@ -291,42 +311,42 @@ kv_bench --run=async --bench=mixed --clients=8 --workers=8 --ops=200000 \
 
 ## Recommended Design Decisions
 
-### 1. Treat `ThreadPoolScheduler` as the only foreground scheduler
+### 1. Keep `CpuThreadPool` for short CPU work and resumes
 
-Do not add more foreground DB schedulers. `foreground_db_scheduler` can stay as a named adapter for clarity, but it should always map to `ThreadPoolScheduler::Submit(priority=0)`.
+Do not put blocking DB or file work on `CpuThreadPool`. Use it for short continuations, delayed work, affinity-sensitive CPU jobs, and reactor read coroutine resumes.
 
 Rationale:
 
-- Foreground DB work is latency-sensitive and high-frequency.
+- Blocking DB work is latency-sensitive but can wait on I/O and DB coordination.
 - A logical lane that only forwards to another executor adds no isolation.
 - The worker-local fast path plus stealing is enough for load balance.
 
-### 2. Keep the read lane only for operations that may block in the OS
+### 2. Keep blocking I/O separate from DB work
 
-Keep `read_scheduler` for:
+Keep `blocking_io_executor` for:
 
 - `Env` metadata calls
 - fallback file reads when the reactor cannot handle the file
 - random-access file construction/open calls
 
-Do not use it for `AsyncDB::GetAsync()` itself. `GetAsync()` may internally touch tables/cache, but the async API's unit of scheduling is DB work, not raw file I/O.
+Do not use it for `AsyncDB::GetAsync()` itself. `GetAsync()` may internally touch tables/cache, but the async API's unit of scheduling is DB read work, so it belongs on `db_read_executor` until true async SST/table reads are pushed deeper into the storage stack.
 
-### 3. Keep `serial_scheduler` for ordering, not performance
+### 3. Keep `serial_file_executor` for ordering, not performance
 
 The serial lane should be considered a correctness lane. It protects file lifecycle ordering such as append/flush/sync/close. It should not be generalized into a foreground routing path.
 
-### 4. Keep `compaction_scheduler` as a physical lane, but avoid logical scheduler expansion
+### 4. Keep `compaction_executor` as a physical lane, but avoid logical scheduler expansion
 
 The single compaction executor is justified because compaction is background, blocking, and should remain single-flight. Avoid adding per-level or per-purpose compaction schedulers until there is evidence that compaction parallelism is a real bottleneck.
 
-### 5. Keep `IScheduler` submit-only
+### 5. Keep `ExecutorRef` submit-only
 
-Current `AsyncOp` resumes inline after the work function completes. That makes explicit continuation-routing hooks unnecessary for production AsyncOp routing.
+Current `AsyncOp` resumes inline after the work function completes. That makes explicit continuation-routing hooks unnecessary for production AsyncOp routing. Reactor-backed random-access reads are the exception: their completion callback schedules the coroutine resume on `CpuThreadPool` instead of resuming on the pump thread.
 
 Implemented migration:
 
-- Removed `BlockingScheduler()` and `ContinuationScheduler()` from `IScheduler`.
-- Removed split-route state from `ExecutorSchedulerAdapter`.
+- Removed split-route scheduler hooks.
+- Removed forwarding adapter state from the runtime hot path.
 - Updated tests to assert physical lane behavior instead of self-routing hook identity.
 
 ### 6. Collapse `AsyncEnvBackendMode`
@@ -335,14 +355,14 @@ Implemented migration:
 
 Implemented migration:
 
-- Removed the runtime enum and `RuntimeBundle::async_env_backend`.
+- Removed the runtime enum and `AsyncRuntime::async_env_backend`.
 - Kept `async_bench --backend=thread_pool|blocking_lane` as a compatibility label only; both names now exercise the same fixed AsyncEnv read-lane policy.
 
 ## Code-Level Optimization Opportunities
 
 ### P0: Continue foreground operation-state allocation work
 
-Scheduler-side void job type-erasure has been addressed by `InlineJob` plus templated `ThreadPoolScheduler::Submit(F&&)`. `AsyncOp` still allocates shared state per operation and stores the result-producing work in `std::move_only_function<T()>`, so there is still per-operation setup cost above the scheduler queue layer.
+Scheduler-side void job type-erasure has been addressed by `InlineJob` plus templated `CpuThreadPool::Submit(F&&)`. `AsyncOp` still allocates shared state per operation and stores the result-producing work in `std::move_only_function<T()>`, so there is still per-operation setup cost above the scheduler queue layer.
 
 Remaining possible next step:
 
@@ -355,9 +375,9 @@ Risk: medium. Lifetime and resume-before-suspend safety must remain exactly as t
 
 Implemented scheduler-side direction:
 
-- `IScheduler::Job` is now `InlineJob`, with inline storage and static invoke/move/destroy thunks.
-- Concrete `ThreadPoolScheduler` producers can call `Submit(F&&)` / `SubmitAfter(F&&)` / `SubmitIn(F&&)` and construct jobs directly into queue storage.
-- `AsyncDB` foreground operations now use the concrete scheduler path instead of the foreground scheduler adapter.
+- `ExecutorRef::Job` is now `InlineJob`, with inline storage and static invoke/move/destroy thunks.
+- Concrete `CpuThreadPool` producers can call `Submit(F&&)` / `SubmitAfter(F&&)` / `SubmitIn(F&&)` and construct jobs directly into queue storage.
+- `AsyncDB` foreground operations now use the concrete DB executor path.
 
 ### P0: Specialize hot `AsyncDB::GetAsync` capture/setup
 
@@ -380,7 +400,7 @@ Design direction to revisit:
 
 ABI/register-argument ring-buffer idea:
 
-- Do not make this a generic `ThreadPoolScheduler` API first. The current generic job call already passes the inline job storage pointer as a register argument (`invoke_(ptr_)`), while the captured callable state still lives in memory. A generic ABI-shaped job path would add complexity without clearly attacking the largest remaining costs.
+- Do not make this a generic `CpuThreadPool` API first. The current generic job call already passes the inline job storage pointer as a register argument (`invoke_(ptr_)`), while the captured callable state still lives in memory. A generic ABI-shaped job path would add complexity without clearly attacking the largest remaining costs.
 - Revisit it only as part of a concrete hot `AsyncDB::GetAsync` operation state. A fixed point-read job can store stable ownership in the operation state, then call a normal function such as `RunGetJob(op, db_state, key_data, key_size, flags)`, allowing the small scalar fields to use ABI register passing at the worker call site.
 - If a ring buffer is introduced, its primary justification should be reducing priority-0 queue mutex/object movement on a measured hot path. Register argument passing is a secondary benefit, not the main design reason.
 - Key lifetime is the main correctness constraint: any queued `key_data/key_size` pair must point into the concrete operation state or another stable owner, never into a temporary caller string.
@@ -395,7 +415,7 @@ Possible next step:
 
 Risk: low.
 
-### P1: Reduce queue mutex pressure in `ThreadPoolScheduler`
+### P1: Reduce queue mutex pressure in `CpuThreadPool`
 
 `perf` shows `pthread_mutex_lock` in the top visible costs. Each worker queue uses a mutex-protected deque.
 
@@ -451,18 +471,17 @@ Possible next steps:
 
 ### P2: Clean up compatibility names
 
-Names like `timer_source` still imply implementation details that are no longer central to the hot path.
+The runtime names now describe physical executors directly.
 
 Possible next steps:
 
-- Rename `timer_source` to `scheduler`.
-- Keep `foreground_db_scheduler` only if it improves call-site readability.
+- Keep future naming changes tied to measured confusion at call sites.
 
 ## Suggested Follow-Up Plan
 
 1. Land the current fast-path and inline-resume changes with the scheduler/runtime tests above.
 2. Add a CI benchmark smoke command using `kv_bench --no_latency` to catch large regressions.
-3. Rename `timer_source` if a broader runtime naming cleanup is needed.
+3. Keep the executor naming aligned with physical runtime ownership.
 4. Only after stable perf data, consider a more invasive queue or AsyncOp allocation optimization.
 
 The important simplification is conceptual: there should be one foreground scheduler path and a small number of physical isolation lanes. Avoid creating new logical schedulers unless they either protect ordering/correctness or isolate real blocking work.

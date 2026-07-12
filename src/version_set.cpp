@@ -1062,7 +1062,7 @@ namespace prism
 
 				for (size_t i = 1; i < files.size(); ++i)
 				{
-					assert(vset_->icmp_->Compare(files[i - 1]->largest.Encode(), files[i]->smallest.Encode()) < 0);
+					assert(vset_->icmp_->CompareEncoded(files[i - 1]->largest.Encode(), files[i]->smallest.Encode()) < 0);
 				}
 			}
 		}
@@ -1097,7 +1097,7 @@ namespace prism
 			uint32_t mid = (left + right) / 2;
 			const FileMetaData* f = files[mid];
 
-			if (icmp.Compare(f->largest.Encode(), key) < 0)
+			if (icmp.CompareEncoded(f->largest.Encode(), key) < 0)
 			{
 				left = mid + 1;
 			}
@@ -1147,7 +1147,7 @@ namespace prism
 	{
 		for (size_t i = 1; i < files.size(); ++i)
 		{
-			if (icmp.Compare(files[i - 1]->largest.Encode(), files[i]->smallest.Encode()) >= 0)
+			if (icmp.CompareEncoded(files[i - 1]->largest.Encode(), files[i]->smallest.Encode()) >= 0)
 			{
 				assert(false && "Level > 0 contains overlapping or mis-ordered files");
 				return false;
@@ -1224,7 +1224,7 @@ namespace prism
 	{
 		const VersionSet* vset = input_version_->vset_;
 		while (grandparent_index_ < grandparents_.size()
-		    && vset->Comparator()->Compare(internal_key, grandparents_[grandparent_index_]->largest.Encode()) > 0)
+		    && vset->Comparator()->CompareEncoded(internal_key, grandparents_[grandparent_index_]->largest.Encode()) > 0)
 		{
 			if (seen_key_)
 			{

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <sstream>
+#include "coding.h"
 #include "slice.h"
 #include "comparator.h"
 #include "logging.h"
@@ -122,6 +123,11 @@ namespace prism
 		}
 		const char* Name() const override;
 		int Compare(const Slice& a, const Slice& b) const override;
+		ComparatorKind Kind() const noexcept override
+		{
+			return is_bytewise_ ? ComparatorKind::kInternalKeyBytewise : ComparatorKind::kGeneric;
+		}
+		int CompareEncoded(const Slice& a, const Slice& b) const;
 		void FindShortestSeparator(std::string* start, const Slice& limit) const override;
 		void FindShortSuccessor(std::string* key) const override;
 
@@ -131,7 +137,35 @@ namespace prism
 		int Compare(const InternalKey& a, const InternalKey& b) const;
 	};
 
-	inline int InternalKeyComparator::Compare(const InternalKey& a, const InternalKey& b) const { return Compare(a.Encode(), b.Encode()); }
+	inline int InternalKeyComparator::Compare(const InternalKey& a, const InternalKey& b) const
+	{
+		return CompareEncoded(a.Encode(), b.Encode());
+	}
+
+	inline int InternalKeyComparator::CompareEncoded(const Slice& a, const Slice& b) const
+	{
+		assert(a.size() >= 8);
+		assert(b.size() >= 8);
+		const Slice a_user_key(a.data(), a.size() - 8);
+		const Slice b_user_key(b.data(), b.size() - 8);
+		int result = is_bytewise_ ? a_user_key.compare(b_user_key) : user_comparator_->Compare(a_user_key, b_user_key);
+		if (result != 0)
+		{
+			return result;
+		}
+
+		const uint64_t a_tag = DecodeFixed64(a.data() + a.size() - 8);
+		const uint64_t b_tag = DecodeFixed64(b.data() + b.size() - 8);
+		if (a_tag > b_tag)
+		{
+			return -1;
+		}
+		if (a_tag < b_tag)
+		{
+			return 1;
+		}
+		return 0;
+	}
 
 	// LookupKey for querying MemTable. It encodes the search target.
 	// Offer internal_key and user_key for the search target.

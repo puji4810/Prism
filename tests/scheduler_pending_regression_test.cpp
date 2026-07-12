@@ -52,7 +52,7 @@ static bool WaitFor(const std::atomic<int>& counter, int target, std::chrono::mi
 TEST(SchedulerPendingRegressionTest, AffinityBeforeDispatchedNoZombie)
 {
 	// Single worker so both jobs land on the same thread.
-	ThreadPoolScheduler scheduler(1);
+	CpuThreadPool scheduler(1);
 
 	std::atomic<int> affinity_done{ 0 };
 	std::atomic<int> dispatched_done{ 0 };
@@ -143,7 +143,7 @@ TEST(SchedulerPendingRegressionTest, AffinityBeforeDispatchedNoZombie)
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, HighVolumeAffinityAndDispatchedMix)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	constexpr int kTasks = 2000;
 	std::atomic<int> affinity_count{ 0 };
@@ -181,7 +181,7 @@ TEST(SchedulerPendingRegressionTest, HighVolumeAffinityAndDispatchedMix)
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, WorkerReregistersAfterDispatchedJob)
 {
-	ThreadPoolScheduler scheduler(1);
+	CpuThreadPool scheduler(1);
 
 	std::atomic<int> step{ 0 };
 
@@ -204,7 +204,7 @@ TEST(SchedulerPendingRegressionTest, WorkerReregistersAfterDispatchedJob)
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorityDispatch)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	std::atomic<int> victim_ctx_ready{ 0 };
 	std::atomic<int> hold_victim_worker{ 0 };
@@ -228,7 +228,7 @@ TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorit
 		return true;
 	};
 
-	ThreadPoolScheduler::Context victim_ctx;
+	CpuThreadPool::Context victim_ctx;
 
 	scheduler.Submit([&scheduler, &victim_ctx, &victim_ctx_ready]() {
 		victim_ctx = scheduler.CaptureContext();
@@ -263,7 +263,7 @@ TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorit
 
 	hold_victim_worker.store(1, std::memory_order_release);
 
-	scheduler.Submit([&priority_done]() { priority_done.fetch_add(1, std::memory_order_release); }, 1);
+	scheduler.SubmitWithPriority([&priority_done]() { priority_done.fetch_add(1, std::memory_order_release); }, 1);
 
 	ASSERT_TRUE(WaitFor(thief_worker_running, 1, 5s)) << "expected thief worker to start executing stolen batch";
 
@@ -272,7 +272,7 @@ TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorit
 	ASSERT_TRUE(WaitFor(stolen_done, kStolenBatch, 5s)) << "stolen batch did not fully drain";
 	ASSERT_TRUE(WaitFor(priority_done, 1, 5s)) << "priority work stalled after stolen batch drained to idle";
 
-	scheduler.Submit([&final_job_done]() { final_job_done.fetch_add(1, std::memory_order_release); }, 2);
+	scheduler.SubmitWithPriority([&final_job_done]() { final_job_done.fetch_add(1, std::memory_order_release); }, 2);
 	ASSERT_TRUE(WaitFor(final_job_done, 1, 5s)) << "scheduler did not remain dispatchable after regression scenario";
 }
 
@@ -284,7 +284,7 @@ TEST(SchedulerPendingRegressionTest, StolenBatchDrainReregistersWorkerForPriorit
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, AffinityJobsDoNotSpuriouslyReregister)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	constexpr int kChain = 500;
 	std::atomic<int> chain_count{ 0 };
@@ -319,7 +319,7 @@ TEST(SchedulerPendingRegressionTest, AffinityJobsDoNotSpuriouslyReregister)
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, IdleWorkersWakeOnNewSubmissions)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	std::atomic<int> first_batch{ 0 };
 	std::atomic<int> second_batch{ 0 };
@@ -349,7 +349,7 @@ TEST(SchedulerPendingRegressionTest, IdleWorkersWakeOnNewSubmissions)
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, ProgressiveBatchCyclesNoZombie)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	constexpr int kCycles = 5;
 	constexpr int kPerCycle = 500;
@@ -385,7 +385,7 @@ TEST(SchedulerPendingRegressionTest, ProgressiveBatchCyclesNoZombie)
 // ---------------------------------------------------------------------------
 TEST(SchedulerPendingRegressionTest, MixedPriorityLazyWakeupProgress)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	std::atomic<int> counter{ 0 };
 	constexpr int kImmediate = 200;
@@ -398,7 +398,7 @@ TEST(SchedulerPendingRegressionTest, MixedPriorityLazyWakeupProgress)
 	}
 	for (int i = 0; i < kPriority; ++i)
 	{
-		scheduler.Submit([&counter]() { counter.fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 5 + 1));
+		scheduler.SubmitWithPriority([&counter]() { counter.fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 5 + 1));
 	}
 	auto past = std::chrono::steady_clock::now() - 1s;
 	for (int i = 0; i < kDelayed; ++i)

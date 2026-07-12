@@ -73,24 +73,11 @@ namespace prism
 		dst.append(buf, sizeof(buf));
 	}
 
-	void PutVarint32(std::string& dst, uint32_t value)
-	{
-		char buf[5];
-		char* end = EncodeVarint32(buf, value);
-		dst.append(buf, static_cast<size_t>(end - buf));
-	}
-
 	void PutVarint64(std::string& dst, uint64_t value)
 	{
 		char buf[10];
 		char* end = EncodeVarint64(buf, value);
 		dst.append(buf, static_cast<size_t>(end - buf));
-	}
-
-	void PutLengthPrefixedSlice(std::string& dst, const Slice& value)
-	{
-		PutVarint32(dst, value.size());
-		dst.append(value.data(), value.size());
 	}
 
 	int VarintLength(uint64_t v)
@@ -104,17 +91,6 @@ namespace prism
 		return len;
 	}
 
-	bool GetVarint32(Slice* src, uint32_t* value)
-	{
-		const char* p = src->data();
-		const char* limit = p + src->size();
-		const char* q = GetVarint32Ptr(p, limit, value);
-		if (!q)
-			return false;
-		src->remove_prefix(static_cast<size_t>(q - p));
-		return true;
-	}
-
 	bool GetVarint64(Slice* src, uint64_t* value)
 	{
 		const char* p = src->data();
@@ -123,18 +99,6 @@ namespace prism
 		if (!q)
 			return false;
 		src->remove_prefix(static_cast<size_t>(q - p));
-		return true;
-	}
-
-	bool GetLengthPrefixedSlice(prism::Slice* src, prism::Slice* out)
-	{
-		uint32_t len = 0;
-		if (!GetVarint32(src, &len))
-			return false;
-		if (src->size() < static_cast<size_t>(len))
-			return false;
-		*out = prism::Slice(src->data(), static_cast<size_t>(len));
-		src->remove_prefix(static_cast<size_t>(len));
 		return true;
 	}
 

@@ -1,9 +1,11 @@
 #include "table.h"
+#include "async_env.h"
 #include "cache.h"
 #include "coding.h"
 #include "filter_policy.h"
 #include "comparator.h"
 #include <cstdint>
+#include <memory>
 
 namespace prism
 {
@@ -132,6 +134,12 @@ namespace prism
 		delete block;
 	}
 
+	static Status SaveSeekValue(void* arg, const Slice&, const Slice& value)
+	{
+		*static_cast<Slice*>(arg) = value;
+		return Status::OK();
+	}
+
 	static void ReleaseBlock(void* arg, void* h)
 	{
 		Cache* cache = reinterpret_cast<Cache*>(arg);
@@ -254,6 +262,107 @@ namespace prism
 		delete index_iter;
 		return s;
 	}
+
+	void Table::InternalGetAsyncCallback(AsyncRuntime& runtime,
+	    RandomAccessFile& file,
+	    ReadOptions options,
+	    std::string key,
+	    void* arg,
+	    HandleResult handle_result,
+	    AsyncGetCallback completion)
+	{
+		Status s;
+		BlockHandle handle;
+		Slice key_slice(key);
+		Slice handle_value;
+		bool index_entry_found = false;
+		s = rep_->index_block->Seek(
+		    rep_->options.comparator, key_slice, &handle_value, &SaveSeekValue, &index_entry_found);
+		if (!s.ok() || !index_entry_found)
+		{
+			completion(s);
+			return;
+		}
+
+		FilterBlockReader* filter = rep_->filter;
+		bool skip_data_block = false;
+
+		s = handle.DecodeFrom(handle_value);
+		if (s.ok() && filter != nullptr && !filter->KeyMayMatch(handle.offset(), key_slice))
+		{
+			skip_data_block = true;
+		}
+		if (!s.ok() || skip_data_block)
+		{
+			completion(s);
+			return;
+		}
+
+		Cache* block_cache = rep_->options.block_cache;
+		Block* block = nullptr;
+		Cache::Handle* cache_handle = nullptr;
+		char cache_key_buffer[16];
+		Slice cache_key;
+
+		if (block_cache != nullptr)
+		{
+			EncodeFixed64(cache_key_buffer, rep_->cache_id);
+			EncodeFixed64(cache_key_buffer + 8, handle.offset());
+			cache_key = Slice(cache_key_buffer, sizeof(cache_key_buffer));
+			cache_handle = block_cache->Lookup(cache_key);
+			if (cache_handle != nullptr)
+			{
+				block = reinterpret_cast<Block*>(block_cache->Value(cache_handle));
+			}
+		}
+
+		auto finish_with_block = [this, block_cache, arg, handle_result, completion = std::move(completion), key = std::move(key)](
+		                             Block* data_block, Cache::Handle* data_cache_handle, Status block_status) mutable {
+			Status result = block_status;
+			if (result.ok())
+			{
+				bool block_entry_found = false;
+				result = data_block->Seek(
+				    rep_->options.comparator, Slice(key), arg, handle_result, &block_entry_found);
+			}
+			if (data_cache_handle != nullptr)
+			{
+				block_cache->Release(data_cache_handle);
+			}
+			else
+			{
+				delete data_block;
+			}
+			completion(result);
+		};
+
+		if (block != nullptr)
+		{
+			finish_with_block(block, cache_handle, Status::OK());
+			return;
+		}
+
+		ReadBlockAsyncCallback(runtime, file, options, handle, [block_cache,
+		                                          cache_key_string = cache_key.ToString(),
+		                                          options,
+		                                          finish_with_block = std::move(finish_with_block)](
+		                                             Result<BlockContents> contents) mutable {
+			if (!contents.has_value())
+			{
+				finish_with_block(nullptr, nullptr, contents.error());
+				return;
+			}
+
+			Block* loaded_block = new Block(contents.value());
+			Cache::Handle* loaded_handle = nullptr;
+			if (block_cache != nullptr && contents.value().cachable && options.fill_cache)
+			{
+				loaded_handle = block_cache->Insert(Slice(cache_key_string), loaded_block, loaded_block->size(), &DeleteCachedBlock);
+			}
+			finish_with_block(loaded_block, loaded_handle, Status::OK());
+		});
+	}
+
 
 	Iterator* Table::NewIterator(const ReadOptions& options) const
 	{

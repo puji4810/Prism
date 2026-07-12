@@ -142,6 +142,36 @@ TEST(PosixEnvTest, FileAndDirectoryOps)
 	ASSERT_TRUE(env->RemoveDir(test_dir.string()).ok());
 }
 
+TEST(PosixEnvTest, MmapRandomAccessFileExposesStableReadView)
+{
+	Env* env = Env::Default();
+	const auto test_dir = UniqueTestDir(env);
+	const ScopedRemoveAll cleanup(test_dir);
+	ASSERT_TRUE(env->CreateDir(test_dir.string()).ok());
+
+	const auto file_path = (test_dir / "mapped.txt").string();
+	auto writable = env->NewWritableFile(file_path);
+	ASSERT_TRUE(writable.has_value());
+	ASSERT_TRUE(writable.value()->Append(Slice("mapped-data")).ok());
+	ASSERT_TRUE(writable.value()->Close().ok());
+
+	auto random = env->NewRandomAccessFile(file_path);
+	ASSERT_TRUE(random.has_value());
+	auto view = random.value()->TryReadView(1, 5);
+	ASSERT_TRUE(view.has_value()) << view.error().ToString();
+	ASSERT_TRUE(view.value().has_value());
+	EXPECT_EQ(view.value()->ToString(), "apped");
+
+	auto eof = random.value()->TryReadView(11, 0);
+	ASSERT_TRUE(eof.has_value()) << eof.error().ToString();
+	ASSERT_TRUE(eof.value().has_value());
+	EXPECT_TRUE(eof.value()->empty());
+
+	auto out_of_range = random.value()->TryReadView(12, 0);
+	ASSERT_FALSE(out_of_range.has_value());
+	EXPECT_TRUE(out_of_range.error().IsIOError()) << out_of_range.error().ToString();
+}
+
 TEST(PosixEnvTest, FileLock)
 {
 	Env* env = Env::Default();

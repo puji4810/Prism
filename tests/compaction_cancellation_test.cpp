@@ -202,7 +202,12 @@ protected:
 		std::filesystem::remove_all("test_shutdown_quiescence_running_compaction", ec);
 	}
 
-	void SetUp() override { RuntimeMetrics::Instance().Reset(); }
+	void SetUp() override
+	{
+#ifdef PRISM_RUNTIME_METRICS
+		RuntimeMetrics::Instance().Reset();
+#endif
+	}
 };
 
 TEST_F(CompactionCancellationTest, PreStartCompactionCancelledBeforeExecution)
@@ -220,12 +225,16 @@ TEST_F(CompactionCancellationTest, PreStartCompactionCancelledBeforeExecution)
 	std::vector<std::pair<std::string, std::string>> kvs;
 	FillUntilImmutable(impl, "seed", &kvs);
 	ASSERT_TRUE(WaitUntil([impl] { return impl->TEST_BackgroundCompactionStartCount() >= 1; }, 5s));
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_EQ(RuntimeMetrics::Instance().active_compaction_lane.load(std::memory_order_relaxed), 1);
+#endif
 
 	impl->TEST_RequestCompactionStop();
 	impl->TEST_HoldBackgroundCompaction(false);
 	ASSERT_TRUE(WaitUntil([impl] { return !impl->TEST_HasInFlightCompaction(); }, 5s));
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_EQ(RuntimeMetrics::Instance().active_compaction_lane.load(std::memory_order_relaxed), 0);
+#endif
 	EXPECT_TRUE(impl->TEST_HasImmutableMemTable());
 	EXPECT_EQ(impl->TEST_NumLevelFiles(0), 0);
 
@@ -258,12 +267,16 @@ TEST_F(CompactionCancellationTest, RunningCompactionStopsAtCheckpoint)
 	env.EnableAppendBlock();
 	impl->TEST_ScheduleCompaction();
 	ASSERT_TRUE(env.WaitForBlockedAppend(5s));
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_EQ(RuntimeMetrics::Instance().active_compaction_lane.load(std::memory_order_relaxed), 1);
+#endif
 
 	impl->TEST_RequestCompactionStop();
 	env.ReleaseBlockedAppend();
 	ASSERT_TRUE(WaitUntil([impl] { return !impl->TEST_HasInFlightCompaction(); }, 5s));
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_EQ(RuntimeMetrics::Instance().active_compaction_lane.load(std::memory_order_relaxed), 0);
+#endif
 
 	EXPECT_TRUE(impl->TEST_PendingOutputsEmpty());
 	EXPECT_EQ(impl->TEST_NumLevelFiles(0), 4);
@@ -335,7 +348,9 @@ TEST_F(CompactionCancellationTest, ShutdownQuiescenceWhileCompactionRunning)
 	env.EnableAppendBlock();
 	impl->TEST_ScheduleCompaction();
 	ASSERT_TRUE(env.WaitForBlockedAppend(5s));
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_EQ(RuntimeMetrics::Instance().active_compaction_lane.load(std::memory_order_relaxed), 1);
+#endif
 
 	std::atomic<bool> destroyed{ false };
 	std::thread destroy_thread([&] {
@@ -349,9 +364,11 @@ TEST_F(CompactionCancellationTest, ShutdownQuiescenceWhileCompactionRunning)
 	env.ReleaseBlockedAppend();
 	ASSERT_TRUE(WaitUntil([&destroyed] { return destroyed.load(std::memory_order_acquire); }, 5s));
 	destroy_thread.join();
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_EQ(RuntimeMetrics::Instance().active_compaction_lane.load(std::memory_order_relaxed), 0);
 	EXPECT_GE(RuntimeMetrics::Instance().shutdown_wait_count.load(std::memory_order_relaxed), 1u);
 	EXPECT_GT(RuntimeMetrics::Instance().shutdown_wait_duration_us.load(std::memory_order_relaxed), 0u);
+#endif
 
 	env.DisableAppendBlock();
 	open = DBImpl::OpenInternal(options, "test_shutdown_quiescence_running_compaction");

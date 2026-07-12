@@ -18,14 +18,25 @@ namespace prism
 		std::atomic<std::size_t> shutdown_wait_count{ 0 };
 		std::atomic<uint64_t> shutdown_wait_duration_us{ 0 };
 
-		// Foreground read-lane queue metrics — instrumented via PRISM_RUNTIME_METRICS
+		// Foreground DB read-lane queue metrics — instrumented via PRISM_RUNTIME_METRICS
 		// #ifdef. When PRISM_RUNTIME_METRICS is NOT defined, these counters remain at
 		// 0 and the BlockingExecutor hot-path is identical to uninstrumented code.
-		std::atomic<uint64_t> blocking_jobs_submitted{ 0 };
-		std::atomic<uint64_t> blocking_jobs_completed{ 0 };
-		std::atomic<uint64_t> blocking_peak_queue_depth{ 0 };
-		std::atomic<uint64_t> blocking_enqueue_wait_total_us{ 0 };
-		std::atomic<uint64_t> blocking_exec_time_total_us{ 0 };
+		std::atomic<uint64_t> db_read_jobs_submitted{ 0 };
+		std::atomic<uint64_t> db_read_jobs_completed{ 0 };
+		std::atomic<uint64_t> db_read_peak_queue_depth{ 0 };
+		std::atomic<uint64_t> db_read_enqueue_wait_total_us{ 0 };
+		std::atomic<uint64_t> db_read_exec_time_total_us{ 0 };
+		std::atomic<uint64_t> db_read_steal_attempts{ 0 };
+		std::atomic<uint64_t> db_read_steal_successes{ 0 };
+
+		// Blocking file-I/O lane queue metrics.
+		std::atomic<uint64_t> blocking_io_jobs_submitted{ 0 };
+		std::atomic<uint64_t> blocking_io_jobs_completed{ 0 };
+		std::atomic<uint64_t> blocking_io_peak_queue_depth{ 0 };
+		std::atomic<uint64_t> blocking_io_enqueue_wait_total_us{ 0 };
+		std::atomic<uint64_t> blocking_io_exec_time_total_us{ 0 };
+		std::atomic<uint64_t> blocking_io_steal_attempts{ 0 };
+		std::atomic<uint64_t> blocking_io_steal_successes{ 0 };
 
 		// Dedicated compaction-lane queue metrics.
 		std::atomic<uint64_t> compaction_queue_jobs_submitted{ 0 };
@@ -42,15 +53,35 @@ namespace prism
 		std::atomic<uint64_t> get_async_db_op_total_us{ 0 };
 		std::atomic<uint64_t> get_async_db_op_count{ 0 };
 
+		// Async WAL write-path metrics.
+		std::atomic<uint64_t> wal_append_reactor_count{ 0 };
+		std::atomic<uint64_t> wal_append_fallback_count{ 0 };
+		std::atomic<uint64_t> wal_fsync_reactor_count{ 0 };
+		std::atomic<uint64_t> wal_fsync_fallback_count{ 0 };
+		std::atomic<uint64_t> wal_append_latency_total_us{ 0 };
+		std::atomic<uint64_t> wal_fsync_latency_total_us{ 0 };
+		std::atomic<uint64_t> async_wal_inflight_total_us{ 0 };
+		std::atomic<uint64_t> async_wal_inflight_count{ 0 };
+		std::atomic<uint64_t> write_groups_completed{ 0 };
+		std::atomic<uint64_t> write_group_requests_total{ 0 };
+		std::atomic<uint64_t> write_group_bytes_total{ 0 };
+		std::atomic<uint64_t> write_plan_mutex_total_us{ 0 };
+		std::atomic<uint64_t> write_plan_mutex_count{ 0 };
+		std::atomic<uint64_t> write_apply_total_us{ 0 };
+		std::atomic<uint64_t> write_apply_count{ 0 };
+		std::atomic<uint64_t> write_publish_mutex_total_us{ 0 };
+		std::atomic<uint64_t> write_publish_mutex_count{ 0 };
+		std::atomic<uint64_t> write_commit_total_us{ 0 };
+		std::atomic<uint64_t> write_commit_count{ 0 };
+
 		// Compaction lifecycle counters — incremented when compaction work is
 		// scheduled/completed by CompactionController.
 		std::atomic<uint64_t> compaction_jobs_submitted{ 0 };
 		std::atomic<uint64_t> compaction_jobs_completed{ 0 };
 
-		// Scheduler-aware counters — always available (no PRISM_RUNTIME_METRICS gate).
-		// These track the redesigned split-role scheduler's fast path, steal, and
-		// locality behavior. Atomic increments are negligible overhead on the hot path.
-		std::atomic<uint64_t> foreground_fastpath_submits{ 0 };   // Submit(job,0) that bypassed dispatcher
+		// Scheduler-aware counters. Updates are compiled only with
+		// PRISM_RUNTIME_METRICS so the default scheduler hot path is uninstrumented.
+		std::atomic<uint64_t> foreground_fastpath_submits{ 0 };   // priority-0 submits that bypassed dispatcher
 		std::atomic<uint64_t> foreground_fallback_submits{ 0 };   // Submit() that fell back to priority path
 		std::atomic<uint64_t> steal_attempts{ 0 };                // TrySteal() invocations
 		std::atomic<uint64_t> steal_successes{ 0 };               // TrySteal() that moved jobs

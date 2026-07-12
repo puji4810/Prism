@@ -1,4 +1,6 @@
 #include "asyncdb.h"
+#include "../src/async_runtime.h"
+#include "db_impl.h"
 
 #include <filesystem>
 #include <gtest/gtest.h>
@@ -10,6 +12,47 @@ using namespace prism::tests;
 
 namespace
 {
+	class NoViewRandomAccessFile final: public RandomAccessFile
+	{
+	public:
+		explicit NoViewRandomAccessFile(std::unique_ptr<RandomAccessFile> file)
+		    : file_(std::move(file))
+		{
+		}
+
+		Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const override
+		{
+			return file_->Read(offset, n, result, scratch);
+		}
+
+		Result<std::size_t> ReadAt(uint64_t offset, std::span<std::byte> dst) const override
+		{
+			return file_->ReadAt(offset, dst);
+		}
+
+	private:
+		std::unique_ptr<RandomAccessFile> file_;
+	};
+
+	class NoViewEnv final: public EnvWrapper
+	{
+	public:
+		explicit NoViewEnv(Env* target)
+		    : EnvWrapper(target)
+		{
+		}
+
+		Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& filename) override
+		{
+			auto file = target()->NewRandomAccessFile(filename);
+			if (!file.has_value())
+			{
+				return std::unexpected(file.error());
+			}
+			return std::unique_ptr<RandomAccessFile>(new NoViewRandomAccessFile(std::move(file.value())));
+		}
+	};
+
 	class AsyncDBTest: public ::testing::Test
 	{
 	protected:
@@ -34,9 +77,9 @@ namespace
 		}
 	};
 
-	Task<void> PublicOpenAcrossIndependentPathsImpl(ThreadPoolScheduler& scheduler, Options options)
+	Task<void> PublicOpenAcrossIndependentPathsImpl(AsyncRuntime& runtime, Options options)
 	{
-		auto left_db_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db_left");
+		auto left_db_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db_left");
 		if (!left_db_res.has_value())
 		{
 			ADD_FAILURE() << "Left DB open failed";
@@ -44,7 +87,7 @@ namespace
 		}
 		auto left_db = std::move(left_db_res.value());
 
-		auto right_db_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db_right");
+		auto right_db_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db_right");
 		if (!right_db_res.has_value())
 		{
 			ADD_FAILURE() << "Right DB open failed";
@@ -74,8 +117,8 @@ namespace
 
 		Options missing_options;
 		missing_options.create_if_missing = false;
-		auto left_missing = co_await AsyncDB::OpenAsync(scheduler, missing_options, "test_async_db_missing_left");
-		auto right_missing = co_await AsyncDB::OpenAsync(scheduler, missing_options, "test_async_db_missing_right");
+		auto left_missing = co_await AsyncDB::OpenAsync(runtime, missing_options, "test_async_db_missing_left");
+		auto right_missing = co_await AsyncDB::OpenAsync(runtime, missing_options, "test_async_db_missing_right");
 
 		EXPECT_EQ(left_missing.has_value(), right_missing.has_value());
 		EXPECT_FALSE(left_missing.has_value());
@@ -94,13 +137,14 @@ namespace
 
 TEST_F(AsyncDBTest, BasicPutGet)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 
 	Options options;
 	options.create_if_missing = true;
 
-	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
-		auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		auto adb_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
 		if (!adb_res.has_value())
 		{
 			ADD_FAILURE() << "Open failed";
@@ -125,34 +169,187 @@ TEST_F(AsyncDBTest, BasicPutGet)
 		auto missing_result = co_await adb.GetAsync(ReadOptions(), "k");
 		EXPECT_TRUE(missing_result.error().IsNotFound()) << missing_result.error().ToString();
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	task.SyncWait();
+}
+
+TEST_F(AsyncDBTest, GetAsyncResumesInlineOnCompletingReadWorker)
+{
+	bool resumed_on_read_worker = false;
+	std::optional<Task<void>> task;
+	{
+		CpuThreadPool scheduler(2);
+		AsyncRuntime runtime(scheduler);
+		Options options;
+		options.create_if_missing = true;
+
+		task.emplace([](AsyncRuntime& runtime, Options options, bool* resumed_on_read_worker) -> Task<void> {
+			auto db_result = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
+			if (!db_result.has_value())
+			{
+				ADD_FAILURE() << "Open failed: " << db_result.error().ToString();
+				co_return;
+			}
+			auto db = std::move(db_result.value());
+			Status put = co_await db.PutAsync(WriteOptions(), "fast-key", "fast-value");
+			if (!put.ok())
+			{
+				ADD_FAILURE() << "Put failed: " << put.ToString();
+				co_return;
+			}
+
+			auto get = co_await db.GetAsync(ReadOptions(), "fast-key");
+			if (!get.has_value())
+			{
+				ADD_FAILURE() << "Get failed: " << get.error().ToString();
+				co_return;
+			}
+			EXPECT_EQ(get.value(), "fast-value");
+			*resumed_on_read_worker = runtime.DbReadExecutor().IsCurrentWorker();
+			}(runtime, options, &resumed_on_read_worker));
+
+		task->SyncWait();
+	}
+	task.reset();
+	EXPECT_TRUE(resumed_on_read_worker);
+}
+
+TEST_F(AsyncDBTest, GetAsyncReadsFlushedSstBlockMiss)
+{
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+
+	Options options;
+	options.create_if_missing = true;
+	options.write_buffer_size = 8 * 1024;
+	options.block_size = 256;
+
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		auto adb_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
+		if (!adb_res.has_value())
+		{
+			ADD_FAILURE() << "Open failed";
+			co_return;
+		}
+		auto adb = std::move(adb_res.value());
+
+		const std::string payload(1024, 'x');
+		for (int i = 0; i < 32; ++i)
+		{
+			Status s = co_await adb.PutAsync(WriteOptions(), "sst_key_" + std::to_string(i), payload + std::to_string(i));
+			if (!s.ok())
+			{
+				ADD_FAILURE() << "Put failed: " << s.ToString();
+				co_return;
+			}
+		}
+
+		DBImpl* impl = CompactionStateAccess::GetDBImpl(CompactionStateAccess::GetDatabase(adb));
+		int file_count = 0;
+		for (int level = 0; level < kNumLevels; ++level)
+		{
+			file_count += impl->TEST_NumLevelFiles(level);
+		}
+		if (file_count <= 0)
+		{
+			ADD_FAILURE() << "test setup should flush at least one SST file";
+			co_return;
+		}
+
+		ReadOptions read_options;
+		read_options.fill_cache = false;
+		auto result = co_await adb.GetAsync(read_options, "sst_key_0");
+		if (!result.has_value())
+		{
+			ADD_FAILURE() << "SST GetAsync failed: " << result.error().ToString();
+			co_return;
+		}
+		EXPECT_EQ(result.value(), payload + "0");
+		co_return;
+	}(runtime, options);
+	task.SyncWait();
+}
+
+TEST_F(AsyncDBTest, GetAsyncResumesAfterAsynchronousSstRead)
+{
+	std::optional<Task<void>> task;
+	{
+		// Keep the coroutine frame alive until the runtime and its workers have
+		// drained. SyncWait() is released from final_suspend(), while the worker's
+		// resume() call may still be unwinding.
+		NoViewEnv env(Env::Default());
+		CpuThreadPool scheduler(4);
+		AsyncRuntime runtime(scheduler);
+
+		Options options;
+		options.create_if_missing = true;
+		options.env = &env;
+		options.write_buffer_size = 8 * 1024;
+		options.block_size = 256;
+
+		task.emplace([](AsyncRuntime& runtime, CpuThreadPool& scheduler, Options options) -> Task<void> {
+		auto db_result = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
+		if (!db_result.has_value())
+		{
+			ADD_FAILURE() << "Open failed: " << db_result.error().ToString();
+			co_return;
+		}
+		auto db = std::move(db_result.value());
+		const std::string payload(1024, 'a');
+		for (int i = 0; i < 32; ++i)
+		{
+			Status put = co_await db.PutAsync(WriteOptions(), "async_sst_" + std::to_string(i), payload);
+			if (!put.ok())
+			{
+				ADD_FAILURE() << "Put failed: " << put.ToString();
+				co_return;
+			}
+		}
+
+		ReadOptions read_options;
+		read_options.fill_cache = false;
+		auto get = co_await db.GetAsync(read_options, "async_sst_0");
+		if (!get.has_value())
+		{
+			ADD_FAILURE() << "Get failed: " << get.error().ToString();
+			co_return;
+		}
+		EXPECT_EQ(get.value(), payload);
+		EXPECT_TRUE(scheduler.CaptureContext().IsValid());
+		EXPECT_FALSE(runtime.DbReadExecutor().IsCurrentWorker());
+		co_return;
+		}(runtime, scheduler, options));
+		task->SyncWait();
+	}
+	task.reset();
 }
 
 TEST_F(AsyncDBTest, OpenAsyncFailure)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	Options options;
 	options.create_if_missing = false;
 
-	auto open_task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
-		auto db_res = co_await AsyncDB::OpenAsync(scheduler, options, "/nonexistent_path/no_db");
+	auto open_task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		auto db_res = co_await AsyncDB::OpenAsync(runtime, options, "/nonexistent_path/no_db");
 		EXPECT_FALSE(db_res.has_value());
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	open_task.SyncWait();
 }
 
 TEST_F(AsyncDBTest, DestroyBeforeAwait)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	Options options;
 	options.create_if_missing = true;
 
-	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
-		std::optional<AsyncOp<Status>> put_op;
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		std::optional<AsyncWriteOp> put_op;
 		{
-			auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+			auto adb_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
 			if (!adb_res.has_value())
 			{
 				ADD_FAILURE() << "Open failed";
@@ -164,18 +361,19 @@ TEST_F(AsyncDBTest, DestroyBeforeAwait)
 		Status s = co_await std::move(*put_op);
 		EXPECT_TRUE(s.ok()) << s.ToString();
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	task.SyncWait();
 }
 
 TEST_F(AsyncDBTest, ValueHandleMoveConstruction)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	Options options;
 	options.create_if_missing = true;
 
-	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
-		auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		auto adb_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
 		if (!adb_res.has_value())
 		{
 			ADD_FAILURE() << "Open failed";
@@ -196,33 +394,35 @@ TEST_F(AsyncDBTest, ValueHandleMoveConstruction)
 		}
 		EXPECT_EQ(get_result.value(), "move_val");
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	task.SyncWait();
 }
 
 TEST_F(AsyncDBTest, PublicOpenAcrossIndependentPaths)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	Options options;
 	options.create_if_missing = true;
 
-	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
-		PublicOpenAcrossIndependentPathsImpl(scheduler, options).SyncWait();
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		PublicOpenAcrossIndependentPathsImpl(runtime, options).SyncWait();
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	task.SyncWait();
 }
 
 TEST_F(AsyncDBTest, SnapshotReadSurvivesCallerTeardown)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	Options options;
 	options.create_if_missing = true;
 
-	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
-		std::optional<AsyncOp<Result<std::string>>> get_op;
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		std::optional<AsyncGetOp> get_op;
 		{
-			auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+			auto adb_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
 			if (!adb_res.has_value())
 			{
 				ADD_FAILURE() << "Open failed";
@@ -246,18 +446,19 @@ TEST_F(AsyncDBTest, SnapshotReadSurvivesCallerTeardown)
 		}
 		EXPECT_EQ("v1", result.value());
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	task.SyncWait();
 }
 
 TEST_F(AsyncDBTest, SnapshotCopyAcrossCoroutineBoundaryKeepsViewAlive)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	Options options;
 	options.create_if_missing = true;
 
-	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
-		auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		auto adb_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
 		if (!adb_res.has_value())
 		{
 			ADD_FAILURE() << "Open failed";
@@ -283,18 +484,19 @@ TEST_F(AsyncDBTest, SnapshotCopyAcrossCoroutineBoundaryKeepsViewAlive)
 		}
 		EXPECT_EQ(result.value(), "original");
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	task.SyncWait();
 }
 
 TEST_F(AsyncDBTest, SnapshotRejectsMovedFromHandle)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	Options options;
 	options.create_if_missing = true;
 
-	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
-		auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		auto adb_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
 		if (!adb_res.has_value())
 		{
 			ADD_FAILURE() << "Open failed";
@@ -329,18 +531,19 @@ TEST_F(AsyncDBTest, SnapshotRejectsMovedFromHandle)
 		}
 		EXPECT_EQ(ok_result.value(), "val");
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	task.SyncWait();
 }
 
 TEST_F(AsyncDBTest, SnapshotRejectsForeignHandle)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	Options options;
 	options.create_if_missing = true;
 
-	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
-		auto left_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db_left");
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
+		auto left_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db_left");
 		if (!left_res.has_value())
 		{
 			ADD_FAILURE() << "Left DB open failed";
@@ -348,7 +551,7 @@ TEST_F(AsyncDBTest, SnapshotRejectsForeignHandle)
 		}
 		auto left_db = std::move(left_res.value());
 
-		auto right_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db_right");
+		auto right_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db_right");
 		if (!right_res.has_value())
 		{
 			ADD_FAILURE() << "Right DB open failed";
@@ -370,20 +573,21 @@ TEST_F(AsyncDBTest, SnapshotRejectsForeignHandle)
 			EXPECT_TRUE(result.error().IsInvalidArgument()) << result.error().ToString();
 		}
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	task.SyncWait();
 }
 
 TEST_F(AsyncDBTest, SnapshotDestructionAfterDBWrapperTeardownIsSafe)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 	Options options;
 	options.create_if_missing = true;
 
-	auto task = [](ThreadPoolScheduler& scheduler, Options options) -> Task<void> {
+	auto task = [](AsyncRuntime& runtime, Options options) -> Task<void> {
 		Snapshot snap;
 		{
-			auto adb_res = co_await AsyncDB::OpenAsync(scheduler, options, "test_async_db");
+			auto adb_res = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
 			if (!adb_res.has_value())
 			{
 				ADD_FAILURE() << "Open failed";
@@ -400,6 +604,6 @@ TEST_F(AsyncDBTest, SnapshotDestructionAfterDBWrapperTeardownIsSafe)
 
 		SUCCEED();
 		co_return;
-	}(scheduler, options);
+	}(runtime, options);
 	task.SyncWait();
 }

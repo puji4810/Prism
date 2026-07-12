@@ -13,6 +13,7 @@
 namespace prism
 {
 	class AsyncDB;
+	class AsyncGetOp;
 	class DBImpl;
 
 	// Database: move-only public handle for the KV store.
@@ -58,6 +59,8 @@ namespace prism
 		Snapshot CaptureSnapshot();
 
 		private:
+		friend class AsyncDB;
+		friend class AsyncGetOp;
 		friend struct CompactionStateAccess;
 
 		explicit Database(std::unique_ptr<DBImpl> impl);

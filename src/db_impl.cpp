@@ -8,7 +8,9 @@
 #include "filename.h"
 #include "iterator.h"
 #include "log_reader.h"
+#include "log_writer.h"
 #include "options.h"
+#include "async_wal_writer.h"
 #include "async_runtime.h"
 #include "runtime_metrics.h"
 #include "slice.h"
@@ -18,6 +20,7 @@
 #include "table/table_builder.h"
 #include "table/two_level_iterator.h"
 #include "version_edit.h"
+#include "write_coordinator.h"
 #include "write_batch.h"
 #include "write_batch_internal.h"
 
@@ -30,12 +33,14 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <utility>
 
 namespace prism
 {
 	namespace
 	{
 		constexpr int kNumNonTableCacheFiles = 10;
+		constexpr size_t kDefaultBlockCacheCapacity = 8 * 1024 * 1024;
 
 		Status InvalidSnapshotOwnerStatus() { return Status::InvalidArgument("snapshot does not belong to this database"); }
 
@@ -61,12 +66,20 @@ namespace prism
 			return opts;
 		}
 
-		std::shared_ptr<RuntimeBundle> DefaultRuntimeBundle()
+		AsyncRuntime& DefaultAsyncRuntime()
 		{
-			static ThreadPoolScheduler scheduler(1);
-			static std::shared_ptr<RuntimeBundle> runtime = AcquireRuntimeBundle(scheduler);
+			static CpuThreadPool cpu_pool(1);
+			static AsyncRuntime runtime(cpu_pool);
 			return runtime;
 		}
+
+#ifdef PRISM_RUNTIME_METRICS
+		uint64_t ElapsedUs(std::chrono::steady_clock::time_point start)
+		{
+			return static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+		}
+#endif
 
 		Status BuildTable(const std::string& dbname, Env* env, const Options& options, TableCache* table_cache, uint64_t file_number,
 		    Iterator* iter, uint64_t* file_size, InternalKey* smallest, InternalKey* largest)
@@ -690,9 +703,14 @@ namespace prism
 
 	Result<std::unique_ptr<DBImpl>> DBImpl::OpenInternal(const Options& options, const std::string& dbname)
 	{
+		return OpenInternal(options, dbname, nullptr);
+	}
+
+	Result<std::unique_ptr<DBImpl>> DBImpl::OpenInternal(const Options& options, const std::string& dbname, AsyncRuntime* runtime)
+	{
 		Options opts = SanitizeOpenOptions(options);
 
-		auto impl = std::make_unique<DBImpl>(opts, dbname);
+		auto impl = std::make_unique<DBImpl>(opts, dbname, runtime);
 		Status s = impl->Recover();
 		if (!s.ok())
 		{
@@ -712,22 +730,29 @@ namespace prism
 		return OpenInternal(options, dbname);
 	}
 
-	DBImpl::DBImpl(const Options& options, const std::string& dbname)
+	DBImpl::DBImpl(const Options& options, const std::string& dbname, AsyncRuntime* runtime)
 	    : env_(options.env)
 	    , options_(options)
+	    , owned_block_cache_(options.block_cache == nullptr ? NewLRUCache(kDefaultBlockCacheCapacity) : nullptr)
 	    , dbname_(dbname)
 	    , table_cache_(nullptr)
 	    , mem_(nullptr)
 	    , internal_comparator_(options.comparator)
 	    , versions_(nullptr)
-	    , runtime_bundle_(DefaultRuntimeBundle())
+	    , runtime_(runtime != nullptr ? runtime : &DefaultAsyncRuntime())
 	    , snapshot_registry_(std::make_shared<SnapshotRegistry>())
 	{
+		if (owned_block_cache_ != nullptr)
+		{
+			options_.block_cache = owned_block_cache_.get();
+		}
 		options_.comparator = &internal_comparator_;
 
 		table_cache_ = new TableCache(dbname_, options_, TableCacheEntries(options_));
 		versions_ = std::make_unique<VersionSet>(dbname_, &options_, table_cache_, &internal_comparator_);
-		compaction_controller_ = std::make_unique<CompactionController>(runtime_bundle_->compaction_executor, *this);
+		async_wal_writer_ = std::make_unique<AsyncWalWriter>(*runtime_);
+		compaction_controller_ = std::make_unique<CompactionController>(runtime_->CompactionExecutor(), *this);
+		write_coordinator_ = std::make_unique<WriteCoordinator>(*this, runtime_->DbWriteExecutor());
 
 		mem_ = new MemTable(internal_comparator_);
 		mem_->Ref();
@@ -745,12 +770,16 @@ namespace prism
 			background_work_finished_signal_.notify_all();
 			while (compaction_controller_ != nullptr && compaction_controller_->HasInFlightWork())
 			{
+#ifdef PRISM_RUNTIME_METRICS
 				auto wait_start = std::chrono::steady_clock::now();
+#endif
 				background_work_finished_signal_.wait(lock);
+#ifdef PRISM_RUNTIME_METRICS
 				auto waited_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start);
 				RuntimeMetrics::Instance().shutdown_wait_count.fetch_add(1, std::memory_order_relaxed);
 				RuntimeMetrics::Instance().shutdown_wait_duration_us.fetch_add(
 				    static_cast<uint64_t>(waited_us.count()), std::memory_order_relaxed);
+#endif
 			}
 			// Teardown rule: once shutdown begins, no new SuperVersion acquisitions are allowed.
 			// Existing holders complete normally through the refcount, and two-generation retirement
@@ -771,6 +800,11 @@ namespace prism
 			background_work_finished_signal_.notify_all();
 		}
 		compaction_controller_.reset();
+		if (write_coordinator_ != nullptr)
+		{
+			write_coordinator_->Shutdown();
+			write_coordinator_.reset();
+		}
 		if (imm_)
 		{
 			imm_->Unref();
@@ -784,9 +818,145 @@ namespace prism
 		delete table_cache_;
 	}
 
-	Status DBImpl::ApplyBatch(WriteBatch& batch)
+	DBImpl::WritePlan::~WritePlan() { Reset(); }
+
+	DBImpl::WritePlan::WritePlan(WritePlan&& other) noexcept
 	{
-		RecoveryHandler handler(mem_, WriteBatchInternal::Sequence(&batch));
+		writer = std::exchange(other.writer, nullptr);
+		file = std::exchange(other.file, nullptr);
+		commit_target = std::exchange(other.commit_target, nullptr);
+		sync = std::exchange(other.sync, false);
+		visible_sequence = std::exchange(other.visible_sequence, 0);
+	}
+
+	DBImpl::WritePlan& DBImpl::WritePlan::operator=(WritePlan&& other) noexcept
+	{
+		if (this != &other)
+		{
+			Reset();
+			writer = std::exchange(other.writer, nullptr);
+			file = std::exchange(other.file, nullptr);
+			commit_target = std::exchange(other.commit_target, nullptr);
+			sync = std::exchange(other.sync, false);
+			visible_sequence = std::exchange(other.visible_sequence, 0);
+		}
+		return *this;
+	}
+
+	void DBImpl::WritePlan::CaptureCommitTarget(MemTable* target)
+	{
+		if (commit_target != nullptr)
+		{
+			commit_target->Unref();
+		}
+		commit_target = target;
+		if (commit_target != nullptr)
+		{
+			commit_target->Ref();
+		}
+	}
+
+	void DBImpl::WritePlan::Reset() noexcept
+	{
+		if (commit_target != nullptr)
+		{
+			commit_target->Unref();
+			commit_target = nullptr;
+		}
+		writer = nullptr;
+		file = nullptr;
+		sync = false;
+		visible_sequence = 0;
+	}
+
+	DBImpl::PointReadGuard::PointReadGuard(
+	    DBImpl* db_arg, SuperVersion* view_arg, std::size_t epoch_arg, std::size_t shard_arg)
+	    : db(db_arg)
+	    , view(view_arg)
+	    , epoch(epoch_arg)
+	    , shard(shard_arg)
+	{
+	}
+
+	DBImpl::PointReadGuard::~PointReadGuard()
+	{
+		if (db != nullptr)
+		{
+			db->ReleasePointRead(epoch, shard);
+		}
+	}
+
+	DBImpl::PointReadGuard::PointReadGuard(PointReadGuard&& other) noexcept
+	    : db(std::exchange(other.db, nullptr))
+	    , view(std::exchange(other.view, nullptr))
+	    , epoch(other.epoch)
+	    , shard(other.shard)
+	{
+	}
+
+	DBImpl::PointReadGuard& DBImpl::PointReadGuard::operator=(PointReadGuard&& other) noexcept
+	{
+		if (this != &other)
+		{
+			if (db != nullptr)
+			{
+				db->ReleasePointRead(epoch, shard);
+			}
+			db = std::exchange(other.db, nullptr);
+			view = std::exchange(other.view, nullptr);
+			epoch = other.epoch;
+			shard = other.shard;
+		}
+		return *this;
+	}
+
+	DBImpl::PointReadGuard DBImpl::AcquirePointRead()
+	{
+		static std::atomic<std::size_t> next_shard{ 0 };
+		static thread_local const std::size_t shard
+		    = next_shard.fetch_add(1, std::memory_order_relaxed) % kPointReadShardCount;
+
+		while (true)
+		{
+			const std::size_t epoch = point_read_epoch_.load(std::memory_order_acquire);
+			point_read_counters_[epoch][shard].value.fetch_add(1, std::memory_order_acq_rel);
+			SuperVersion* view = super_version_.load(std::memory_order_acquire);
+			if (epoch != point_read_epoch_.load(std::memory_order_acquire)
+			    || (view != nullptr && view->point_read_epoch != epoch))
+			{
+				point_read_counters_[epoch][shard].value.fetch_sub(1, std::memory_order_release);
+				continue;
+			}
+
+			return PointReadGuard(this, view, epoch, shard);
+		}
+	}
+
+	void DBImpl::ReleasePointRead(std::size_t epoch, std::size_t shard) noexcept
+	{
+		const uint32_t previous = point_read_counters_[epoch][shard].value.fetch_sub(1, std::memory_order_release);
+		assert(previous > 0);
+	}
+
+	bool DBImpl::PointReadEpochIdle(std::size_t epoch) const noexcept
+	{
+		for (const auto& counter : point_read_counters_[epoch])
+		{
+			if (counter.value.load(std::memory_order_acquire) != 0)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	Status DBImpl::ApplyBatch(const WriteBatch& batch, MemTable* target)
+	{
+		if (target == nullptr)
+		{
+			return Status::InvalidArgument("write commit target not set");
+		}
+		RecoveryHandler handler(target, WriteBatchInternal::Sequence(&batch));
 		return batch.Iterate(&handler);
 	}
 
@@ -809,13 +979,22 @@ namespace prism
 		// Precondition: caller holds unique_lock(mutex_). Publication is serialized by
 		// the DB mutex so readers never observe partially constructed state.
 		//
-		// Acquire-gap safety: retired SuperVersions are NEVER Unref'd during normal
-		// operation — they are accumulated and drained only in ~DBImpl() after all
-		// background work has quiesced.  This guarantees that a reader which loaded
-		// super_version_ before the exchange can always safely call Ref() because
-		// the SuperVersion is never freed while the DB is live.  The memory cost is
-		// bounded by the number of state changes (memtable rotations + compactions),
-		// typically a few hundred objects across the DB lifetime.
+		// Point readers enter one of two sharded epochs before loading the published
+		// view. A publication switches to the idle epoch and can reclaim everything
+		// retired in that epoch's previous use. This closes the load/ref acquire gap
+		// without a contended per-read SuperVersion refcount, while allowing obsolete
+		// Versions and their SSTs to be reclaimed during normal operation.
+		const int old_epoch = retired_index_;
+		const int next_epoch = 1 - old_epoch;
+		const bool rotate_epoch = PointReadEpochIdle(static_cast<std::size_t>(next_epoch));
+		if (rotate_epoch)
+		{
+			for (SuperVersion* retired : retired_super_versions_[next_epoch])
+			{
+				retired->Unref();
+			}
+			retired_super_versions_[next_epoch].clear();
+		}
 		SuperVersion* sv = new SuperVersion;
 		sv->mem = mem_;
 		if (sv->mem != nullptr)
@@ -833,12 +1012,18 @@ namespace prism
 			sv->current->Ref();
 		}
 		sv->sequence = visible_sequence_.load(std::memory_order_acquire);
+		sv->point_read_epoch = static_cast<std::size_t>(rotate_epoch ? next_epoch : old_epoch);
 		sv->Ref(); // publication reference — released in ~DBImpl()
 
 		SuperVersion* old = super_version_.exchange(sv, std::memory_order_acq_rel);
+		if (rotate_epoch)
+		{
+			point_read_epoch_.store(static_cast<std::size_t>(next_epoch), std::memory_order_release);
+			retired_index_ = next_epoch;
+		}
 		if (old != nullptr)
 		{
-			retired_super_versions_[retired_index_].push_back(old);
+			retired_super_versions_[old_epoch].push_back(old);
 		}
 	}
 
@@ -994,6 +1179,18 @@ namespace prism
 
 	void DBImpl::RemoveObsoleteFiles()
 	{
+		// Callers hold mutex_ exclusively. Directory enumeration and unlink can be
+		// comparatively expensive on large SST sets, but neither needs to serialize
+		// the write planner. Revalidate liveness after enumeration, then unlink the
+		// exact immutable file numbers outside the DB mutex.
+		mutex_.unlock();
+		auto children = env_->GetChildren(dbname_);
+		mutex_.lock();
+		if (!children.has_value())
+		{
+			return;
+		}
+
 		std::set<uint64_t> live;
 		versions_->AddLiveFiles(&live);
 		for (uint64_t number : pending_outputs_)
@@ -1001,12 +1198,7 @@ namespace prism
 			live.insert(number);
 		}
 
-		auto children = env_->GetChildren(dbname_);
-		if (!children.has_value())
-		{
-			return;
-		}
-
+		std::vector<std::string> obsolete_files;
 		for (const auto& filename : children.value())
 		{
 			uint64_t number = 0;
@@ -1047,9 +1239,16 @@ namespace prism
 				{
 					table_cache_->Evict(number);
 				}
-				env_->RemoveFile(dbname_ + "/" + filename);
+				obsolete_files.push_back(dbname_ + "/" + filename);
 			}
 		}
+
+		mutex_.unlock();
+		for (const auto& filename : obsolete_files)
+		{
+			env_->RemoveFile(filename);
+		}
+		mutex_.lock();
 	}
 
 	Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version*)
@@ -1543,7 +1742,6 @@ namespace prism
 			if (s.ok())
 			{
 				InstallSuperVersion();
-				RemoveObsoleteFiles();
 			}
 		}
 		else
@@ -1561,6 +1759,10 @@ namespace prism
 				s = InstallCompactionResults(compaction.get(), result.outputs, result.total_bytes);
 				if (s.ok())
 				{
+					// The installed edit no longer needs the picked input Version. Drop
+					// that ref before computing live files so obsolete SSTs can be
+					// removed in this compaction cycle.
+					compaction->ReleaseInputs();
 					RemoveObsoleteFiles();
 				}
 				else
@@ -1582,9 +1784,9 @@ namespace prism
 
 	void DBImpl::MaybeScheduleCompaction() { compaction_controller_->ScheduleIfNeeded(); }
 
-	// TODO(wal-rotation): MakeRoomForWrite will be refactored into explicit epoch helpers:
-	//   (a) writer grouping/selection seam, (b) WAL epoch freeze, (c) room accounting
-	//   against batch size, (d) append/sync/apply completion.
+	// Legacy room-making helper used by WriteCoordinator::PlanWriteGroup.
+	// Group selection, WAL append/sync, and memtable commit are split into
+	// coordinator-owned Plan / Execute / Commit phases.
 	Status DBImpl::MakeRoomForWrite(bool force, std::unique_lock<std::shared_mutex>& lock)
 	{
 		Status s;
@@ -1839,9 +2041,9 @@ namespace prism
 
 	Result<std::string> DBImpl::Get(const ReadOptions& read_options, const Slice& key)
 	{
-		// Phase 1: Acquire the published read view. SuperVersions are retired only
-		// during DB teardown, so point reads do not need per-call ref/unref traffic.
-		SuperVersion* sv = super_version_.load(std::memory_order_acquire);
+		// Phase 1: acquire the published view through a sharded read epoch.
+		auto read_guard = AcquirePointRead();
+		SuperVersion* sv = read_guard.view;
 		if (sv == nullptr)
 		{
 			return std::unexpected(Status::Corruption("database not initialized"));
@@ -1957,56 +2159,333 @@ namespace prism
 		return std::unexpected(Status::NotFound(Slice()));
 	}
 
-	// TODO(wal-rotation): Write() will gain a leader/follower group selection queue
-	//   that batches only contiguous same-sync, same-epoch writers. Group formation
-	//   freezes before room-making and never crosses a WAL rotation boundary.
+	void DBImpl::GetAsyncCallback(
+	    AsyncRuntime& runtime, ReadOptions read_options, std::string key, std::move_only_function<void(Result<std::string>)> completion)
+	{
+		auto read_guard = AcquirePointRead();
+		SuperVersion* sv = read_guard.view;
+		if (sv == nullptr)
+		{
+			completion(std::unexpected(Status::Corruption("database not initialized")));
+			return;
+		}
+
+		auto snapshot_result = ResolveSnapshotSequence(read_options.snapshot_handle);
+		if (!snapshot_result.has_value())
+		{
+			completion(std::unexpected(snapshot_result.error()));
+			return;
+		}
+
+		const SequenceNumber snapshot = snapshot_result.value();
+		LookupKey lkey(Slice(key), snapshot);
+		std::string value;
+		Status s;
+		if (sv->mem->Get(lkey, &value, &s))
+		{
+			if (s.ok())
+			{
+				completion(std::move(value));
+			}
+			else
+			{
+				completion(std::unexpected(s));
+			}
+			return;
+		}
+		if (sv->imm != nullptr && sv->imm->Get(lkey, &value, &s))
+		{
+			if (s.ok())
+			{
+				completion(std::move(value));
+			}
+			else
+			{
+				completion(std::unexpected(s));
+			}
+			return;
+		}
+
+		struct SearchState
+		{
+			DBImpl* db = nullptr;
+			AsyncRuntime* runtime = nullptr;
+			SuperVersion* sv = nullptr;
+			ReadOptions options;
+			std::string user_key;
+			std::string internal_key;
+			std::string value;
+			TableGetState table_state;
+			int level = 0;
+			std::size_t file_index = 0;
+			std::move_only_function<void(Result<std::string>)> completion;
+			PointReadGuard read_guard;
+
+			bool KeyInFileRange(const FileMetaData* file) const
+			{
+				const Slice user_key_slice(user_key);
+				const Slice smallest_user_key = file->smallest.user_key();
+				const Slice largest_user_key = file->largest.user_key();
+				if (db->internal_comparator_.IsBytewise())
+				{
+					return user_key_slice.compare(smallest_user_key) >= 0 && user_key_slice.compare(largest_user_key) <= 0;
+				}
+				const Comparator* ucmp = db->internal_comparator_.user_comparator();
+				return ucmp->Compare(user_key_slice, smallest_user_key) >= 0 && ucmp->Compare(user_key_slice, largest_user_key) <= 0;
+			}
+
+			static void Complete(std::unique_ptr<SearchState> self, Result<std::string> result)
+			{
+				auto done = std::move(self->completion);
+				// The completion may resume a coroutine that releases the last AsyncDB
+				// operation reference and destroys DBImpl. Drop the point-read guard and
+				// all DB-owned search state before publishing the result.
+				self.reset();
+				done(std::move(result));
+			}
+
+			void StartTableRead(const FileMetaData* file, std::unique_ptr<SearchState> self)
+			{
+				db->table_cache_->GetAsyncCallback(*runtime,
+				    options,
+				    file->number,
+				    file->file_size,
+				    internal_key,
+				    &table_state,
+				    &SaveValue,
+				    [self = std::move(self)](Status table_status) mutable {
+					    if (!table_status.ok())
+					    {
+						    Complete(std::move(self), std::unexpected(table_status));
+						    return;
+					    }
+					    if (self->table_state.value_found)
+					    {
+						    Result<std::string> result(std::move(self->value));
+						    Complete(std::move(self), std::move(result));
+						    return;
+					    }
+					    self->Continue(std::move(self));
+				    });
+			}
+
+			void Continue(std::unique_ptr<SearchState> self)
+			{
+				while (level < kNumLevels)
+				{
+					const auto& files = sv->current->files(level);
+					if (level == 0)
+					{
+						while (file_index < files.size())
+						{
+							const FileMetaData* file = files[file_index++];
+							if (!KeyInFileRange(file))
+							{
+								continue;
+							}
+							StartTableRead(file, std::move(self));
+							return;
+						}
+						++level;
+						file_index = 0;
+						continue;
+					}
+
+					if (!files.empty())
+					{
+						const int index = FindFile(db->internal_comparator_, files, Slice(internal_key));
+						if (index < static_cast<int>(files.size()))
+						{
+							const FileMetaData* file = files[static_cast<std::size_t>(index)];
+							if (KeyInFileRange(file))
+							{
+								++level;
+								file_index = 0;
+								StartTableRead(file, std::move(self));
+								return;
+							}
+						}
+					}
+					++level;
+					file_index = 0;
+				}
+				Complete(std::move(self), std::unexpected(Status::NotFound(Slice())));
+			}
+		};
+
+		auto state = std::make_unique<SearchState>();
+		state->db = this;
+		state->runtime = &runtime;
+		state->sv = sv;
+		state->options = std::move(read_options);
+		state->user_key = std::move(key);
+		state->internal_key = lkey.internal_key().ToString();
+		state->table_state.user_comparator = internal_comparator_.user_comparator();
+		state->table_state.user_key = Slice(state->user_key);
+		state->table_state.value = &state->value;
+		state->completion = std::move(completion);
+		state->read_guard = std::move(read_guard);
+		SearchState* state_ptr = state.get();
+		state_ptr->Continue(std::move(state));
+	}
+
 	Status DBImpl::Write(const WriteOptions& write_options, WriteBatch batch)
 	{
-		std::unique_lock<std::shared_mutex> lock(mutex_);
+		return write_coordinator_->SubmitSync(write_options, std::move(batch));
+	}
 
-		std::size_t count = WriteBatchInternal::Count(&batch);
-		if (!count)
+	AsyncWriteOp DBImpl::WriteAsync(const WriteOptions& write_options, WriteBatch batch)
+	{
+		return write_coordinator_->SubmitAsync(write_options, std::move(batch));
+	}
+
+	AsyncWriteOp DBImpl::WriteAsync(
+	    const WriteOptions& write_options, WriteBatch batch, void* keep_alive, void (*release_keep_alive)(void*))
+	{
+		return AsyncWriteOp(*write_coordinator_, keep_alive, release_keep_alive, write_options, std::move(batch));
+	}
+
+	Status DBImpl::PlanWriteGroupForCoordinator(std::span<WriteRequestState* const> requests, WriteBatch* merged, WritePlan* plan)
+	{
+		std::size_t total_count = 0;
+		for (WriteRequestState* request : requests)
+		{
+			total_count += WriteBatchInternal::Count(&request->batch);
+		}
+		if (total_count == 0)
 		{
 			return Status::OK();
 		}
 
-		Status s = MakeRoomForWrite(false, lock);
-		if (!s.ok())
 		{
-			return s;
+			std::unique_lock<std::shared_mutex> lock(mutex_);
+#ifdef PRISM_RUNTIME_METRICS
+			const auto mutex_start = std::chrono::steady_clock::now();
+#endif
+
+			Status s = MakeRoomForWrite(false, lock);
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().write_plan_mutex_total_us.fetch_add(ElapsedUs(mutex_start), std::memory_order_relaxed);
+			RuntimeMetrics::Instance().write_plan_mutex_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+			if (!s.ok())
+			{
+				return s;
+			}
+			if (log_file_guard_ == nullptr || log_file_guard_->writer() == nullptr || log_file_guard_->file() == nullptr)
+			{
+				return Status::InvalidArgument("log file not open");
+			}
+
+			SequenceNumber next_sequence = sequence_;
+			for (WriteRequestState* request : requests)
+			{
+				const std::size_t count = WriteBatchInternal::Count(&request->batch);
+				if (count == 0)
+				{
+					continue;
+				}
+				WriteBatchInternal::SetSequence(&request->batch, next_sequence);
+				next_sequence += count;
+				merged->Append(request->batch);
+			}
+
+			WriteBatchInternal::SetSequence(merged, sequence_);
+			sequence_ += total_count;
+			versions_->SetLastSequence(sequence_ - 1);
+			plan->visible_sequence = sequence_ - 1;
+			plan->sync = requests.front()->options.sync;
+
+			plan->writer = log_file_guard_->writer();
+			plan->file = log_file_guard_->file();
+			plan->CaptureCommitTarget(mem_);
 		}
-		if (log_file_guard_ == nullptr || log_file_guard_->writer() == nullptr || log_file_guard_->file() == nullptr)
+		return Status::OK();
+	}
+
+	void DBImpl::StartWritePlanForCoordinator(const WritePlan& plan, WriteBatch merged, std::function<void(Status)> completion)
+	{
+		if (plan.writer == nullptr || plan.file == nullptr || async_wal_writer_ == nullptr)
 		{
-			return Status::InvalidArgument("log file not open");
+			completion(Status::InvalidArgument("log file not open"));
+			return;
 		}
 
-		WriteBatchInternal::SetSequence(&batch, sequence_);
-		sequence_ += count;
-		versions_->SetLastSequence(sequence_ - 1);
+		Slice record = WriteBatchInternal::Contents(&merged);
+		async_wal_writer_->Write(*plan.file, *plan.writer, record, plan.sync, std::move(completion));
+	}
 
-		Slice record = WriteBatchInternal::Contents(&batch);
-		s = log_file_guard_->writer()->AddRecord(record);
-		if (s.ok() && write_options.sync)
+	void DBImpl::RecordWriteFailureForCoordinator(const Status& status)
+	{
+		std::unique_lock<std::shared_mutex> lock(mutex_);
+		RecordBackgroundError(status);
+	}
+
+	Status DBImpl::CommitWriteGroupForCoordinator(std::span<WriteRequestState* const> requests, const WritePlan& plan)
+	{
+#ifdef PRISM_RUNTIME_METRICS
+		const auto commit_start = std::chrono::steady_clock::now();
+#endif
+		Status apply_status = Status::OK();
 		{
-			s = log_file_guard_->file()->Sync();
-		}
-		if (!s.ok())
-		{
-			return s;
+#ifdef PRISM_RUNTIME_METRICS
+			const auto apply_start = std::chrono::steady_clock::now();
+#endif
+			for (WriteRequestState* request : requests)
+			{
+				if (WriteBatchInternal::Count(&request->batch) == 0)
+				{
+					request->status = Status::OK();
+					continue;
+				}
+
+				Status s = ApplyBatch(request->batch, plan.commit_target);
+				request->status = s;
+				if (!s.ok())
+				{
+					apply_status = std::move(s);
+					break;
+				}
+			}
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().write_apply_total_us.fetch_add(ElapsedUs(apply_start), std::memory_order_relaxed);
+			RuntimeMetrics::Instance().write_apply_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 		}
 
-		s = ApplyBatch(batch);
-		if (!s.ok())
+		if (!apply_status.ok())
 		{
-			return s;
+			std::unique_lock<std::shared_mutex> lock(mutex_);
+			RecordBackgroundError(apply_status);
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().write_commit_total_us.fetch_add(ElapsedUs(commit_start), std::memory_order_relaxed);
+			RuntimeMetrics::Instance().write_commit_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+			return apply_status;
 		}
-		visible_sequence_.store(sequence_ - 1, std::memory_order_release);
+
+		{
+#ifdef PRISM_RUNTIME_METRICS
+			const auto mutex_start = std::chrono::steady_clock::now();
+#endif
+			std::unique_lock<std::shared_mutex> lock(mutex_);
+			visible_sequence_.store(plan.visible_sequence, std::memory_order_release);
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().write_publish_mutex_total_us.fetch_add(ElapsedUs(mutex_start), std::memory_order_relaxed);
+			RuntimeMetrics::Instance().write_publish_mutex_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+		}
+#ifdef PRISM_RUNTIME_METRICS
+		RuntimeMetrics::Instance().write_commit_total_us.fetch_add(ElapsedUs(commit_start), std::memory_order_relaxed);
+		RuntimeMetrics::Instance().write_commit_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 		return Status::OK();
 	}
 
 	std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& read_options)
 	{
-		SuperVersion* sv = super_version_.load(std::memory_order_acquire);
+		auto read_guard = AcquirePointRead();
+		SuperVersion* sv = read_guard.view;
 		if (sv == nullptr)
 		{
 			return std::unique_ptr<Iterator>(NewErrorIterator(Status::Corruption("database not initialized")));

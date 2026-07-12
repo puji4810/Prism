@@ -1,7 +1,9 @@
 #include "db.h"
 #include "db_impl.h"
+#include "cache.h"
 #include "write_batch.h"
 #include "env.h"
+#include "runtime_metrics.h"
 
 #include <gtest/gtest.h>
 #include <atomic>
@@ -31,6 +33,29 @@ namespace
 		}
 		return condition();
 	}
+
+	class DestructionTrackingCache final: public Cache
+	{
+	public:
+		explicit DestructionTrackingCache(int* destruction_count)
+		    : destruction_count_(destruction_count)
+		{
+		}
+
+		~DestructionTrackingCache() override { ++*destruction_count_; }
+
+		Handle* Insert(const Slice&, void*, size_t, void (*)(const Slice&, void*)) override { return nullptr; }
+		Handle* Lookup(const Slice&) override { return nullptr; }
+		void Release(Handle*) override {}
+		void* Value(Handle*) override { return nullptr; }
+		void Erase(const Slice&) override {}
+		uint64_t NewId() override { return ++last_id_; }
+		size_t TotalCharge() const override { return 0; }
+
+	private:
+		int* destruction_count_;
+		uint64_t last_id_ = 0;
+	};
 }
 
 // ===========================================================================
@@ -95,6 +120,24 @@ TEST_F(DBTest, BasicPutGetDelete)
 	EXPECT_TRUE(s4.error().IsNotFound()) << "Get should return NotFound after delete";
 }
 
+#ifdef PRISM_RUNTIME_METRICS
+TEST_F(DBTest, WritePathStageMetricsAreRecorded)
+{
+	RuntimeMetrics::Instance().Reset();
+
+	auto res = Database::Open("test_db");
+	ASSERT_TRUE(res.has_value());
+
+	auto db = std::move(res.value());
+	ASSERT_TRUE(db.Put("metrics_key", "metrics_value").ok());
+
+	EXPECT_GE(RuntimeMetrics::Instance().write_plan_mutex_count.load(std::memory_order_relaxed), 1u);
+	EXPECT_GE(RuntimeMetrics::Instance().write_apply_count.load(std::memory_order_relaxed), 1u);
+	EXPECT_GE(RuntimeMetrics::Instance().write_publish_mutex_count.load(std::memory_order_relaxed), 1u);
+	EXPECT_GE(RuntimeMetrics::Instance().write_commit_count.load(std::memory_order_relaxed), 1u);
+}
+#endif
+
 TEST_F(DBTest, DatabaseHandleBasicPutGetDelete)
 {
 	auto res = Database::Open("test_db");
@@ -131,6 +174,43 @@ TEST_F(DBTest, DatabaseHandleOpenBaseline)
 	auto get_result = db.Get("engine_baseline_key");
 	ASSERT_TRUE(get_result.has_value()) << get_result.error().ToString();
 	EXPECT_EQ(get_result.value(), "engine_baseline_value");
+}
+
+TEST_F(DBTest, DefaultOptionsCreateInternalBlockCache)
+{
+	Options options;
+	options.create_if_missing = true;
+	ASSERT_EQ(options.block_cache, nullptr);
+
+	auto result = DBImpl::OpenInternal(options, "test_db");
+	ASSERT_TRUE(result.has_value()) << result.error().ToString();
+	DBImpl* impl = result.value().get();
+
+	EXPECT_NE(impl->TEST_Options().block_cache, nullptr);
+	EXPECT_EQ(options.block_cache, nullptr);
+}
+
+TEST_F(DBTest, ExternalBlockCacheRemainsCallerOwned)
+{
+	int destruction_count = 0;
+	auto* cache = new DestructionTrackingCache(&destruction_count);
+
+	Options options;
+	options.create_if_missing = true;
+	options.block_cache = cache;
+	{
+		auto result = DBImpl::OpenInternal(options, "test_db");
+		ASSERT_TRUE(result.has_value()) << result.error().ToString();
+		EXPECT_EQ(result.value()->TEST_Options().block_cache, cache);
+	}
+
+	const int destructions_before_caller_cleanup = destruction_count;
+	EXPECT_EQ(destructions_before_caller_cleanup, 0);
+	if (destructions_before_caller_cleanup == 0)
+	{
+		delete cache;
+	}
+	EXPECT_EQ(destruction_count, 1);
 }
 
 TEST_F(DBTest, BatchWrite)

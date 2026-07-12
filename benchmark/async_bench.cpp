@@ -313,7 +313,7 @@ namespace prism::bench
 			return base + (static_cast<std::size_t>(slot_id) < remainder ? 1 : 0);
 		}
 
-		std::vector<double> RunRandomReadBenchmarkConcurrent(ThreadPoolScheduler& scheduler,
+		std::vector<double> RunRandomReadBenchmarkConcurrent(CpuThreadPool& scheduler,
 		    const std::vector<AsyncRandomAccessFile>& files, const std::vector<ReadRequest>& requests, int inflight)
 		{
 			StartGate gate;
@@ -421,10 +421,10 @@ int main(int argc, char** argv)
 		CreateDataset(env, file_paths);
 		const auto requests = BuildWorkload(cfg.ops);
 
-		ThreadPoolScheduler scheduler(kWorkerCount);
-		(void)AcquireRuntimeBundle(scheduler);
+		CpuThreadPool scheduler(kWorkerCount);
+		AsyncRuntime runtime(scheduler);
 
-		AsyncEnv async_env(scheduler, env);
+		AsyncEnv async_env(runtime, env);
 		const auto files = OpenAsyncFiles(async_env, file_paths);
 
 		const auto start = Clock::now();

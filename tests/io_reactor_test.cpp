@@ -204,9 +204,9 @@ TEST(IoReactorTest, AsyncRandomAccessFileUsesReactorBackend)
 		GTEST_SKIP() << "io_uring unavailable on this runtime";
 	}
 
-	ThreadPoolScheduler scheduler(4);
-	auto runtime = AcquireRuntimeBundle(scheduler);
-	ASSERT_TRUE(runtime->io_dispatcher.HasReactor());
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+	ASSERT_TRUE(runtime.Io().HasReactor());
 	RuntimeMetrics::Instance().Reset();
 
 	Env* env = Env::Default();
@@ -225,7 +225,7 @@ TEST(IoReactorTest, AsyncRandomAccessFileUsesReactorBackend)
 
 	auto file_result = env->NewRandomAccessFile(file_path.string());
 	ASSERT_TRUE(file_result.has_value()) << file_result.error().ToString();
-	AsyncRandomAccessFile async_file(scheduler, std::shared_ptr<RandomAccessFile>(std::move(file_result.value())));
+	AsyncRandomAccessFile async_file(runtime, std::shared_ptr<RandomAccessFile>(std::move(file_result.value())));
 
 	auto task = [&]() -> Task<std::string> {
 		auto read_result = co_await async_file.ReadAtStringAsync(0, contents.size());
@@ -247,9 +247,9 @@ TEST(IoReactorTest, AsyncWritableFileUsesReactorBackend)
 		GTEST_SKIP() << "io_uring unavailable on this runtime";
 	}
 
-	ThreadPoolScheduler scheduler(4);
-	auto runtime = AcquireRuntimeBundle(scheduler);
-	ASSERT_TRUE(runtime->io_dispatcher.HasReactor());
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+	ASSERT_TRUE(runtime.Io().HasReactor());
 	RuntimeMetrics::Instance().Reset();
 
 	Env* env = Env::Default();
@@ -264,7 +264,7 @@ TEST(IoReactorTest, AsyncWritableFileUsesReactorBackend)
 
 	auto file_result = env->NewWritableFile(file_path.string());
 	ASSERT_TRUE(file_result.has_value()) << file_result.error().ToString();
-	auto async_file = std::make_shared<AsyncWritableFile>(scheduler, std::move(file_result.value()));
+	auto async_file = std::make_shared<AsyncWritableFile>(runtime, std::move(file_result.value()));
 
 	auto task = [](std::shared_ptr<AsyncWritableFile> async_file, std::string first, std::string second) -> Task<Status> {
 		auto s = co_await async_file->AppendAsync(first);

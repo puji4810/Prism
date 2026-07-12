@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -265,6 +266,17 @@ namespace prism
 				std::memcpy(dst.data(), result.data(), result.size());
 			}
 			return result.size();
+		}
+
+		// Return a stable read-only view when the backend can expose one without
+		// issuing a read syscall. A successful nullopt means no view is available.
+		// A returned Slice contains exactly n bytes and remains valid until this file is destroyed. Accessing a
+		// memory-mapped view may still fault and block the calling thread.
+		virtual Result<std::optional<Slice>> TryReadView(uint64_t offset, size_t n) const
+		{
+			(void)offset;
+			(void)n;
+			return std::nullopt;
 		}
 
 		// Return a permanently usable file descriptor for direct OS-backed reads when

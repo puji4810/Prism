@@ -42,7 +42,7 @@ static bool PollUntil(Pred pred, std::chrono::milliseconds timeout = 5000ms)
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, SelfSubmitRunsOnOwnWorker)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 
 	std::atomic<bool> done{ false };
 	std::thread::id outer_tid;
@@ -72,7 +72,7 @@ TEST(SchedulerInvariantTest, SelfSubmitRunsOnOwnWorker)
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, SubmitInPinnedTaskStaysOnWorker)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 
 	std::atomic<int> done_count{ 0 };
 	std::thread::id outer_tid;
@@ -119,7 +119,7 @@ TEST(SchedulerInvariantTest, SubmitInPinnedTaskStaysOnWorker)
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, NoLostWakeupsAcrossFallbackPaths)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 
 	auto submit_counter = std::make_shared<std::atomic<int>>(0);
 	auto affinity_counter = std::make_shared<std::atomic<int>>(0);
@@ -165,7 +165,7 @@ TEST(SchedulerInvariantTest, NoLostWakeupsAcrossFallbackPaths)
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, ZeroWakeupEmptySchedulerMainSubmit)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 
 	std::atomic<bool> done{ false };
 
@@ -187,14 +187,14 @@ TEST(SchedulerInvariantTest, ZeroWakeupEmptySchedulerMainSubmit)
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, PriorityTasksAllCompleteNoStarvation)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 500;
 
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 10));
+		scheduler.SubmitWithPriority([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 10));
 	}
 
 	ASSERT_TRUE(PollUntil([&] { return counter->load(std::memory_order_acquire) == kNumTasks; }, 10s))
@@ -211,7 +211,7 @@ TEST(SchedulerInvariantTest, PriorityTasksAllCompleteNoStarvation)
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, SamePriorityTasksAllComplete)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 
 	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kNumTasks = 1000;
@@ -219,7 +219,7 @@ TEST(SchedulerInvariantTest, SamePriorityTasksAllComplete)
 
 	for (int i = 0; i < kNumTasks; ++i)
 	{
-		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kPriority);
+		scheduler.SubmitWithPriority([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kPriority);
 	}
 
 	ASSERT_TRUE(PollUntil([&] { return counter->load(std::memory_order_acquire) == kNumTasks; }, 10s))
@@ -236,7 +236,7 @@ TEST(SchedulerInvariantTest, SamePriorityTasksAllComplete)
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, ConcurrentPrioritySubmissionPreservesProgress)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
 
 	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kThreads = 4;
@@ -248,7 +248,7 @@ TEST(SchedulerInvariantTest, ConcurrentPrioritySubmissionPreservesProgress)
 		threads.emplace_back([&scheduler, counter, t]() {
 			for (int i = 0; i < kPerThread; ++i)
 			{
-				scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>((i + t) % 10));
+				scheduler.SubmitWithPriority([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>((i + t) % 10));
 			}
 		});
 	}
@@ -271,7 +271,7 @@ TEST(SchedulerInvariantTest, ConcurrentPrioritySubmissionPreservesProgress)
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, HighPriorityTasksProgressUnderConcurrentLoad)
 {
-	ThreadPoolScheduler scheduler(2);
+	CpuThreadPool scheduler(2);
 
 	auto counter = std::make_shared<std::atomic<int>>(0);
 	constexpr int kHighPriority = 100;
@@ -282,11 +282,11 @@ TEST(SchedulerInvariantTest, HighPriorityTasksProgressUnderConcurrentLoad)
 	// Submit high-priority tasks first, then flood with low-priority.
 	for (int i = 0; i < kHighPriority; ++i)
 	{
-		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kHighPri);
+		scheduler.SubmitWithPriority([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kHighPri);
 	}
 	for (int i = 0; i < kLowPriority; ++i)
 	{
-		scheduler.Submit([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kLowPri);
+		scheduler.SubmitWithPriority([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, kLowPri);
 	}
 
 	const int expected = kHighPriority + kLowPriority;

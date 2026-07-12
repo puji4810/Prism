@@ -1,16 +1,18 @@
 # Coroutine and Async API Design
 
-This document describes Prism's structured concurrency runtime, coroutine integration, and execution model. Prism uses a lane-isolated executor architecture where async DB work is routed to dedicated blocking lanes, with foreground operations using the read lane and background maintenance using a separate compaction lane.
+This document describes Prism's structured concurrency runtime, coroutine integration, and execution model. Prism uses a lane-isolated executor architecture where synchronous DB work, blocking file I/O, CPU continuations, ordered file writes, and background maintenance use distinct execution resources.
 
 ## 1. Architectural Layers
 
 ```
 Layer 1: TaskScope — structured concurrency, stop propagation, join, quarantine
-Layer 2: RuntimeBundle — executor dispatch
-  |-- CPU Executor (ThreadPoolScheduler — general CPU dispatch)
-  |-- Read Executor (BlockingExecutor — foreground async DB/file work)
+Layer 2: AsyncRuntime — executor dispatch
+  |-- CPU Executor (CpuThreadPool — CPU continuations, timers, reactor read resumes)
+  |-- DB Read Executor (BlockingExecutor — synchronous DBImpl::Get calls from AsyncDB)
+  |-- DB Write Executor (SerialExecutor — WriteCoordinator drain)
+  |-- Blocking I/O Executor (BlockingExecutor — file factories, metadata, fallback file I/O)
   |-- Compaction Executor (BlockingExecutor — background compaction/flush)
-  |-- Serial Lane (SerialLane — FIFO ordered writable files)
+  |-- Serial Executor (SerialExecutor — FIFO ordered writable files)
 Layer 3: AsyncOp — awaitable bridge, suspend/resume handshake
 Layer 4: AsyncEnv / AsyncDB — public async API surface
 ```
@@ -26,12 +28,15 @@ graph TD
     end
     subgraph L3["Layer 3 — Awaitable Bridge"]
         AOp["AsyncOp<T>"]
+        AWOp["AsyncWriteOp"]
     end
-    subgraph L2["Layer 2 — Runtime Bundle"]
+    subgraph L2["Layer 2 — Async Runtime"]
         CPU["cpu_executor"]
-        READ["read_executor"]
+        DBR["db_read_executor"]
+        DBW["db_write_executor"]
+        READ["blocking_io_executor"]
         COMP["compaction_executor"]
-        SER["serial_lane"]
+        SER["serial_file_executor"]
     end
     subgraph L1["Layer 1 — Structured Concurrency"]
         SCOPE["TaskScope"]
@@ -40,36 +45,39 @@ graph TD
     end
 
     ADB --> AOp
+    ADB --> AWOp
     AEnv --> AOp
     AF --> AOp
+    AOp --> DBR
     AOp --> READ
     AOp --> COMP
     AOp --> SER
+    AWOp --> DBW
     SCOPE --> STOP
     STOP --> AOp
     STOP --> Q
 ```
 
-### 1.2 AsyncOp: Lane-Based Suspend/Resume Handshake
+### 1.2 AsyncOp: Executor-Based Suspend/Resume Handshake
 
 ```mermaid
 sequenceDiagram
     participant UC as User Coroutine
     participant AOp as AsyncOp
-    participant READ as read_executor
+    participant EXEC as selected executor
 
     UC->>AOp: co_await
-    AOp->>READ: scheduler.Submit(work)
-    activate READ
-    READ->>READ: st->work()  (foreground async work)
-    READ-->>AOp: result ready
-    READ->>READ: CAS suspend/resume handshake
-    READ->>UC: handle.resume() inline
-    deactivate READ
+    AOp->>EXEC: executor.Submit(work)
+    activate EXEC
+    EXEC->>EXEC: st->work()
+    EXEC-->>AOp: result ready
+    EXEC->>EXEC: CAS suspend/resume handshake
+    EXEC->>UC: handle.resume() inline
+    deactivate EXEC
     UC->>UC: continue after co_await
 ```
 
-**Current rule**: `include/async_op.h` submits the work directly to the scheduler it was given. When that work completes, the worker runs the same three-state suspend/resume handshake inline and calls `handle.resume()` directly if the coroutine is already suspended. This keeps async DB work on the foreground CPU pool and file operations on the read lane without paying a second queue/mutex hop for every continuation. `AcquireRuntimeBundle()` protects shutdown by deferring `RuntimeBundle` deletion to a small cleanup thread if the last reference is released from a bundle-owned worker.
+**Current rule**: `include/async_op.h` submits work through the `ExecutorRef` it was given. When that work completes, the worker runs the same three-state suspend/resume handshake inline and calls `handle.resume()` directly if the coroutine is already suspended. Runtime lifetime is explicit: the caller-owned `AsyncRuntime` must outlive async handles and outstanding operations.
 
 ### 1.3 Executor Routing: Who Runs What
 
@@ -78,31 +86,41 @@ graph LR
     subgraph Work["Incoming Work"]
         COMPACTION["Compaction"]
         IO["File I/O<br/>(AsyncEnv)"]
-        DB["DB Put/Get<br/>(AsyncDB)"]
+        DBOPEN["DB Open<br/>(AsyncDB)"]
+        DBGET["DB Get<br/>(AsyncDB)"]
+        DBWRITE["DB Put/Delete/Write<br/>(AsyncDB)"]
         WRITE["Ordered File Write<br/>(AsyncWritableFile)"]
     end
 
     subgraph Execs["Executors"]
-        READ["read_executor (4 thr)"]
+        READ["blocking_io_executor (4 thr)"]
+        DBREAD["db_read_executor (4 thr)"]
+        DBWR["db_write_executor (1 thr)"]
         COMP["compaction_executor (1 thr)"]
         CPU["cpu_executor (N thr)"]
-        SER["serial_lane (1 thr)"]
+        SER["serial_file_executor (1 thr)"]
     end
 
     COMPACTION --> COMP
     IO --> READ
-    DB --> CPU
+    DBOPEN --> READ
+    DBGET --> DBREAD
+    DBWRITE --> DBWR
     WRITE --> SER
 
-    CPU -->|"inline AsyncOp resume"| CPU
+    DBREAD -->|"inline AsyncOp resume"| DBREAD
+    DBWR -->|"AsyncWriteOp resume"| DBWR
     READ -->|"inline AsyncOp resume"| READ
     SER -->|"inline AsyncOp resume"| SER
+    READ -->|"reactor read completion resume"| CPU
 ```
 
-- **cpu_executor**: `AsyncDB` foreground operations (Put/Get/Delete/Write) via `foreground_db_scheduler` — runs on shared `ThreadPoolScheduler` worker-local fast paths
-- **read_executor**: `AsyncEnv` blocking file I/O and filesystem metadata (ReadAtAsync, GetFileSizeAsync, etc.)
+- **cpu_executor**: CPU-bound continuations, delayed work, affinity APIs, and reactor read coroutine resumes
+- **db_read_executor**: `AsyncDB::GetAsync`, because synchronous `DBImpl::Get` can block on table/cache work
+- **db_write_executor**: per-DB `WriteCoordinator` drain for `PutAsync`, `DeleteAsync`, `WriteAsync`, and sync `Database::Write`
+- **blocking_io_executor**: `AsyncEnv` blocking file I/O and filesystem metadata (ReadAtAsync, GetFileSizeAsync, etc.)
 - **compaction_executor**: background compaction/flush work with single-flight control
-- **serial_lane**: FIFO-ordered `AsyncWritableFile` Append/Flush/Sync/Close
+- **serial_file_executor**: FIFO-ordered `AsyncWritableFile` Append/Flush/Sync/Close
 
 ### 1.4 Compaction: Structured Lifetime & Cancellation
 
@@ -138,36 +156,40 @@ stateDiagram-v2
 2. **Pre-commit**: stop before `LogAndApply()` (manifest install) → release inputs, wake writers
 3. **Post-commit**: outputs already on disk → install manifest edits (cleanup), but suppress follow-up scheduling
 
-## 2. Runtime Bundle and Execution Model
+## 2. Async Runtime and Execution Model
 
-The `RuntimeBundle` is the central runtime container, shared via `std::shared_ptr` across runtime components. It groups executors by their scheduling semantics:
+The `AsyncRuntime` is the central runtime container. Callers construct it explicitly from a `CpuThreadPool&`; async handles keep non-owning runtime pointers, so the runtime must outlive those handles and operations.
 
 
 | Executor            | Type                       | Threads         | Schedules                                                                    |
 | ------------------- | -------------------------- | --------------- | ---------------------------------------------------------------------------- |
-| `read_executor`     | `BlockingExecutor`         | 4               | `AsyncEnv` file I/O — blocking reads and filesystem metadata                 |
+| `cpu_executor`      | `CpuThreadPool`            | N (caller-owned) | CPU continuations, timers, affinity, reactor read resumes                    |
+| `db_read_executor`  | `BlockingExecutor`         | 4               | `AsyncDB::GetAsync` synchronous `DBImpl::Get` work                           |
+| `db_write_executor` | `SerialExecutor`           | 1               | Per-DB `WriteCoordinator` drain and grouped WAL commit control               |
+| `blocking_io_executor`     | `BlockingExecutor`         | 4               | `AsyncEnv` file I/O — blocking reads and filesystem metadata                 |
 | `compaction_executor` | `BlockingExecutor`       | 1               | Background compaction/flush single-flight work                               |
-| `cpu_executor`      | `ThreadPoolExecutor`       | N (shared pool) | `AsyncDB` foreground operations (Put/Get/Delete/Write), general CPU dispatch |
-| `serial_lane`       | `SerialLane`               | 1               | FIFO-ordered `AsyncWritableFile` Append/Flush/Sync/Close                     |
-| `foreground_db_scheduler` | `ExecutorSchedulerAdapter` | routing only    | `AsyncDB` entry point — submits to CPU pool; `AsyncOp` resumes inline        |
+| `serial_file_executor`       | `SerialExecutor`               | 1               | FIFO-ordered `AsyncWritableFile` Append/Flush/Sync/Close                     |
 
 ### Why Separate Lanes?
 
 Without separation, a long-running compaction would occupy the same execution lane as foreground reads. The split ensures:
 
-- **Foreground work never waits behind compaction** — reads use their own lane
+- **Foreground reads never wait behind compaction** — DB reads use their own lane
+- **DB writes are serialized deliberately** — `WriteCoordinator` owns grouped write ordering on a single write lane
 - **Compaction never blocks foreground progress** — compaction stays isolated on its own lane
 - **Single-flight compaction is enforced by `CompactionController`**, not by thread pool availability
 
-### The `foreground_db_scheduler` Router
+### DB Read and Write Lanes
 
-Every `AsyncDB` operation wraps work in an `AsyncOp` that receives the `foreground_db_scheduler`. At `await_suspend()`:
+`AsyncDB::GetAsync` wraps work in an `AsyncOp` that receives the `db_read_executor`. At `await_suspend()`:
 
-1. `AsyncOp` calls `foreground_db_scheduler.Submit(work)`
-2. The adapter forwards to the shared CPU pool via `ThreadPoolScheduler` worker-local fast paths
+1. `AsyncOp` calls `db_read_executor.Submit(work)`
+2. The dedicated DB read executor runs the synchronous `DBImpl::Get` operation
 3. The completing worker runs the CAS handshake inline and calls `st->handle.resume()` directly
 
-This keeps `AsyncDB` hot-path operations on the lightweight CPU pool while avoiding a second queue hop. `AsyncEnv` file I/O operations use a separate `read_scheduler` routed to `read_executor` (4 threads), and ordered writable-file operations use `serial_scheduler` routed to `SerialLane` (1 thread). If coroutine teardown releases the final `RuntimeBundle` reference on a bundle-owned worker, `AcquireRuntimeBundle()` defers actual destruction to an external cleanup thread, preventing any executor from self-joining.
+`AsyncDB::{PutAsync,DeleteAsync,WriteAsync}` return `AsyncWriteOp` instead of generic `AsyncOp<Status>`. Awaiting an `AsyncWriteOp` enqueues a request into `DBImpl::WriteCoordinator`; the coordinator drains on `db_write_executor`, groups contiguous same-sync requests, writes one merged WAL record, and publishes visibility in order.
+
+This keeps synchronous DB reads and coordinated DB writes off the CPU continuation pool. `AsyncEnv` file I/O operations use `blocking_io_executor` (4 threads), and ordered writable-file operations use `serial_file_executor` (1 thread).
 
 ## 3. Core Abstraction: `AsyncOp<T>`
 
@@ -178,7 +200,7 @@ The `AsyncOp<T>` class is the heart of Prism's async design. It is a C++20 await
 Unlike many async frameworks, Prism does not force a specific `Task` type on the user. Instead, Prism functions return `AsyncOp<T>`, which can be `co_await`ed in any coroutine that supports the standard C++20 coroutine protocol. This approach has two major benefits:
 
 1. **Zero-Frame Overhead**: `AsyncOp` is not a coroutine function itself (it contains no `co_await` or `co_return`), so it does not create a coroutine frame when called. A frame is only created if the user decides to `co_await` it.
-2. **Flexibility**: Users can integrate Prism into their existing cororuntimeutine systems (e.g., `asio::awaitable`, `boost::cobalt`, or custom task types).
+2. **Flexibility**: Users can integrate Prism into their existing coroutine systems (e.g., `asio::awaitable`, `boost::cobalt`, or custom task types).
 
 ### The Suspend/Resume Handshake
 
@@ -212,7 +234,7 @@ Prism provides two solutions in `AsyncRandomAccessFile`:
 
 ### FIFO Serialization in `AsyncWritableFile`
 
-Database writes (appends to logs or SSTables) must be strictly ordered. `AsyncWritableFile` serializes operations through the `SerialLane` executor in `RuntimeBundle`, which provides FIFO-ordered execution on a single dedicated thread. This replaces the earlier ticket/CV scheme, eliminating per-operation worker thread blocking.
+Database writes (appends to logs or SSTables) must be strictly ordered. `AsyncWritableFile` serializes operations through the `SerialExecutor` executor in `AsyncRuntime`, which provides FIFO-ordered execution on a single dedicated thread. This replaces the earlier ticket/CV scheme, eliminating per-operation worker thread blocking.
 
 ## 5. Async Database (`AsyncDB`)
 
@@ -220,14 +242,14 @@ Database writes (appends to logs or SSTables) must be strictly ordered. `AsyncWr
 
 ### Lifecycle and Usage
 
-- **Opening**: Use `AsyncDB::OpenAsync(scheduler, options, dbname)` which returns an `AsyncOp<Result<AsyncDB>>`.
+- **Opening**: Use `AsyncDB::OpenAsync(runtime, options, dbname)` which returns an `AsyncOp<Result<AsyncDB>>`.
 - **Snapshots**: Call `db.CaptureSnapshot()` to obtain a synchronous RAII `Snapshot` handle declared in `include/snapshot.h`. This handle is cheap to copy and can be passed into `ReadOptions` for async reads.
 - **Operations**: `GetAsync`, `PutAsync`, `DeleteAsync`, and `WriteAsync` are the primary entry points.
 
 ### Implementation (Offload Model)
 
-- **Runtime dispatch**: Every `AsyncDB` call is packaged into a lambda and submitted through the `foreground_db_scheduler`, which routes to the shared CPU pool via `ThreadPoolScheduler` worker-local fast paths. `AsyncEnv` file I/O operations route through `read_scheduler` → `read_executor` (4 threads). Order-sensitive writable-file operations route through `serial_scheduler` → `serial_lane` (1 thread).
-- **Simplicity**: This allows for a clean async API without requiring a massive refactor of the core `DBImpl` engine.
+- **Runtime dispatch**: `OpenAsync` routes to `blocking_io_executor`; `GetAsync` routes to `db_read_executor`; write methods return `AsyncWriteOp` and enqueue into `WriteCoordinator`. `AsyncEnv` file factory, metadata, and blocking fallback operations route to `blocking_io_executor`. Order-sensitive writable-file operations route to `serial_file_executor`.
+- **Structured writes**: The write path is no longer "run one synchronous write lambda on an executor"; it is queueing, grouping, WAL append/sync, and visibility publication under coordinator control.
 - **Snapshot Safety**: Since SSTables are immutable and MemTables use sequence-number-based MVCC, a `Snapshot` obtained from the sync engine is safe to use across execution boundaries.
 
 ## 6. Migration Guide
@@ -266,7 +288,10 @@ auto value = db.Get(read_options, "k");
 ### After (async)
 
 ```cpp
-auto db_result = co_await prism::AsyncDB::OpenAsync(scheduler, options, name);
+prism::CpuThreadPool cpu_pool(8);
+prism::AsyncRuntime runtime(cpu_pool);
+
+auto db_result = co_await prism::AsyncDB::OpenAsync(runtime, options, name);
 if (!db_result.has_value()) {
     co_return db_result.error();
 }
@@ -283,11 +308,11 @@ auto value = co_await db.GetAsync(read_options, "k");
 
 ### Completed
 
-1. **Lane-isolated runtime model** — `read_executor` + `compaction_executor` + `serial_lane`, with async DB work routed through the read lane (Wave 1-2)
+1. **Lane-isolated runtime model** — `db_read_executor` + `db_write_executor` + `blocking_io_executor` + `compaction_executor` + `serial_file_executor`, with CPU continuations kept separate from blocking work
 2. **CompactionController** — DB-owned single-flight compaction lane backed by `BlockingExecutor`
 3. **TaskScope and structured concurrency** — `StopSource` / `StopToken` (chainable), `Quarantine`, `OperationState<T>` for structured task lifecycle
 4. **`Env::Schedule()` / `StartThread()` migration** — DB core no longer uses them; retained as POSIX-background facility in PosixEnv
-5. **SerialLane migration** — `AsyncWritableFile` now uses `SerialLane` executor for FIFO-ordered file writes
+5. **SerialExecutor migration** — `AsyncWritableFile` now uses `SerialExecutor` executor for FIFO-ordered file writes
 6. **Internal cancellation** — `StopSource` propagation through `TaskScope` quarantine and `CompactionController` stop tokens
 7. **Backend selection and metrics** — `BackendSelect()` unifies routing; `RuntimeMetrics` provides executor-level counters
 8. **io_uring backend** — future work outside the VTune remediation scope; current async reads use executor-lane offload

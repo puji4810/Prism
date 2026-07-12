@@ -185,7 +185,7 @@ Reads:   App → MemTable → Imm → L0 → L1 → ... → L6
    - `Database` (sync) and `AsyncDB` (coroutine) are the public entry points
    - `DBImpl` is the internal engine — see `include/db_impl.h`
    - `Snapshot` is a cheap-copy RAII handle for point-in-time reads
-   - The `RuntimeBundle` manages lane-isolated executors for async I/O
+   - The `AsyncRuntime` manages lane-isolated executors for async I/O
    - Compaction is snapshot-aware and runs on a dedicated background lane
 3. See `docs/architecture.md` for the full system design.
 

@@ -17,7 +17,7 @@ namespace prism
 {
 	class Database;
 	class AsyncDB;
-	class ThreadPoolScheduler;
+	class CpuThreadPool;
 	struct ReadOptions;
 	struct WriteOptions;
 }
@@ -51,7 +51,7 @@ namespace prism::bench
 
 		Awaiter operator co_await() noexcept;
 
-		void Open(ThreadPoolScheduler& scheduler);
+		void Open(CpuThreadPool& scheduler);
 
 		std::mutex mutex;
 		std::vector<std::coroutine_handle<>> waiters;
@@ -122,6 +122,7 @@ namespace prism::bench
 		bool profile_pause_prefill = false; // pause VTune/ITT during prefill
 		std::string db_dir = "";
 		bool keep_db = false;
+		bool round_isolation = false; // use a fresh DB directory for each measured round
 		int max_client_inflight = 0; // populated by runners
 	};
 
@@ -182,15 +183,15 @@ namespace prism::bench
 	    std::atomic<std::size_t>& client_inflight, std::atomic<std::size_t>& client_max_inflight);
 
 	// Async benchmark runners
-	Stats RunAsyncMixed(AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
+	Stats RunAsyncMixed(AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
 	Stats RunAsyncDiskRead(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
+	    AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
 	Stats RunAsyncSstReadPipeline(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
+	    AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
 	Stats RunAsyncDurabilityWrite(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
+	    AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
 	Stats RunAsyncCompactionOverlap(
-	    AsyncDB& db, ThreadPoolScheduler& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
+	    AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys);
 
 	// Output formatting
 	void PrintLine(std::string_view name, const Config& cfg, int round, const Stats& stats, std::size_t max_inflight = 0);

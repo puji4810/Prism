@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <sys/types.h>
 
@@ -63,7 +64,7 @@ namespace prism
 		size_t charge;
 		size_t key_length;
 		bool in_cache;
-		uint32_t refs;
+		std::atomic<uint32_t> refs{ 0 };
 		uint32_t hash;
 		char key_data[1];
 
@@ -222,7 +223,7 @@ namespace prism
 			LRUHandle* next = e->next;
 			assert(e->in_cache);
 			e->in_cache = false;
-			assert(e->refs == 1); // Invariant of lru_ list.
+			assert(e->refs.load(std::memory_order_relaxed) == 1); // Invariant of lru_ list.
 			Unref(e);
 			e = next;
 		}
@@ -230,25 +231,27 @@ namespace prism
 
 	void LRUCache::Ref(LRUHandle* e)
 	{
-		if (e->refs == 1 && e->in_cache)
+		const uint32_t previous_refs = e->refs.fetch_add(1, std::memory_order_relaxed);
+		if (previous_refs == 1 && e->in_cache)
 		{ // If on lru_ list, move to in_use_ list.
 			LRU_Remove(e);
 			LRU_Append(&in_use_, e);
 		}
-		e->refs++;
 	}
 
 	void LRUCache::Unref(LRUHandle* e)
 	{
-		assert(e->refs > 0);
-		e->refs--;
-		if (e->refs == 0)
+		const uint32_t previous_refs = e->refs.fetch_sub(1, std::memory_order_acq_rel);
+		assert(previous_refs > 0);
+		const uint32_t refs = previous_refs - 1;
+		if (refs == 0)
 		{ // Deallocate.
 			assert(!e->in_cache);
 			(*e->deleter)(e->key(), e->value);
+			std::destroy_at(e);
 			free(e);
 		}
-		else if (e->in_cache && e->refs == 1)
+		else if (e->in_cache && refs == 1)
 		{
 			// No longer in use; move to lru_ list.
 			LRU_Remove(e);
@@ -284,24 +287,42 @@ namespace prism
 
 	void LRUCache::Release(Cache::Handle* handle)
 	{
+		LRUHandle* e = reinterpret_cast<LRUHandle*>(handle);
+		uint32_t refs = e->refs.load(std::memory_order_acquire);
+		while (refs > 2)
+		{
+			if (e->refs.compare_exchange_weak(refs, refs - 1, std::memory_order_acq_rel, std::memory_order_acquire))
+			{
+				return;
+			}
+		}
 		std::lock_guard<std::mutex> guard(mutex_);
-		Unref(reinterpret_cast<LRUHandle*>(handle));
+		Unref(e);
 	}
 
 	Cache::Handle* LRUCache::Insert(const Slice& key, uint32_t hash, void* value, size_t charge, LRUHandle::Deleter deleter)
 	{
 		std::lock_guard<std::mutex> guard(mutex_);
 
-		LRUHandle* e = reinterpret_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
-		*e = LRUHandle{
-			.value = value, .deleter = deleter, .charge = charge, .key_length = key.size(), .in_cache = false, .refs = 1, .hash = hash
-		};
+		const std::size_t allocation_size = sizeof(LRUHandle) + (key.size() > 1 ? key.size() - 1 : 0);
+		LRUHandle* e = reinterpret_cast<LRUHandle*>(malloc(allocation_size));
+		std::construct_at(e);
+		e->value = value;
+		e->deleter = deleter;
+		e->next_hash = nullptr;
+		e->next = nullptr;
+		e->prev = nullptr;
+		e->charge = charge;
+		e->key_length = key.size();
+		e->in_cache = false;
+		e->refs.store(1, std::memory_order_relaxed);
+		e->hash = hash;
 		std::memcpy(e->key_data, key.data(), key.size());
 
 		if (capacity_ > 0)
 		{
 			// push into the LRU
-			e->refs++;
+			e->refs.fetch_add(1, std::memory_order_relaxed);
 			e->in_cache = true;
 			LRU_Append(&in_use_, e);
 			usage_ += charge;
@@ -318,7 +339,7 @@ namespace prism
 		while (usage_ > capacity_ && lru_.next != &lru_)
 		{
 			LRUHandle* old = lru_.next;
-			assert(old->refs == 1); // every node in lru_ list should have refs == 1
+			assert(old->refs.load(std::memory_order_relaxed) == 1); // every node in lru_ list should have refs == 1
 			auto erased = FinishErase(table_.Remove(old->key(), old->hash));
 			if (!erased)
 			{
@@ -356,7 +377,7 @@ namespace prism
 		while (lru_.next != &lru_)
 		{
 			LRUHandle* e = lru_.next;
-			assert(e->refs == 1);
+			assert(e->refs.load(std::memory_order_relaxed) == 1);
 			bool erased = FinishErase(table_.Remove(e->key(), e->hash));
 			if (!erased)
 			{ // to avoid unused variable when compiled NDEBUG

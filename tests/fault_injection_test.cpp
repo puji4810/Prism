@@ -506,6 +506,39 @@ TEST_F(FaultInjectionTest, WalAppendFailurePropagatesCleanly)
 	EXPECT_FALSE(get2_result.has_value()) << "Expected key2 to not exist";
 }
 
+TEST_F(FaultInjectionTest, WalAppendFailureDoesNotPublishFailedSequence)
+{
+	Options options;
+	options.env = env_.get();
+	options.comparator = BytewiseComparator();
+	options.create_if_missing = true;
+
+	auto db_result = Database::Open(options, tmp_path_);
+	ASSERT_TRUE(db_result.has_value()) << db_result.error().ToString();
+	auto db = std::move(db_result.value());
+
+	ASSERT_TRUE(db.Put(WriteOptions(), "stable", "visible").ok());
+
+	env_->SetFailAppend(true);
+	Status failed = db.Put(WriteOptions(), "reserved_only", "hidden");
+	env_->SetFailAppend(false);
+
+	ASSERT_FALSE(failed.ok()) << "Expected injected WAL append failure";
+	EXPECT_TRUE(failed.IsIOError()) << failed.ToString();
+
+	auto hidden = db.Get(ReadOptions(), "reserved_only");
+	EXPECT_FALSE(hidden.has_value()) << "Failed WAL write must not become reader-visible";
+	EXPECT_TRUE(hidden.error().IsNotFound()) << hidden.error().ToString();
+
+	auto stable = db.Get(ReadOptions(), "stable");
+	ASSERT_TRUE(stable.has_value()) << stable.error().ToString();
+	EXPECT_EQ("visible", stable.value());
+
+	Status later = db.Put(WriteOptions(), "later", "rejected");
+	EXPECT_FALSE(later.ok()) << "Sticky write failure should reject later writes instead of extending a sequence gap";
+	EXPECT_TRUE(later.IsIOError()) << later.ToString();
+}
+
 // ── WAL Close failure surfaces but doesn't poison recovery. ───────────────────
 // Characterizes: When WAL close fails, the error is surfaced, and subsequent
 // recovery/open path remains deterministic per characterized behavior.

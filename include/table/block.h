@@ -27,6 +27,12 @@ namespace prism
 		size_t size() const { return size_; }
 
 		Iterator* NewIterator(const Comparator* comparator);
+		using SeekResultHandler = Status (*)(void*, const Slice& key, const Slice& value);
+		Status Seek(const Comparator* comparator,
+		    const Slice& target,
+		    void* arg,
+		    SeekResultHandler handler,
+		    bool* found) const;
 
 	private:
 		size_t size_;

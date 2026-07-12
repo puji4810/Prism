@@ -1,6 +1,7 @@
 #include "block.h"
 #include "coding.h"
 #include "comparator.h"
+#include "dbformat.h"
 #include "iterator.h"
 #include "status.h"
 #include <algorithm>
@@ -8,13 +9,45 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <sys/types.h>
+#include <utility>
 
 	namespace prism
 	{
 	namespace
 	{
-		constexpr std::size_t kInitialKeyBufferReserve = 128;
+		class KeyBuffer
+		{
+		public:
+			std::size_t size() const noexcept { return size_; }
+			char* data() noexcept { return data_; }
+			const char* data() const noexcept { return data_; }
+			Slice slice() const noexcept { return Slice(data_, size_); }
+			void clear() noexcept { size_ = 0; }
+
+			void resize(std::size_t size)
+			{
+				if (size > capacity_)
+				{
+					const std::size_t new_capacity = std::max(size, capacity_ * 2);
+					auto storage = std::make_unique<char[]>(new_capacity);
+					std::memcpy(storage.get(), data_, size_);
+					heap_storage_ = std::move(storage);
+					data_ = heap_storage_.get();
+					capacity_ = new_capacity;
+				}
+				size_ = size;
+			}
+
+		private:
+			static constexpr std::size_t kInlineCapacity = 32;
+			char inline_storage_[kInlineCapacity];
+			std::unique_ptr<char[]> heap_storage_;
+			char* data_{ inline_storage_ };
+			std::size_t size_{ 0 };
+			std::size_t capacity_{ kInlineCapacity };
+		};
 	}
 
 	inline uint32_t Block::NumRestarts() const
@@ -103,21 +136,30 @@
 	{
 	private:
 		const Comparator* const comparator_;
-		const bool is_bytewise_;
+		const ComparatorKind comparator_kind_;
+		const InternalKeyComparator* const internal_comparator_;
 		const char* const data_; // block contents
 		uint32_t const restarts_;
 		uint32_t const num_restarts_;
 
 		uint32_t current_; // The offset in data_ of current entry, >= restarts if !Valid, always points to the start of current entry
 		uint32_t restart_index_; // Index of restart array
-		std::string key_; // the entire Key value
+		KeyBuffer key_; // the entire Key value
 		Slice value_;
 		Status status_;
 
-		inline int Compare(const Slice& a, const Slice& b) const { return comparator_->Compare(a, b); }
-		inline int CompareMaybeBytewise(const Slice& a, const Slice& b) const
+		inline int CompareKey(const Slice& a, const Slice& b) const
 		{
-			return is_bytewise_ ? a.compare(b) : comparator_->Compare(a, b);
+			switch (comparator_kind_)
+			{
+			case ComparatorKind::kBytewise:
+				return a.compare(b);
+			case ComparatorKind::kInternalKeyBytewise:
+				return internal_comparator_->CompareEncoded(a, b);
+			case ComparatorKind::kGeneric:
+				return comparator_->Compare(a, b);
+			}
+			return comparator_->Compare(a, b);
 		}
 
 		int CompareDecodedKeyToTarget(uint32_t shared, const char* non_shared_data, uint32_t non_shared, const Slice& target) const
@@ -220,7 +262,7 @@
 			{
 				if (target_compare != nullptr)
 				{
-					if (is_bytewise_)
+					if (comparator_kind_ == ComparatorKind::kBytewise)
 					{
 						*target_compare = CompareDecodedKeyToTarget(shared, p, non_shared, *target);
 					}
@@ -228,9 +270,9 @@
 				key_.resize(shared + non_shared); // we have made sure that key.size >= shared
 				std::memcpy(key_.data() + shared, p, non_shared);
 				value_ = Slice(p + non_shared, value_length);
-				if (target_compare != nullptr && !is_bytewise_)
+				if (target_compare != nullptr && comparator_kind_ != ComparatorKind::kBytewise)
 				{
-					*target_compare = comparator_->Compare(key_, *target);
+					*target_compare = CompareKey(key_.slice(), *target);
 				}
 				while (restart_index_ + 1 < num_restarts_ && GetRestartPoint(restart_index_ + 1) < current_)
 				{
@@ -250,7 +292,10 @@
 	public:
 		Iter(const Comparator* comparator, const char* data, uint32_t restarts, uint32_t num_restarts)
 		    : comparator_(comparator)
-		    , is_bytewise_(comparator == BytewiseComparator())
+		    , comparator_kind_(comparator->Kind())
+		    , internal_comparator_(comparator_kind_ == ComparatorKind::kInternalKeyBytewise
+		              ? static_cast<const InternalKeyComparator*>(comparator)
+		              : nullptr)
 		    , data_(data)
 		    , restarts_(restarts)
 		    , num_restarts_(num_restarts)
@@ -258,7 +303,6 @@
 		    , restart_index_(num_restarts_)
 		{
 			assert(num_restarts > 0);
-			key_.reserve(kInitialKeyBufferReserve);
 		}
 
 		bool Valid() const override { return current_ < restarts_; } // valid in [0, restarts_)
@@ -268,7 +312,7 @@
 		Slice key() const override
 		{
 			assert(Valid());
-			return key_;
+			return key_.slice();
 		}
 
 		Slice value() const override
@@ -316,7 +360,7 @@
 
 			if (Valid())
 			{
-				current_key_compare = CompareMaybeBytewise(key_, target);
+				current_key_compare = CompareKey(key_.slice(), target);
 				if (current_key_compare < 0)
 				{
 					left = restart_index_;
@@ -346,7 +390,7 @@
 
 				Slice mid_key(key_ptr, non_shared);
 
-				if (CompareMaybeBytewise(mid_key, target) < 0) // the last one which lower than target
+				if (CompareKey(mid_key, target) < 0) // the last one which lower than target
 				{
 					left = mid;
 				}
@@ -408,5 +452,30 @@
 		{
 			return new Iter(comparator, data_, restart_offset_, num_restarts);
 		}
+	}
+
+	Status Block::Seek(
+	    const Comparator* comparator, const Slice& target, void* arg, SeekResultHandler handler, bool* found) const
+	{
+		if (size_ < sizeof(uint32_t))
+		{
+			*found = false;
+			return Status::Corruption("bad block contents");
+		}
+		const uint32_t num_restarts = NumRestarts();
+		if (num_restarts == 0)
+		{
+			*found = false;
+			return Status::OK();
+		}
+
+		Iter iter(comparator, data_, restart_offset_, num_restarts);
+		iter.Seek(target);
+		*found = iter.Valid();
+		if (!*found)
+		{
+			return iter.status();
+		}
+		return handler(arg, iter.key(), iter.value());
 	}
 }

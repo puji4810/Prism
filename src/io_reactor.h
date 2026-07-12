@@ -42,6 +42,7 @@ namespace prism
 		bool IsValid() const noexcept;
 		bool SubmitRead(int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data);
 		bool SubmitWrite(int fd, const void* buf, unsigned nbytes, off_t offset, uint64_t user_data);
+		bool SubmitFsync(int fd, uint64_t user_data);
 		int WaitCompletion(uint64_t* user_data, int* res);
 		bool IsFallback() const noexcept;
 
@@ -89,6 +90,7 @@ namespace prism
 			std::function<bool(int, void*, unsigned, off_t, uint64_t)> submit_read;
 			std::function<bool(int, const void*, unsigned, off_t, uint64_t)> submit_write;
 			std::function<bool(uint64_t)> submit_noop;
+			std::function<bool(int, uint64_t)> submit_fsync;
 			std::function<int(uint64_t*, int*)> wait_completion;
 		};
 
@@ -110,19 +112,21 @@ namespace prism
 		    unsigned nbytes,
 		    off_t offset,
 		    uint64_t user_data,
-		    std::function<void(uint64_t, int)> completion);
+		    std::move_only_function<void(uint64_t, int)> completion);
 		void SubmitWrite(int fd,
 		    const void* buf,
 		    unsigned nbytes,
 		    off_t offset,
 		    uint64_t user_data,
-		    std::function<void(uint64_t, int)> completion);
+		    std::move_only_function<void(uint64_t, int)> completion);
+		void SubmitFsync(int fd, uint64_t user_data, std::move_only_function<void(uint64_t, int)> completion);
 
 	private:
 		enum class Operation
 		{
 			kRead,
 			kWrite,
+			kFsync,
 		};
 
 		struct RequestState;
@@ -138,23 +142,25 @@ namespace prism
 		    unsigned nbytes,
 		    off_t offset,
 		    uint64_t user_data,
-		    std::function<void(uint64_t, int)> completion);
+		    std::move_only_function<void(uint64_t, int)> completion);
 		void SubmitBlockingWrite(int fd,
 		    const void* buf,
 		    unsigned nbytes,
 		    off_t offset,
 		    uint64_t user_data,
-		    std::function<void(uint64_t, int)> completion);
+		    std::move_only_function<void(uint64_t, int)> completion);
+		void SubmitBlockingFsync(int fd, uint64_t user_data, std::move_only_function<void(uint64_t, int)> completion);
 		void SubmitRequest(Operation operation,
 		    int fd,
 		    const void* buf,
 		    unsigned nbytes,
 		    off_t offset,
 		    uint64_t user_data,
-		    std::function<void(uint64_t, int)> completion);
+		    std::move_only_function<void(uint64_t, int)> completion);
 		bool ReactorIsValid() const noexcept;
 		bool ReactorSubmitRead(int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data);
 		bool ReactorSubmitWrite(int fd, const void* buf, unsigned nbytes, off_t offset, uint64_t user_data);
+		bool ReactorSubmitFsync(int fd, uint64_t user_data);
 		int ReactorWaitCompletion(uint64_t* user_data, int* res);
 		void PumpLoop();
 

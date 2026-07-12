@@ -1,4 +1,5 @@
 #include "table/merger.h"
+#include "dbformat.h"
 
 #include <cassert>
 
@@ -123,6 +124,10 @@ namespace prism
 			// semantics (handled by higher-level DB iterators).
 			MergingIterator(const Comparator* comparator, Iterator** children, int n)
 			    : comparator_(comparator)
+			    , comparator_kind_(comparator->Kind())
+			    , internal_comparator_(comparator_kind_ == ComparatorKind::kInternalKeyBytewise
+			              ? static_cast<const InternalKeyComparator*>(comparator)
+			              : nullptr)
 			    , children_(new IteratorWrapper[n])
 			    , n_(n)
 			    , current_(nullptr)
@@ -186,7 +191,7 @@ namespace prism
 							child->Seek(key());
 							// Seek() is >=. If it lands exactly on key(), advance once so we don't
 							// return the same key again after the direction switch.
-							if (child->Valid() && comparator_->Compare(key(), child->key()) == 0)
+							if (child->Valid() && CompareKeys(key(), child->key()) == 0)
 							{
 								child->Next();
 							}
@@ -267,6 +272,20 @@ namespace prism
 				kReverse
 			};
 
+			int CompareKeys(const Slice& a, const Slice& b) const
+			{
+				switch (comparator_kind_)
+				{
+				case ComparatorKind::kBytewise:
+					return a.compare(b);
+				case ComparatorKind::kInternalKeyBytewise:
+					return internal_comparator_->CompareEncoded(a, b);
+				case ComparatorKind::kGeneric:
+					return comparator_->Compare(a, b);
+				}
+				return comparator_->Compare(a, b);
+			}
+
 			void FindSmallest()
 			{
 				IteratorWrapper* smallest = nullptr;
@@ -279,7 +298,7 @@ namespace prism
 						{
 							smallest = child;
 						}
-						else if (comparator_->Compare(child->key(), smallest->key()) < 0)
+						else if (CompareKeys(child->key(), smallest->key()) < 0)
 						{
 							smallest = child;
 						}
@@ -300,7 +319,7 @@ namespace prism
 						{
 							largest = child;
 						}
-						else if (comparator_->Compare(child->key(), largest->key()) > 0)
+						else if (CompareKeys(child->key(), largest->key()) > 0)
 						{
 							largest = child;
 						}
@@ -310,6 +329,8 @@ namespace prism
 			}
 
 			const Comparator* comparator_;
+			ComparatorKind comparator_kind_;
+			const InternalKeyComparator* internal_comparator_;
 			IteratorWrapper* children_;
 			int n_;
 			IteratorWrapper* current_;

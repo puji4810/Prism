@@ -65,27 +65,73 @@ namespace prism::tests
 	// ===========================================================================
 	// Test 1: Read Lane Isolation Verification
 	//
-	// Confirms that read_executor and compaction_executor are distinct physical
+	// Confirms that db_read_executor, blocking_io_executor, db_write_executor,
+	// and compaction_executor are distinct physical
 	// lanes, while their scheduler adapters remain simple submit-only views.
 	// ===========================================================================
 	TEST(RuntimeLaneTest, ReadAndCompactionExecutorsAreSeparate)
 	{
-		ThreadPoolScheduler scheduler(2);
-		RuntimeBundle runtime(scheduler);
+		CpuThreadPool scheduler(2);
+		AsyncRuntime runtime(scheduler);
 
-		EXPECT_NE(&runtime.read_executor, &runtime.compaction_executor);
+		EXPECT_NE(&runtime.DbReadExecutor(), &runtime.BlockingIoExecutor());
+		EXPECT_NE(&runtime.DbReadExecutor(), &runtime.CompactionExecutor());
+		EXPECT_NE(&runtime.BlockingIoExecutor(), &runtime.CompactionExecutor());
 
 		{
 			std::binary_semaphore done(0);
-			runtime.read_scheduler.Submit([&done] { done.release(); });
+			runtime.DbReadExecutor().Submit([&done] { done.release(); });
 			EXPECT_TRUE(done.try_acquire_for(5s));
 		}
 
 		{
 			std::binary_semaphore done(0);
-			runtime.compaction_scheduler.Submit([&done] { done.release(); });
+			runtime.BlockingIoExecutor().Submit([&done] { done.release(); });
 			EXPECT_TRUE(done.try_acquire_for(5s));
 		}
+
+		{
+			std::binary_semaphore done(0);
+			runtime.CompactionExecutor().Submit([&done] { done.release(); });
+			EXPECT_TRUE(done.try_acquire_for(5s));
+		}
+
+		{
+			std::binary_semaphore done(0);
+			runtime.DbWriteExecutor().Submit([&] {
+				EXPECT_TRUE(runtime.DbWriteExecutor().IsCurrentWorker());
+				done.release();
+			});
+			EXPECT_TRUE(done.try_acquire_for(5s));
+		}
+	}
+
+	TEST(RuntimeLaneTest, DbReadReentrantWorkCanRunInline)
+	{
+		CpuThreadPool scheduler(1);
+		AsyncRuntimeOptions options;
+		options.db_read_threads = 1;
+		AsyncRuntime runtime(scheduler, options);
+
+		std::binary_semaphore done(0);
+		std::atomic<int> step{ 0 };
+		bool external_ran = false;
+		EXPECT_FALSE(runtime.DbReadExecutor().TryRunInline([&] { external_ran = true; }));
+		EXPECT_FALSE(external_ran);
+		runtime.DbReadExecutor().Submit([&] {
+			EXPECT_TRUE(runtime.DbReadExecutor().IsCurrentWorker());
+			step.store(1, std::memory_order_relaxed);
+			EXPECT_TRUE(runtime.DbReadExecutor().TryRunInline([&] {
+				EXPECT_TRUE(runtime.DbReadExecutor().IsCurrentWorker());
+				EXPECT_EQ(step.load(std::memory_order_relaxed), 1);
+				step.store(2, std::memory_order_relaxed);
+			}));
+			EXPECT_EQ(step.load(std::memory_order_relaxed), 2);
+			done.release();
+		});
+
+		ASSERT_TRUE(done.try_acquire_for(5s));
+		EXPECT_EQ(step.load(std::memory_order_relaxed), 2);
 	}
 
 	// ===========================================================================
@@ -97,14 +143,14 @@ namespace prism::tests
 	// ===========================================================================
 	TEST(RuntimeLaneTest, ForegroundProgressDuringBackgroundCompaction)
 	{
-		ThreadPoolScheduler scheduler(2);
-		RuntimeBundle runtime(scheduler);
+		CpuThreadPool scheduler(2);
+		AsyncRuntime runtime(scheduler);
 
 		std::binary_semaphore compaction_started(0);
 		std::binary_semaphore allow_compaction_finish(0);
 		std::atomic<bool> compaction_finished{ false };
 
-		runtime.compaction_executor.Submit([&] {
+		runtime.CompactionExecutor().Submit([&] {
 			compaction_started.release();
 			allow_compaction_finish.acquire();
 			compaction_finished.store(true, std::memory_order_release);
@@ -113,7 +159,7 @@ namespace prism::tests
 		ASSERT_TRUE(compaction_started.try_acquire_for(5s));
 
 		std::binary_semaphore read_done(0);
-		runtime.read_scheduler.Submit([&read_done] { read_done.release(); });
+		runtime.DbReadExecutor().Submit([&read_done] { read_done.release(); });
 
 		EXPECT_TRUE(read_done.try_acquire_for(5s)) << "foreground read was blocked behind compaction — lane isolation broken";
 
@@ -123,10 +169,10 @@ namespace prism::tests
 		EXPECT_TRUE(WaitUntil([&compaction_finished] { return compaction_finished.load(); }, 5s));
 	}
 
-	TEST(RuntimeLaneTest, ForegroundDbSchedulerBypassesBusyReadLane)
+	TEST(RuntimeLaneTest, CpuExecutorBypassesBusyBlockingIoLane)
 	{
-		ThreadPoolScheduler scheduler(4);
-		RuntimeBundle runtime(scheduler);
+		CpuThreadPool scheduler(4);
+		AsyncRuntime runtime(scheduler);
 
 		constexpr int kReadWorkers = 4;
 		std::counting_semaphore<kReadWorkers> read_started(0);
@@ -134,7 +180,7 @@ namespace prism::tests
 
 		for (int i = 0; i < kReadWorkers; ++i)
 		{
-			runtime.read_scheduler.Submit([&] {
+			runtime.BlockingIoExecutor().Submit([&] {
 				read_started.release();
 				release_reads.acquire();
 			});
@@ -146,67 +192,13 @@ namespace prism::tests
 		}
 
 		std::binary_semaphore foreground_done(0);
-		runtime.foreground_db_scheduler.Submit([&] { foreground_done.release(); });
+		runtime.CpuExecutor().Submit([&] { foreground_done.release(); });
 		EXPECT_TRUE(foreground_done.try_acquire_for(5s)) << "foreground DB work was blocked behind read-lane work";
 
 		for (int i = 0; i < kReadWorkers; ++i)
 		{
 			release_reads.release();
 		}
-	}
-
-	TEST(RuntimeLaneTest, RuntimeBundleCanReleaseLastReferenceFromReadWorker)
-	{
-		ThreadPoolScheduler scheduler(2);
-		auto runtime = AcquireRuntimeBundle(scheduler);
-
-		std::binary_semaphore released_on_worker(0);
-		runtime->read_executor.Submit([runtime = std::move(runtime), &released_on_worker]() mutable {
-			runtime.reset();
-			released_on_worker.release();
-		});
-
-		EXPECT_TRUE(released_on_worker.try_acquire_for(5s));
-	}
-
-	TEST(RuntimeLaneTest, DeferredDeletionIsSafeWithActiveCpuBurst)
-	{
-		ThreadPoolScheduler scheduler(4);
-		auto runtime = AcquireRuntimeBundle(scheduler);
-		std::weak_ptr<RuntimeBundle> weak_runtime = runtime;
-
-		constexpr int kBurstJobs = 128;
-		std::binary_semaphore burst_submitted(0);
-		std::binary_semaphore released_on_read_worker(0);
-		std::atomic<bool> allow_burst{ false };
-		std::atomic<int> burst_completed{ 0 };
-
-		runtime->foreground_db_scheduler.Submit([&] {
-			for (int i = 0; i < kBurstJobs; ++i)
-			{
-				scheduler.Submit([&] {
-					while (!allow_burst.load(std::memory_order_acquire))
-					{
-						std::this_thread::yield();
-					}
-					burst_completed.fetch_add(1, std::memory_order_release);
-				});
-			}
-			burst_submitted.release();
-		});
-
-		ASSERT_TRUE(burst_submitted.try_acquire_for(5s));
-
-		runtime->read_executor.Submit([runtime = std::move(runtime), &released_on_read_worker]() mutable {
-			runtime.reset();
-			released_on_read_worker.release();
-		});
-
-		ASSERT_TRUE(released_on_read_worker.try_acquire_for(5s));
-		allow_burst.store(true, std::memory_order_release);
-
-		EXPECT_TRUE(WaitUntil([&] { return burst_completed.load(std::memory_order_acquire) == kBurstJobs; }, 5s));
-		EXPECT_TRUE(WaitUntil([&] { return weak_runtime.expired(); }, 5s));
 	}
 
 	// ===========================================================================
@@ -269,8 +261,8 @@ namespace prism::tests
 	// ===========================================================================
 	TEST(RuntimeLaneTest, NoLostWakeupsWithSeparateLanes)
 	{
-		ThreadPoolScheduler scheduler(4);
-		RuntimeBundle runtime(scheduler);
+		CpuThreadPool scheduler(4);
+		AsyncRuntime runtime(scheduler);
 
 		constexpr int kNumWorkItems = 100;
 		std::atomic<int> read_counter{ 0 };
@@ -280,7 +272,7 @@ namespace prism::tests
 
 		for (int i = 0; i < kNumWorkItems; ++i)
 		{
-			runtime.read_scheduler.Submit([&read_counter, i, &read_all_done, kNumWorkItems] {
+			runtime.BlockingIoExecutor().Submit([&read_counter, i, &read_all_done, kNumWorkItems] {
 				read_counter.fetch_add(i, std::memory_order_relaxed);
 				if (i == kNumWorkItems - 1)
 				{
@@ -291,7 +283,7 @@ namespace prism::tests
 
 		for (int i = 0; i < kNumWorkItems; ++i)
 		{
-			runtime.compaction_scheduler.Submit([&compaction_counter, i, &compaction_all_done, kNumWorkItems] {
+			runtime.CompactionExecutor().Submit([&compaction_counter, i, &compaction_all_done, kNumWorkItems] {
 				compaction_counter.fetch_add(i * 2, std::memory_order_relaxed);
 				if (i == kNumWorkItems - 1)
 				{

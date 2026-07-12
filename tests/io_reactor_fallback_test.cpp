@@ -15,6 +15,8 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <deque>
 #include <semaphore>
 #include <string>
 #include <string_view>
@@ -187,6 +189,67 @@ namespace
 		std::string contents_;
 	};
 
+	class GatedMemoryRandomAccessFile final: public RandomAccessFile
+	{
+	public:
+		explicit GatedMemoryRandomAccessFile(std::string contents)
+		    : contents_(std::move(contents))
+		{
+		}
+
+		Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const override
+		{
+			entered_.release();
+			release_.acquire();
+			if (offset >= contents_.size())
+			{
+				*result = Slice();
+				return Status::OK();
+			}
+
+			const std::size_t read_size = std::min<std::size_t>(n, contents_.size() - static_cast<std::size_t>(offset));
+			std::memcpy(scratch, contents_.data() + offset, read_size);
+			*result = Slice(scratch, read_size);
+			return Status::OK();
+		}
+
+		bool WaitUntilReadStarted(std::chrono::milliseconds timeout) const { return entered_.try_acquire_for(timeout); }
+		void ReleaseRead() const { release_.release(); }
+
+	private:
+		std::string contents_;
+		mutable std::binary_semaphore entered_{ 0 };
+		mutable std::binary_semaphore release_{ 0 };
+	};
+
+	Task<bool> ReadAtStringAndReportCpuResume(
+	    AsyncRandomAccessFile* async_file, CpuThreadPool* scheduler, std::string contents)
+	{
+		auto read_result = co_await async_file->ReadAtStringAsync(0, contents.size());
+		if (!read_result.has_value() || read_result.value() != contents)
+		{
+			co_return false;
+		}
+		co_return scheduler->CaptureContext().IsValid();
+	}
+
+	Task<bool> ReadAtSpanAndReportCpuResume(AsyncRandomAccessFile* async_file, CpuThreadPool* scheduler, std::string contents)
+	{
+		std::vector<std::byte> buffer(contents.size());
+		auto read_result = co_await async_file->ReadAtAsync(0, std::span<std::byte>(buffer));
+		if (!read_result.has_value())
+		{
+			co_return false;
+		}
+
+		std::string actual(reinterpret_cast<const char*>(buffer.data()), read_result.value());
+		if (actual != contents)
+		{
+			co_return false;
+		}
+		co_return scheduler->CaptureContext().IsValid();
+	}
+
 	std::filesystem::path UniqueTestDir()
 	{
 		const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -209,7 +272,12 @@ namespace
 	class IoReactorFallbackTest: public ::testing::Test
 	{
 	protected:
-		void SetUp() override { RuntimeMetrics::Instance().Reset(); }
+		void SetUp() override
+		{
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().Reset();
+#endif
+		}
 	};
 }
 
@@ -253,7 +321,9 @@ TEST_F(IoReactorFallbackTest, ProbeReturnsUnavailableWhenIoUringNotSupported)
 	EXPECT_EQ(user_data.load(std::memory_order_acquire), 7u);
 	EXPECT_EQ(result.load(std::memory_order_acquire), static_cast<int>(contents.size()));
 	EXPECT_EQ(std::string_view(buffer.data(), contents.size()), contents);
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_GE(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 1u);
+#endif
 }
 
 TEST_F(IoReactorFallbackTest, InitFailureRecordsFallbackCounter)
@@ -262,7 +332,9 @@ TEST_F(IoReactorFallbackTest, InitFailureRecordsFallbackCounter)
 	InvalidReactor reactor_factory;
 	IoDispatcher dispatcher(executor, IoCapability::kSupported, reactor_factory.Hooks());
 	EXPECT_FALSE(dispatcher.HasReactor());
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_GE(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 1u);
+#endif
 }
 
 TEST_F(IoReactorFallbackTest, FallbackToBlockingExecutorForReads)
@@ -307,7 +379,93 @@ TEST_F(IoReactorFallbackTest, FallbackToBlockingExecutorForReads)
 	EXPECT_EQ(user_data.load(std::memory_order_acquire), 13u);
 	EXPECT_EQ(result.load(std::memory_order_acquire), static_cast<int>(contents.size()));
 	EXPECT_EQ(std::string_view(buffer.data(), contents.size()), contents);
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_GE(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 1u);
+#endif
+}
+
+TEST_F(IoReactorFallbackTest, FallbackToBlockingExecutorForFsync)
+{
+	BlockingExecutor executor;
+	IoDispatcher dispatcher(executor, IoCapability::kUnavailable, IoDispatcher::TestReactor{});
+
+	const auto test_dir = UniqueTestDir();
+	const ScopedRemoveAll cleanup(test_dir);
+	ASSERT_TRUE(std::filesystem::create_directories(test_dir) || std::filesystem::exists(test_dir));
+
+	const auto file_path = test_dir / "fsync-fallback.txt";
+	ScopedFd fd(::open(file_path.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0644));
+	ASSERT_GE(fd.get(), 0) << std::strerror(errno);
+	WriteAll(fd.get(), "fsync-fallback");
+
+	std::binary_semaphore done(0);
+	int seen_result = -1;
+	dispatcher.SubmitFsync(fd.get(), 123, [&](uint64_t user_data, int result) {
+		EXPECT_EQ(user_data, 123u);
+		seen_result = result;
+		done.release();
+	});
+	done.acquire();
+
+	EXPECT_EQ(seen_result, 0);
+#ifdef PRISM_RUNTIME_METRICS
+	EXPECT_GT(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 0u);
+#endif
+}
+
+TEST_F(IoReactorFallbackTest, ReactorPathSubmitsFsync)
+{
+	BlockingExecutor executor;
+
+	struct Completion
+	{
+		uint64_t user_data;
+		int result;
+	};
+	std::mutex mutex;
+	std::deque<Completion> completions;
+	std::atomic<int> submit_fsync_count{ 0 };
+
+	IoDispatcher::TestReactor reactor{
+		.is_valid = [] { return true; },
+		.submit_read = [](int, void*, unsigned, off_t, uint64_t) { return false; },
+		.submit_write = [](int, const void*, unsigned, off_t, uint64_t) { return false; },
+		.submit_noop = [](uint64_t) { return false; },
+		.submit_fsync = [&](int, uint64_t user_data) {
+			submit_fsync_count.fetch_add(1, std::memory_order_relaxed);
+			std::lock_guard lock(mutex);
+			completions.push_back(Completion{ user_data, 0 });
+			return true;
+		},
+		.wait_completion = [&](uint64_t* user_data, int* res) {
+			std::lock_guard lock(mutex);
+			if (completions.empty())
+			{
+				return 0;
+			}
+			const Completion completion = completions.front();
+			completions.pop_front();
+			*user_data = completion.user_data;
+			*res = completion.result;
+			return 1;
+		},
+	};
+
+	IoDispatcher dispatcher(executor, IoCapability::kSupported, std::move(reactor));
+	std::binary_semaphore done(0);
+	int seen_result = -1;
+	dispatcher.SubmitFsync(7, 456, [&](uint64_t user_data, int result) {
+		EXPECT_EQ(user_data, 456u);
+		seen_result = result;
+		done.release();
+	});
+	done.acquire();
+
+	EXPECT_EQ(seen_result, 0);
+	EXPECT_EQ(submit_fsync_count.load(std::memory_order_relaxed), 1);
+#ifdef PRISM_RUNTIME_METRICS
+	EXPECT_EQ(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 0u);
+#endif
 }
 
 TEST_F(IoReactorFallbackTest, ReactorPumpDemuxesOutOfOrderCompletions)
@@ -365,10 +523,11 @@ TEST_F(IoReactorFallbackTest, ReactorPumpDemuxesOutOfOrderCompletions)
 
 TEST_F(IoReactorFallbackTest, AsyncRandomAccessFileFallsBackWhenReactorUnavailable)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 
 	const std::string contents = "fallback-async-random-read";
-	AsyncRandomAccessFile async_file(scheduler, std::make_shared<MemoryRandomAccessFile>(contents));
+	AsyncRandomAccessFile async_file(runtime, std::make_shared<MemoryRandomAccessFile>(contents));
 
 	auto task = [&]() -> Task<std::string> {
 		auto read_result = co_await async_file.ReadAtStringAsync(0, contents.size());
@@ -380,12 +539,47 @@ TEST_F(IoReactorFallbackTest, AsyncRandomAccessFileFallsBackWhenReactorUnavailab
 	}();
 
 	EXPECT_EQ(task.SyncWait(), contents);
+#ifdef PRISM_RUNTIME_METRICS
 	EXPECT_EQ(RuntimeMetrics::Instance().fallback_to_blocking_count.load(std::memory_order_relaxed), 0u);
+#endif
+}
+
+TEST_F(IoReactorFallbackTest, AsyncRandomAccessFileFallbackResumesOnCpuExecutor)
+{
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+
+	const std::string contents = "fallback-resumes-on-cpu";
+	auto file = std::make_shared<GatedMemoryRandomAccessFile>(contents);
+	AsyncRandomAccessFile async_file(runtime, file);
+
+	auto task = ReadAtStringAndReportCpuResume(&async_file, &scheduler, contents);
+
+	ASSERT_TRUE(file->WaitUntilReadStarted(5s));
+	file->ReleaseRead();
+	EXPECT_TRUE(task.SyncWait());
+}
+
+TEST_F(IoReactorFallbackTest, AsyncRandomAccessFileSpanFallbackResumesOnCpuExecutor)
+{
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
+
+	const std::string contents = "span-fallback-resumes-on-cpu";
+	auto file = std::make_shared<GatedMemoryRandomAccessFile>(contents);
+	AsyncRandomAccessFile async_file(runtime, file);
+
+	auto task = ReadAtSpanAndReportCpuResume(&async_file, &scheduler, contents);
+
+	ASSERT_TRUE(file->WaitUntilReadStarted(5s));
+	file->ReleaseRead();
+	EXPECT_TRUE(task.SyncWait());
 }
 
 TEST_F(IoReactorFallbackTest, AsyncEnvFactoryAndMetadataOpsRouteThroughUnifiedBackendSelect)
 {
-	ThreadPoolScheduler scheduler(4);
+	CpuThreadPool scheduler(4);
+	AsyncRuntime runtime(scheduler);
 
 	Env* env = Env::Default();
 	ASSERT_NE(env, nullptr);
@@ -393,7 +587,7 @@ TEST_F(IoReactorFallbackTest, AsyncEnvFactoryAndMetadataOpsRouteThroughUnifiedBa
 	const ScopedRemoveAll cleanup(test_dir);
 	ASSERT_TRUE(std::filesystem::create_directories(test_dir) || std::filesystem::exists(test_dir));
 
-	AsyncEnv async_env(scheduler, env);
+	AsyncEnv async_env(runtime, env);
 	const std::string subdir = (test_dir / "nested").string();
 	const std::string file_path = (test_dir / "backend_select.txt").string();
 	const std::string payload = "factory-metadata-routing";

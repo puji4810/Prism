@@ -403,44 +403,56 @@ if (result.has_value()) {
 
 ## Runtime Architecture
 
-Prism's async runtime uses a lane-isolated execution model. Each database instance owns a `RuntimeBundle` that partitions work across dedicated executors to prevent head-of-line blocking between foreground reads and background compaction.
+Prism's async runtime uses a lane-isolated execution model. Callers explicitly construct and own an `AsyncRuntime`, which partitions work across dedicated executors to prevent CPU continuations, synchronous DB work, blocking file I/O, and compaction from starving each other.
 
 ### Physical Thread Layout
 
-Each `RuntimeBundle` manages four physical thread sources:
+Each `AsyncRuntime` references a caller-owned CPU pool and owns the blocking lanes:
 
 | Executor | Type | Threads | Purpose |
 |----------|------|---------|---------|
-| `ThreadPoolScheduler` (shared) | `ThreadPoolScheduler` | N workers | CPU-bound continuations and general dispatch |
-| `read_executor` | `BlockingExecutor` | 4 | Foreground async reads and writes |
+| `cpu_executor` | `CpuThreadPool` | N workers | CPU-bound continuations, delayed tasks, and reactor read resumes |
+| `db_read_executor` | `BlockingExecutor` | 4 | AsyncDB synchronous `DBImpl::Get` work |
+| `db_write_executor` | `SerialExecutor` | 1 worker | Per-DB `WriteCoordinator` drain and group commit control |
+| `blocking_io_executor` | `BlockingExecutor` | 4 | File factory calls, metadata operations, and blocking file-I/O fallbacks |
 | `compaction_executor` | `BlockingExecutor` | 1 | Background compaction and flush (single-flight) |
-| `serial_lane` | `SerialLane` | 1 worker | FIFO-ordered file writes (Append / Flush / Sync) |
+| `serial_file_executor` | `SerialExecutor` | 1 worker | FIFO-ordered writable-file operations |
 
-The `ThreadPoolScheduler` is process-wide and shared across all database instances. The other three executors are per-DB and constructed inside `RuntimeBundle`.
+The `CpuThreadPool` must outlive the runtime. The remaining executors are constructed inside `AsyncRuntime`.
 
-### Scheduler Routing
+### Executor Routing
 
-`AsyncOp` routes work through `IScheduler` adapters. There are two primary routing paths:
+`AsyncOp` stores an `ExecutorRef`, a non-owning submit thunk to the concrete executor chosen by the public async API.
 
-**AsyncDB operations** (`PutAsync`, `GetAsync`, etc.) use `foreground_db_scheduler`:
+**AsyncDB reads** use `DbReadExecutor()`:
 ```
-foreground_db_scheduler.Submit(job)
-  -> cpu_executor_impl -> ThreadPoolScheduler (shared CPU pool, worker-local fast path)
+runtime.DbReadExecutor().Submit(job)
+  -> BlockingExecutor(db_read role)
 ```
-Work executes on the CPU pool. The completing worker runs the suspend/resume handshake inline and calls `handle.resume()` directly, avoiding a second queue hop.
+Work executes on the DB read lane because `DBImpl::Get` can block on table reads, cache misses, and DB metadata locks. The completing worker runs the suspend/resume handshake inline.
 
-**AsyncEnv file operations** use `read_scheduler` and `serial_scheduler`:
+**AsyncDB writes** use `AsyncWriteOp` and the per-DB `WriteCoordinator`:
 ```
-read_scheduler.Submit(job)
-  -> read_executor (BlockingExecutor, 4 threads)
-  Foreground file I/O: ReadAtAsync, GetFileSizeAsync, etc.
+DBImpl::WriteCoordinator::Enqueue(request)
+  -> runtime.DbWriteExecutor().Submit(drain)
+  -> SerialExecutor(1)
+```
+The coordinator selects a contiguous same-sync queue prefix, encodes it as one merged WAL `WriteBatch` record, performs WAL append/sync outside `DBImpl::mutex_`, then commits batches to the memtable in sequence under the mutex.
 
-serial_scheduler.Submit(job)
-  -> serial_lane (SerialLane, 1 thread)
+`AsyncDB::OpenAsync` uses `BlockingIoExecutor()` because open/recovery is metadata and file-I/O heavy rather than foreground DB read work.
+
+**AsyncEnv file operations** use `BlockingIoExecutor()` and `SerialFileExecutor()`:
+```
+runtime.BlockingIoExecutor().Submit(job)
+  -> blocking_io_executor (BlockingExecutor, 4 threads)
+  File creation, metadata calls, and blocking random-access fallback reads
+
+runtime.SerialFileExecutor().Submit(job)
+  -> serial_file_executor (SerialExecutor, 1 thread)
   FIFO-ordered writes: AppendAsync, FlushAsync, SyncAsync, CloseAsync
 ```
 
-Compaction uses the dedicated `compaction_scheduler` (backed by a single-threaded `compaction_executor`). The `CompactionController` submits directly to `compaction_executor` so that background merge work never competes with the read lane or CPU pool.
+Reactor-backed random-access reads complete on the I/O pump and schedule the awaiting coroutine back onto `CpuExecutor()`. Compaction submits to `CompactionExecutor()` so background merge work never competes with DB, blocking file I/O, or CPU continuation lanes.
 
 ### Why Reads and Compaction Are Isolated
 
@@ -449,9 +461,9 @@ Compaction uses the dedicated `compaction_scheduler` (backed by a single-threade
 **After lane isolation**:
 - Reads scale on a multi-threaded `BlockingExecutor(4)`
 - Compaction stays isolated on its own `BlockingExecutor(1)`
-- SerialLane guarantees ordered file writes without blocking either lane
+- SerialExecutor guarantees ordered file writes without blocking either lane
 
-**Result**: Throughput on read-heavy workloads improved from 388,990 ops/s to 1,138,247 ops/s (2.93x). Context-switches dropped 87%, and task-clock per run fell 45%. The read lane now peaks at 23/24 utilization without fallback-to-blocking events, while the compaction lane maintains zero queue depth because it runs independently.
+**Result**: Throughput on read-heavy workloads improved from 388,990 ops/s to 1,138,247 ops/s (2.93x). Context-switches dropped 87%, and task-clock per run fell 45%. The blocking I/O lane now peaks at 23/24 utilization without fallback-to-blocking events, while the compaction lane maintains zero queue depth because it runs independently.
 
 ### Instrumentation
 
@@ -524,7 +536,7 @@ SSTable := Data Blocks | Meta Block | Index Block | Footer
 struct Options {
     // MemTable
     size_t write_buffer_size = 4 * 1024 * 1024;  // 4MB
-    
+
     // File management
     int max_open_files = 1000;
     size_t block_size = 4 * 1024;  // 4KB
