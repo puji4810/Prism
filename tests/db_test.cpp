@@ -46,9 +46,9 @@ namespace
 
 		Handle* Insert(const Slice&, void*, size_t, void (*)(const Slice&, void*)) override { return nullptr; }
 		Handle* Lookup(const Slice&) override { return nullptr; }
-		void Release(Handle*) override {}
+		void Release(Handle*) override { }
 		void* Value(Handle*) override { return nullptr; }
-		void Erase(const Slice&) override {}
+		void Erase(const Slice&) override { }
 		uint64_t NewId() override { return ++last_id_; }
 		size_t TotalCharge() const override { return 0; }
 

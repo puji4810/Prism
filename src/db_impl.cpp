@@ -880,8 +880,7 @@ namespace prism
 		visible_sequence = 0;
 	}
 
-	DBImpl::PointReadGuard::PointReadGuard(
-	    DBImpl* db_arg, SuperVersion* view_arg, std::size_t epoch_arg, std::size_t shard_arg)
+	DBImpl::PointReadGuard::PointReadGuard(DBImpl* db_arg, SuperVersion* view_arg, std::size_t epoch_arg, std::size_t shard_arg)
 	    : db(db_arg)
 	    , view(view_arg)
 	    , epoch(epoch_arg)
@@ -924,16 +923,14 @@ namespace prism
 	DBImpl::PointReadGuard DBImpl::AcquirePointRead()
 	{
 		static std::atomic<std::size_t> next_shard{ 0 };
-		static thread_local const std::size_t shard
-		    = next_shard.fetch_add(1, std::memory_order_relaxed) % kPointReadShardCount;
+		static thread_local const std::size_t shard = next_shard.fetch_add(1, std::memory_order_relaxed) % kPointReadShardCount;
 
 		while (true)
 		{
 			const std::size_t epoch = point_read_epoch_.load(std::memory_order_acquire);
 			point_read_counters_[epoch][shard].value.fetch_add(1, std::memory_order_acq_rel);
 			SuperVersion* view = super_version_.load(std::memory_order_acquire);
-			if (epoch != point_read_epoch_.load(std::memory_order_acquire)
-			    || (view != nullptr && view->point_read_epoch != epoch))
+			if (epoch != point_read_epoch_.load(std::memory_order_acquire) || (view != nullptr && view->point_read_epoch != epoch))
 			{
 				point_read_counters_[epoch][shard].value.fetch_sub(1, std::memory_order_release);
 				continue;
@@ -1986,8 +1983,7 @@ namespace prism
 				force = false;
 				MaybeScheduleCompaction();
 #ifdef PRISM_RUNTIME_METRICS
-				RuntimeMetrics::Instance().write_memtable_rotation_total_us.fetch_add(
-				    ElapsedUs(rotation_start), std::memory_order_relaxed);
+				RuntimeMetrics::Instance().write_memtable_rotation_total_us.fetch_add(ElapsedUs(rotation_start), std::memory_order_relaxed);
 				RuntimeMetrics::Instance().write_memtable_rotation_count.fetch_add(1, std::memory_order_relaxed);
 #endif
 				break;
@@ -2372,13 +2368,7 @@ namespace prism
 
 			void StartTableRead(const FileMetaData* file, std::unique_ptr<SearchState> self)
 			{
-				db->table_cache_->GetAsyncCallback(*runtime,
-				    options,
-				    file->number,
-				    file->file_size,
-				    internal_key,
-				    &table_state,
-				    &SaveValue,
+				db->table_cache_->GetAsyncCallback(*runtime, options, file->number, file->file_size, internal_key, &table_state, &SaveValue,
 				    [self = std::move(self)](Status table_status) mutable {
 					    if (!table_status.ok())
 					    {
@@ -2489,8 +2479,7 @@ namespace prism
 #endif
 			std::unique_lock<std::shared_mutex> lock(mutex_);
 #ifdef PRISM_RUNTIME_METRICS
-			RuntimeMetrics::Instance().write_plan_mutex_wait_total_us.fetch_add(
-			    ElapsedUs(mutex_wait_start), std::memory_order_relaxed);
+			RuntimeMetrics::Instance().write_plan_mutex_wait_total_us.fetch_add(ElapsedUs(mutex_wait_start), std::memory_order_relaxed);
 			const auto make_room_start = std::chrono::steady_clock::now();
 #endif
 

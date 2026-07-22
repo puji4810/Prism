@@ -124,10 +124,7 @@ namespace prism
 
 	bool CpuThreadPool::ShouldUseFastPath(std::size_t priority) noexcept { return priority == 0; }
 
-	bool CpuThreadPool::ShouldAcceptSubmitDuringShutdown() const noexcept
-	{
-		return !IsExitRequested() || (current_scheduler_ == this);
-	}
+	bool CpuThreadPool::ShouldAcceptSubmitDuringShutdown() const noexcept { return !IsExitRequested() || (current_scheduler_ == this); }
 
 	bool CpuThreadPool::ShouldPromoteLazyTask(const LazyTask& task, std::chrono::steady_clock::time_point now) noexcept
 	{
@@ -148,25 +145,13 @@ namespace prism
 		}
 	}
 
-	void CpuThreadPool::Submit(Job job)
-	{
-		SubmitJob(std::move(job), 0);
-	}
+	void CpuThreadPool::Submit(Job job) { SubmitJob(std::move(job), 0); }
 
-	void CpuThreadPool::SubmitWithPriority(Job job, std::size_t priority)
-	{
-		SubmitJob(std::move(job), priority);
-	}
+	void CpuThreadPool::SubmitWithPriority(Job job, std::size_t priority) { SubmitJob(std::move(job), priority); }
 
-	void CpuThreadPool::SubmitAfter(std::chrono::steady_clock::time_point deadline, Job job)
-	{
-		SubmitAfterJob(deadline, std::move(job));
-	}
+	void CpuThreadPool::SubmitAfter(std::chrono::steady_clock::time_point deadline, Job job) { SubmitAfterJob(deadline, std::move(job)); }
 
-	void CpuThreadPool::SubmitIn(Context ctx, Job job)
-	{
-		SubmitInJob(ctx, std::move(job));
-	}
+	void CpuThreadPool::SubmitIn(Context ctx, Job job) { SubmitInJob(ctx, std::move(job)); }
 
 	bool CpuThreadPool::TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable)
 	{

@@ -13,8 +13,8 @@
 #include <sys/types.h>
 #include <utility>
 
-	namespace prism
-	{
+namespace prism
+{
 	namespace
 	{
 		class KeyBuffer
@@ -284,10 +284,7 @@
 
 		bool ParseNextKey() { return ParseNextKeyInternal(nullptr, nullptr); }
 
-		bool ParseNextKeyAndCompare(const Slice& target, int* target_compare)
-		{
-			return ParseNextKeyInternal(&target, target_compare);
-		}
+		bool ParseNextKeyAndCompare(const Slice& target, int* target_compare) { return ParseNextKeyInternal(&target, target_compare); }
 
 	public:
 		Iter(const Comparator* comparator, const char* data, uint32_t restarts, uint32_t num_restarts)
@@ -454,8 +451,7 @@
 		}
 	}
 
-	Status Block::Seek(
-	    const Comparator* comparator, const Slice& target, void* arg, SeekResultHandler handler, bool* found) const
+	Status Block::Seek(const Comparator* comparator, const Slice& target, void* arg, SeekResultHandler handler, bool* found) const
 	{
 		if (size_ < sizeof(uint32_t))
 		{

@@ -136,15 +136,13 @@ TEST(WriteCoordinatorOverlapTest, OverlapsNextWalWithPreviousGroupContinuation)
 		}(runtime, options));
 		AsyncDB db = open_task->SyncWait();
 
-		first_task.emplace([](AsyncDB& db,
-		                       Status& status,
-		                       std::binary_semaphore& resumed,
-		                       std::binary_semaphore& allow_return) -> Task<void> {
-			status = co_await db.PutAsync(WriteOptions(), "first", "value-1");
-			resumed.release();
-			allow_return.acquire();
-			co_return;
-		}(db, first_status, first_write_resumed, allow_first_write_return));
+		first_task.emplace(
+		    [](AsyncDB& db, Status& status, std::binary_semaphore& resumed, std::binary_semaphore& allow_return) -> Task<void> {
+			    status = co_await db.PutAsync(WriteOptions(), "first", "value-1");
+			    resumed.release();
+			    allow_return.acquire();
+			    co_return;
+		    }(db, first_status, first_write_resumed, allow_first_write_return));
 
 		const bool first_append_observed = control.first_append_started.try_acquire_for(std::chrono::seconds(2));
 		EXPECT_TRUE(first_append_observed);
@@ -159,8 +157,7 @@ TEST(WriteCoordinatorOverlapTest, OverlapsNextWalWithPreviousGroupContinuation)
 		EXPECT_TRUE(first_resumed);
 		if (first_resumed)
 		{
-			second_wal_overlapped_completion
-			    = control.second_append_started.try_acquire_for(std::chrono::seconds(2));
+			second_wal_overlapped_completion = control.second_append_started.try_acquire_for(std::chrono::seconds(2));
 		}
 		allow_first_write_return.release();
 

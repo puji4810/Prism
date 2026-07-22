@@ -313,8 +313,8 @@ namespace prism::bench
 			return base + (static_cast<std::size_t>(slot_id) < remainder ? 1 : 0);
 		}
 
-		std::vector<double> RunRandomReadBenchmarkConcurrent(CpuThreadPool& scheduler,
-		    const std::vector<AsyncRandomAccessFile>& files, const std::vector<ReadRequest>& requests, int inflight)
+		std::vector<double> RunRandomReadBenchmarkConcurrent(CpuThreadPool& scheduler, const std::vector<AsyncRandomAccessFile>& files,
+		    const std::vector<ReadRequest>& requests, int inflight)
 		{
 			StartGate gate;
 			DoneState done(inflight);

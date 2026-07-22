@@ -23,22 +23,15 @@ namespace prism
 			return Status::IOError(op, std::strerror(error_number));
 		}
 
-		void ScheduleReadAtCallback(AsyncRuntime& runtime,
-		    RandomAccessFile* file,
-		    std::shared_ptr<RandomAccessFile> keep_alive,
-		    uint64_t offset,
-		    std::span<std::byte> dst,
-		    std::move_only_function<void(Result<std::size_t>)> completion)
+		void ScheduleReadAtCallback(AsyncRuntime& runtime, RandomAccessFile* file, std::shared_ptr<RandomAccessFile> keep_alive,
+		    uint64_t offset, std::span<std::byte> dst, std::move_only_function<void(Result<std::size_t>)> completion)
 		{
 			const int fd = file->FileDescriptor();
 			if (fd >= 0 && dst.size() <= std::numeric_limits<unsigned>::max() && runtime.Io().HasReactor())
 			{
-				runtime.Io().SubmitRead(fd,
-				    dst.data(),
-				    static_cast<unsigned>(dst.size()),
-				    static_cast<off_t>(offset),
-				    0,
-				    [&runtime, keep_alive = std::move(keep_alive), completion = std::move(completion)](uint64_t, int completed_result) mutable {
+				runtime.Io().SubmitRead(fd, dst.data(), static_cast<unsigned>(dst.size()), static_cast<off_t>(offset), 0,
+				    [&runtime, keep_alive = std::move(keep_alive), completion = std::move(completion)](
+				        uint64_t, int completed_result) mutable {
 					    Result<std::size_t> result = completed_result < 0
 					        ? Result<std::size_t>(std::unexpected(ReactorIoError("reactor read", completed_result)))
 					        : Result<std::size_t>(static_cast<std::size_t>(completed_result));
@@ -84,12 +77,8 @@ namespace prism
 			const uint64_t offset = file->AppendOffset();
 			std::binary_semaphore done(0);
 			int write_result = -EIO;
-			dispatcher.SubmitWrite(fd,
-			    data.data(),
-			    static_cast<unsigned>(data.size()),
-			    static_cast<off_t>(offset),
-			    0,
-			    [&](uint64_t, int completed_result) {
+			dispatcher.SubmitWrite(
+			    fd, data.data(), static_cast<unsigned>(data.size()), static_cast<off_t>(offset), 0, [&](uint64_t, int completed_result) {
 				    write_result = completed_result;
 				    done.release();
 			    });
@@ -169,11 +158,7 @@ namespace prism
 			const int fd = file->FileDescriptor();
 			if (fd >= 0 && dst.size() <= std::numeric_limits<unsigned>::max() && runtime->Io().HasReactor())
 			{
-				runtime->Io().SubmitRead(fd,
-				    dst.data(),
-				    static_cast<unsigned>(dst.size()),
-				    static_cast<off_t>(offset),
-				    0,
+				runtime->Io().SubmitRead(fd, dst.data(), static_cast<unsigned>(dst.size()), static_cast<off_t>(offset), 0,
 				    [self = std::move(self)](uint64_t, int completed_result) {
 					    if (completed_result < 0)
 					    {
@@ -212,10 +197,7 @@ namespace prism
 	AsyncReadAtOp& AsyncReadAtOp::operator=(AsyncReadAtOp&&) noexcept = default;
 	AsyncReadAtOp::Awaiter::~Awaiter() = default;
 
-	bool AsyncReadAtOp::Awaiter::await_ready() const noexcept
-	{
-		return state->status.load(std::memory_order_acquire) == State::kCompleted;
-	}
+	bool AsyncReadAtOp::Awaiter::await_ready() const noexcept { return state->status.load(std::memory_order_acquire) == State::kCompleted; }
 
 	bool AsyncReadAtOp::Awaiter::await_suspend(std::coroutine_handle<> handle) const
 	{
@@ -270,11 +252,7 @@ namespace prism
 			auto dst = std::as_writable_bytes(std::span(buffer));
 			if (fd >= 0 && dst.size() <= std::numeric_limits<unsigned>::max() && runtime->Io().HasReactor())
 			{
-				runtime->Io().SubmitRead(fd,
-				    dst.data(),
-				    static_cast<unsigned>(dst.size()),
-				    static_cast<off_t>(offset),
-				    0,
+				runtime->Io().SubmitRead(fd, dst.data(), static_cast<unsigned>(dst.size()), static_cast<off_t>(offset), 0,
 				    [self = std::move(self)](uint64_t, int completed_result) {
 					    if (completed_result < 0)
 					    {
@@ -360,10 +338,7 @@ namespace prism
 		ScheduleReadAtCallback(*runtime_, file_.get(), file_, offset, dst, std::move(completion));
 	}
 
-	void ReadAtAsyncCallback(AsyncRuntime& runtime,
-	    RandomAccessFile& file,
-	    uint64_t offset,
-	    std::span<std::byte> dst,
+	void ReadAtAsyncCallback(AsyncRuntime& runtime, RandomAccessFile& file, uint64_t offset, std::span<std::byte> dst,
 	    std::move_only_function<void(Result<std::size_t>)> completion)
 	{
 		if (dst.empty())
@@ -554,6 +529,7 @@ namespace prism
 	{
 		auto runtime = runtime_;
 		auto env = env_;
-		return AsyncOp<Result<std::size_t>>(runtime->BlockingIoExecutor(), [env, fname = std::move(fname)]() { return env->GetFileSize(fname); });
+		return AsyncOp<Result<std::size_t>>(
+		    runtime->BlockingIoExecutor(), [env, fname = std::move(fname)]() { return env->GetFileSize(fname); });
 	}
 }

@@ -139,8 +139,8 @@ namespace prism::bench
 		(void)std::filesystem::remove_all(dir);
 	}
 
-	static Detached RunAsyncOpen(std::optional<AsyncDB>& out_db, AsyncRuntime& runtime, const Options& options,
-	    const std::string& dir, std::binary_semaphore& sem, std::exception_ptr& exc)
+	static Detached RunAsyncOpen(std::optional<AsyncDB>& out_db, AsyncRuntime& runtime, const Options& options, const std::string& dir,
+	    std::binary_semaphore& sem, std::exception_ptr& exc)
 	{
 		try
 		{
@@ -328,8 +328,7 @@ namespace prism::bench
 
 		if (cfg.round_isolation && cfg.warmup_rounds > 0)
 		{
-			std::printf("round_isolation=1: ignoring warmup_rounds=%d because each measured round uses a fresh DB\n",
-			    cfg.warmup_rounds);
+			std::printf("round_isolation=1: ignoring warmup_rounds=%d because each measured round uses a fresh DB\n", cfg.warmup_rounds);
 		}
 
 		if (!cfg.round_isolation && !PrefillAsyncDbDir(cfg, options, env_to_use, keys, dir))
@@ -343,9 +342,8 @@ namespace prism::bench
 			adb = OpenAsyncDbForBenchmark(runtime, options, dir);
 		}
 
-		std::printf("phase=%s scheduler_threads=%zu inflight_per_client=%d round_isolation=%d db_dir=%s\n",
-		    PhaseName(cfg.phase).c_str(), scheduler.WorkerCount(), cfg.inflight_per_client, static_cast<int>(cfg.round_isolation),
-		    dir.c_str());
+		std::printf("phase=%s scheduler_threads=%zu inflight_per_client=%d round_isolation=%d db_dir=%s\n", PhaseName(cfg.phase).c_str(),
+		    scheduler.WorkerCount(), cfg.inflight_per_client, static_cast<int>(cfg.round_isolation), dir.c_str());
 
 		// prefill-only: prefill already done above, return early
 		if (cfg.phase == PhaseMode::kPrefillOnly)
@@ -462,8 +460,8 @@ namespace prism::bench
 			{
 				stats = RunAsyncMeasuredRound(*adb, scheduler, env_wrapper, cfg, keys, r);
 			}
-			AddAsyncRoundStats(
-			    cfg, stats, all_lat, total_seconds, total_max_inflight_observed, total_max_client_inflight, total_write_sync, total_bg_sleeps);
+			AddAsyncRoundStats(cfg, stats, all_lat, total_seconds, total_max_inflight_observed, total_max_client_inflight, total_write_sync,
+			    total_bg_sleeps);
 		}
 
 		Stats total;

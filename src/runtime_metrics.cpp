@@ -200,9 +200,9 @@ namespace prism
 		    db_read_completed > 0 ? static_cast<double>(db_read_enqueue_wait_total_us.load(std::memory_order_relaxed))
 		            / static_cast<double>(db_read_completed)
 		                          : 0.0,
-		    db_read_completed > 0 ? static_cast<double>(db_read_exec_time_total_us.load(std::memory_order_relaxed))
-		            / static_cast<double>(db_read_completed)
-		                          : 0.0,
+		    db_read_completed > 0
+		        ? static_cast<double>(db_read_exec_time_total_us.load(std::memory_order_relaxed)) / static_cast<double>(db_read_completed)
+		        : 0.0,
 		    static_cast<unsigned long>(db_read_steal_attempts.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(db_read_steal_successes.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(blocking_io_jobs_submitted.load(std::memory_order_relaxed)),
@@ -248,32 +248,32 @@ namespace prism
 		    static_cast<unsigned long>(wal_fsync_latency_total_us.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(wal_inflight_count),
 		    static_cast<unsigned long>(async_wal_inflight_total_us.load(std::memory_order_relaxed)),
-		    wal_inflight_count > 0 ? static_cast<double>(async_wal_inflight_total_us.load(std::memory_order_relaxed))
-		            / static_cast<double>(wal_inflight_count)
-		                           : 0.0,
+		    wal_inflight_count > 0
+		        ? static_cast<double>(async_wal_inflight_total_us.load(std::memory_order_relaxed)) / static_cast<double>(wal_inflight_count)
+		        : 0.0,
 		    static_cast<unsigned long>(write_group_count),
 		    static_cast<unsigned long>(write_group_requests_total.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(write_group_bytes_total.load(std::memory_order_relaxed)),
-		    write_group_count > 0 ? static_cast<double>(write_group_requests_total.load(std::memory_order_relaxed))
-		            / static_cast<double>(write_group_count)
-		                          : 0.0,
-		    write_group_count > 0 ? static_cast<double>(write_group_bytes_total.load(std::memory_order_relaxed))
-		            / static_cast<double>(write_group_count)
-		                          : 0.0,
+		    write_group_count > 0
+		        ? static_cast<double>(write_group_requests_total.load(std::memory_order_relaxed)) / static_cast<double>(write_group_count)
+		        : 0.0,
+		    write_group_count > 0
+		        ? static_cast<double>(write_group_bytes_total.load(std::memory_order_relaxed)) / static_cast<double>(write_group_count)
+		        : 0.0,
 		    static_cast<unsigned long>(write_plan_mutex_wait_total_us.load(std::memory_order_relaxed)),
 		    write_plan_count > 0 ? static_cast<double>(write_plan_mutex_wait_total_us.load(std::memory_order_relaxed))
 		            / static_cast<double>(write_plan_count)
 		                         : 0.0,
 		    static_cast<unsigned long>(write_plan_count),
 		    static_cast<unsigned long>(write_plan_mutex_total_us.load(std::memory_order_relaxed)),
-		    write_plan_count > 0 ? static_cast<double>(write_plan_mutex_total_us.load(std::memory_order_relaxed))
-		            / static_cast<double>(write_plan_count)
-		                         : 0.0,
+		    write_plan_count > 0
+		        ? static_cast<double>(write_plan_mutex_total_us.load(std::memory_order_relaxed)) / static_cast<double>(write_plan_count)
+		        : 0.0,
 		    static_cast<unsigned long>(write_apply_stage_count),
 		    static_cast<unsigned long>(write_apply_total_us.load(std::memory_order_relaxed)),
-		    write_apply_stage_count > 0 ? static_cast<double>(write_apply_total_us.load(std::memory_order_relaxed))
-		            / static_cast<double>(write_apply_stage_count)
-		                                : 0.0,
+		    write_apply_stage_count > 0
+		        ? static_cast<double>(write_apply_total_us.load(std::memory_order_relaxed)) / static_cast<double>(write_apply_stage_count)
+		        : 0.0,
 		    static_cast<unsigned long>(write_apply_batch_iterations_total.load(std::memory_order_relaxed)),
 		    write_apply_stage_count > 0 ? static_cast<double>(write_apply_batch_iterations_total.load(std::memory_order_relaxed))
 		            / static_cast<double>(write_apply_stage_count)
@@ -285,9 +285,9 @@ namespace prism
 		                            : 0.0,
 		    static_cast<unsigned long>(write_commit_stage_count),
 		    static_cast<unsigned long>(write_commit_total_us.load(std::memory_order_relaxed)),
-		    write_commit_stage_count > 0 ? static_cast<double>(write_commit_total_us.load(std::memory_order_relaxed))
-		            / static_cast<double>(write_commit_stage_count)
-		                                : 0.0,
+		    write_commit_stage_count > 0
+		        ? static_cast<double>(write_commit_total_us.load(std::memory_order_relaxed)) / static_cast<double>(write_commit_stage_count)
+		        : 0.0,
 		    static_cast<unsigned long>(compaction_jobs_submitted.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(compaction_jobs_completed.load(std::memory_order_relaxed)),
 		    active_compaction_lane.load(std::memory_order_relaxed),
@@ -323,9 +323,9 @@ namespace prism
 		    "compaction_in_job_flush_count:%lu\n"
 		    "compaction_in_job_flush_total_us:%lu\n",
 		    static_cast<unsigned long>(write_make_room_total_us.load(std::memory_order_relaxed)),
-		    write_plan_count > 0 ? static_cast<double>(write_make_room_total_us.load(std::memory_order_relaxed))
-		            / static_cast<double>(write_plan_count)
-		                         : 0.0,
+		    write_plan_count > 0
+		        ? static_cast<double>(write_make_room_total_us.load(std::memory_order_relaxed)) / static_cast<double>(write_plan_count)
+		        : 0.0,
 		    static_cast<unsigned long>(write_imm_wait_count.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(write_imm_wait_total_us.load(std::memory_order_relaxed)),
 		    static_cast<unsigned long>(write_imm_wait_max_us.load(std::memory_order_relaxed)),

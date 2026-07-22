@@ -116,14 +116,8 @@ namespace prism
 		return s;
 	}
 
-	void TableCache::GetAsyncCallback(AsyncRuntime& runtime,
-	    ReadOptions options,
-	    uint64_t file_number,
-	    uint64_t file_size,
-	    std::string key,
-	    void* arg,
-	    prism::Table::HandleResult handle_result,
-	    std::move_only_function<void(Status)> completion)
+	void TableCache::GetAsyncCallback(AsyncRuntime& runtime, ReadOptions options, uint64_t file_number, uint64_t file_size, std::string key,
+	    void* arg, prism::Table::HandleResult handle_result, std::move_only_function<void(Status)> completion)
 	{
 		Cache::Handle* handle = nullptr;
 		Status s = FindTable(file_number, file_size, &handle);
@@ -134,13 +128,7 @@ namespace prism
 		}
 
 		auto* entry = reinterpret_cast<TableCacheEntry*>(cache_->Value(handle));
-		entry->table()->InternalGetAsyncCallback(
-		    runtime,
-		    *entry->file(),
-		    std::move(options),
-		    std::move(key),
-		    arg,
-		    handle_result,
+		entry->table()->InternalGetAsyncCallback(runtime, *entry->file(), std::move(options), std::move(key), arg, handle_result,
 		    [this, handle, completion = std::move(completion)](Status s) mutable {
 			    cache_->Release(handle);
 			    completion(std::move(s));

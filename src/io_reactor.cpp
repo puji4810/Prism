@@ -19,7 +19,7 @@
 #include <unistd.h>
 #endif
 
-	namespace prism
+namespace prism
 {
 	struct IoDispatcher::RequestState
 	{
@@ -687,10 +687,7 @@
 		queue_cv_.notify_all();
 	}
 
-	bool IoDispatcher::HasReactor() const noexcept
-	{
-		return capability_ == IoCapability::kSupported && ReactorIsValid();
-	}
+	bool IoDispatcher::HasReactor() const noexcept { return capability_ == IoCapability::kSupported && ReactorIsValid(); }
 
 	void IoDispatcher::SubmitRead(
 	    int fd, void* buf, unsigned nbytes, off_t offset, uint64_t user_data, std::move_only_function<void(uint64_t, int)> completion)
@@ -709,12 +706,7 @@
 		SubmitRequest(Operation::kFsync, fd, nullptr, 0, 0, user_data, std::move(completion));
 	}
 
-	void IoDispatcher::SubmitRequest(Operation operation,
-	    int fd,
-	    const void* buf,
-	    unsigned nbytes,
-	    off_t offset,
-	    uint64_t user_data,
+	void IoDispatcher::SubmitRequest(Operation operation, int fd, const void* buf, unsigned nbytes, off_t offset, uint64_t user_data,
 	    std::move_only_function<void(uint64_t, int)> completion)
 	{
 		if (!HasReactor())
@@ -813,11 +805,8 @@
 				bool submitted = false;
 				if (request.state->operation == Operation::kRead)
 				{
-					submitted = ReactorSubmitRead(request.state->fd,
-					    const_cast<void*>(request.state->buf),
-					    request.state->nbytes,
-					    request.state->offset,
-					    request.request_id);
+					submitted = ReactorSubmitRead(request.state->fd, const_cast<void*>(request.state->buf), request.state->nbytes,
+					    request.state->offset, request.request_id);
 				}
 				else if (request.state->operation == Operation::kWrite)
 				{

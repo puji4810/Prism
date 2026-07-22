@@ -369,7 +369,6 @@ namespace
 		std::filesystem::remove_all(db_dir);
 	}
 
-
 	TEST(KVBenchAsyncMatrixTest, OutstandingWindowReachesConfiguredDepth)
 	{
 		std::string db_dir = MakeTestDir();
@@ -400,8 +399,7 @@ namespace
 		auto stats = prism::bench::RunAsyncMixed(async_db, scheduler, cfg, keys);
 
 		EXPECT_GE(stats.max_client_inflight, static_cast<std::size_t>(cfg.inflight_per_client));
-		EXPECT_GE(stats.max_inflight_observed,
-		    static_cast<std::size_t>(cfg.clients * cfg.inflight_per_client));
+		EXPECT_GE(stats.max_inflight_observed, static_cast<std::size_t>(cfg.clients * cfg.inflight_per_client));
 
 		std::filesystem::remove_all(db_dir);
 	}

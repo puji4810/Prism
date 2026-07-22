@@ -70,7 +70,8 @@ TEST(SchedulerShutdownTest, ImmediateTasksWithPriority)
 		CpuThreadPool scheduler(4);
 		for (int i = 0; i < kNumTasks; ++i)
 		{
-			scheduler.SubmitWithPriority([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 10));
+			scheduler.SubmitWithPriority(
+			    [counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 10));
 		}
 	}
 

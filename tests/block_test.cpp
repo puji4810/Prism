@@ -41,7 +41,7 @@ namespace
 		return std::string(buf);
 	}
 
-		class MemoryRandomAccessFile final: public RandomAccessFile
+	class MemoryRandomAccessFile final: public RandomAccessFile
 	{
 	public:
 		explicit MemoryRandomAccessFile(std::string contents)
@@ -64,49 +64,49 @@ namespace
 		}
 
 	private:
-			std::string contents_;
-		};
+		std::string contents_;
+	};
 
-		class ViewRandomAccessFile final: public RandomAccessFile
+	class ViewRandomAccessFile final: public RandomAccessFile
+	{
+	public:
+		explicit ViewRandomAccessFile(std::string contents)
+		    : contents_(std::move(contents))
 		{
-		public:
-			explicit ViewRandomAccessFile(std::string contents)
-			    : contents_(std::move(contents))
-			{
-			}
+		}
 
-			Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const override
+		Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const override
+		{
+			++read_calls_;
+			if (offset >= contents_.size())
 			{
-				++read_calls_;
-				if (offset >= contents_.size())
-				{
-					*result = Slice();
-					return Status::OK();
-				}
-				const size_t read_size = std::min(n, contents_.size() - static_cast<size_t>(offset));
-				std::memcpy(scratch, contents_.data() + offset, read_size);
-				*result = Slice(scratch, read_size);
+				*result = Slice();
 				return Status::OK();
 			}
+			const size_t read_size = std::min(n, contents_.size() - static_cast<size_t>(offset));
+			std::memcpy(scratch, contents_.data() + offset, read_size);
+			*result = Slice(scratch, read_size);
+			return Status::OK();
+		}
 
-			Result<std::optional<Slice>> TryReadView(uint64_t offset, size_t n) const override
+		Result<std::optional<Slice>> TryReadView(uint64_t offset, size_t n) const override
+		{
+			++view_calls_;
+			if (offset > contents_.size() || n > contents_.size() - static_cast<size_t>(offset))
 			{
-				++view_calls_;
-				if (offset > contents_.size() || n > contents_.size() - static_cast<size_t>(offset))
-				{
-					return std::unexpected(Status::InvalidArgument("view out of range"));
-				}
-				return std::optional<Slice>(std::in_place, contents_.data() + offset, n);
+				return std::unexpected(Status::InvalidArgument("view out of range"));
 			}
+			return std::optional<Slice>(std::in_place, contents_.data() + offset, n);
+		}
 
-			int read_calls() const { return read_calls_; }
-			int view_calls() const { return view_calls_; }
+		int read_calls() const { return read_calls_; }
+		int view_calls() const { return view_calls_; }
 
-		private:
-			std::string contents_;
-			mutable int read_calls_ = 0;
-			mutable int view_calls_ = 0;
-		};
+	private:
+		std::string contents_;
+		mutable int read_calls_ = 0;
+		mutable int view_calls_ = 0;
+	};
 
 	std::string EncodeRawBlock(std::string payload, CompressionType type, bool valid_checksum = true)
 	{
@@ -122,8 +122,7 @@ namespace
 		return block;
 	}
 
-	Task<Result<BlockContents>> ReadBlockAsyncForTest(
-	    AsyncRandomAccessFile* file, const ReadOptions options, const BlockHandle handle)
+	Task<Result<BlockContents>> ReadBlockAsyncForTest(AsyncRandomAccessFile* file, const ReadOptions options, const BlockHandle handle)
 	{
 		co_return co_await ReadBlockAsync(*file, options, handle);
 	}
@@ -296,9 +295,9 @@ namespace
 		options.block_restart_interval = 2;
 		BlockBuilder builder(&options);
 		std::vector<std::string> keys{
-		    std::string(192, 'a') + "0",
-		    std::string(192, 'a') + "1",
-		    std::string(192, 'b') + "0",
+			std::string(192, 'a') + "0",
+			std::string(192, 'a') + "1",
+			std::string(192, 'b') + "0",
 		};
 		for (const auto& key : keys)
 		{
@@ -402,8 +401,8 @@ namespace
 	TEST(ReadBlockAsyncTest, ReportsChecksumMismatch)
 	{
 		const std::string payload = "bad-checksum";
-		auto backing = std::make_shared<MemoryRandomAccessFile>(
-		    EncodeRawBlock(payload, CompressionType::kNoCompression, /*valid_checksum=*/false));
+		auto backing
+		    = std::make_shared<MemoryRandomAccessFile>(EncodeRawBlock(payload, CompressionType::kNoCompression, /*valid_checksum=*/false));
 
 		BlockHandle handle;
 		handle.set_offset(0);
@@ -455,8 +454,8 @@ namespace
 		CpuThreadPool scheduler(1);
 		AsyncRuntime runtime(scheduler);
 		std::optional<Result<BlockContents>> result;
-		ReadBlockAsyncCallback(runtime, file, options, handle,
-		    [&result](Result<BlockContents> contents) { result.emplace(std::move(contents)); });
+		ReadBlockAsyncCallback(
+		    runtime, file, options, handle, [&result](Result<BlockContents> contents) { result.emplace(std::move(contents)); });
 
 		ASSERT_TRUE(result.has_value());
 		ASSERT_TRUE(result->has_value()) << result->error().ToString();
@@ -478,8 +477,8 @@ namespace
 		CpuThreadPool scheduler(1);
 		AsyncRuntime runtime(scheduler);
 		std::optional<Result<BlockContents>> result;
-		ReadBlockAsyncCallback(runtime, file, ReadOptions(), handle,
-		    [&result](Result<BlockContents> contents) { result.emplace(std::move(contents)); });
+		ReadBlockAsyncCallback(
+		    runtime, file, ReadOptions(), handle, [&result](Result<BlockContents> contents) { result.emplace(std::move(contents)); });
 
 		ASSERT_TRUE(result.has_value());
 		ASSERT_TRUE(result->has_value()) << result->error().ToString();
@@ -501,8 +500,8 @@ namespace
 		CpuThreadPool scheduler(1);
 		AsyncRuntime runtime(scheduler);
 		std::optional<Result<BlockContents>> result;
-		ReadBlockAsyncCallback(runtime, file, ReadOptions(), handle,
-		    [&result](Result<BlockContents> contents) { result.emplace(std::move(contents)); });
+		ReadBlockAsyncCallback(
+		    runtime, file, ReadOptions(), handle, [&result](Result<BlockContents> contents) { result.emplace(std::move(contents)); });
 
 		ASSERT_TRUE(result.has_value());
 		ASSERT_FALSE(result->has_value());

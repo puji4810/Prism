@@ -197,8 +197,7 @@ namespace
 			entries.reserve(512);
 			for (int key = 0; key < 512; ++key)
 			{
-				entries.push_back(TableEntry{ "compaction_key_" + std::to_string(key),
-				    static_cast<SequenceNumber>(4 - file), kTypeValue,
+				entries.push_back(TableEntry{ "compaction_key_" + std::to_string(key), static_cast<SequenceNumber>(4 - file), kTypeValue,
 				    std::string(64, static_cast<char>('a' + file)) });
 			}
 			AddTableFile(db, db->TEST_DBName(), 0, entries);

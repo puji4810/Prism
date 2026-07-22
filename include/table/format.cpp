@@ -17,13 +17,8 @@ namespace prism
 {
 	namespace
 	{
-		Status DecodeBlockContents(
-		    const ReadOptions& options,
-		    const BlockHandle& handle,
-		    const char* data,
-		    size_t contents_size,
-		    char* owned_buf,
-		    BlockContents* result)
+		Status DecodeBlockContents(const ReadOptions& options, const BlockHandle& handle, const char* data, size_t contents_size,
+		    char* owned_buf, BlockContents* result)
 		{
 			result->data = Slice{ };
 			result->cachable = false;
@@ -301,13 +296,12 @@ namespace prism
 		auto state = MakeBlockReadCallbackState(options, handle, std::move(completion));
 
 		auto dst = std::as_writable_bytes(std::span(state->buffer.get(), n + kBlockTrailerSize));
-		file.ReadAtAsyncCallback(handle.offset(), dst, [state = std::move(state)](Result<std::size_t> bytes) mutable {
-			FinishBlockReadCallback(std::move(state), std::move(bytes));
-		});
+		file.ReadAtAsyncCallback(handle.offset(), dst,
+		    [state = std::move(state)](Result<std::size_t> bytes) mutable { FinishBlockReadCallback(std::move(state), std::move(bytes)); });
 	}
 
-	void ReadBlockAsyncCallback(
-	    AsyncRuntime& runtime, RandomAccessFile& file, const ReadOptions& options, const BlockHandle& handle, AsyncBlockReadCallback completion)
+	void ReadBlockAsyncCallback(AsyncRuntime& runtime, RandomAccessFile& file, const ReadOptions& options, const BlockHandle& handle,
+	    AsyncBlockReadCallback completion)
 	{
 		if (handle.size() > std::numeric_limits<size_t>::max() - kBlockTrailerSize)
 		{
@@ -354,8 +348,7 @@ namespace prism
 		auto state = MakeBlockReadCallbackState(options, handle, std::move(completion));
 
 		auto dst = std::as_writable_bytes(std::span(state->buffer.get(), read_size));
-		ReadAtAsyncCallback(runtime, file, handle.offset(), dst, [state = std::move(state)](Result<std::size_t> bytes) mutable {
-			FinishBlockReadCallback(std::move(state), std::move(bytes));
-		});
+		ReadAtAsyncCallback(runtime, file, handle.offset(), dst,
+		    [state = std::move(state)](Result<std::size_t> bytes) mutable { FinishBlockReadCallback(std::move(state), std::move(bytes)); });
 	}
 }

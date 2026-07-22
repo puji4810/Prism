@@ -201,10 +201,7 @@ namespace prism
 		return true;
 	}
 
-	bool BlockingExecutor::IsCurrentWorker() const noexcept
-	{
-		return tls_blocking_executor == this;
-	}
+	bool BlockingExecutor::IsCurrentWorker() const noexcept { return tls_blocking_executor == this; }
 
 	bool BlockingExecutor::TryPopOwn(Shard& shard, Job& out)
 	{
@@ -442,9 +439,7 @@ namespace prism
 
 	AsyncRuntime::AsyncRuntime(CpuThreadPool& cpu_pool, AsyncRuntimeOptions options)
 	    : cpu_executor_(cpu_pool)
-	    , db_read_executor_(
-	          options.db_read_threads != 4 ? options.db_read_threads : options.db_threads,
-	          BlockingExecutorRole::kDbRead,
+	    , db_read_executor_(options.db_read_threads != 4 ? options.db_read_threads : options.db_threads, BlockingExecutorRole::kDbRead,
 	          BlockingExecutorOptions{ .enable_stealing = true })
 	    , db_write_executor_()
 	    , blocking_io_executor_(options.blocking_io_threads, BlockingExecutorRole::kBlockingIo)

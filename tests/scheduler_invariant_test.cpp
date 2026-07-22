@@ -248,7 +248,8 @@ TEST(SchedulerInvariantTest, ConcurrentPrioritySubmissionPreservesProgress)
 		threads.emplace_back([&scheduler, counter, t]() {
 			for (int i = 0; i < kPerThread; ++i)
 			{
-				scheduler.SubmitWithPriority([counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>((i + t) % 10));
+				scheduler.SubmitWithPriority(
+				    [counter]() { counter->fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>((i + t) % 10));
 			}
 		});
 	}

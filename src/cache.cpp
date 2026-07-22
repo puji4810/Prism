@@ -434,10 +434,7 @@ namespace prism
 			shard_[Shard(hash)].Erase(key, hash);
 		}
 		void* Value(Handle* handle) override { return reinterpret_cast<LRUHandle*>(handle)->value; }
-		uint64_t NewId() override
-		{
-			return last_id_.fetch_add(1, std::memory_order_relaxed) + 1;
-		}
+		uint64_t NewId() override { return last_id_.fetch_add(1, std::memory_order_relaxed) + 1; }
 		void Prune() override
 		{
 			for (int s = 0; s < kNumShards; s++)

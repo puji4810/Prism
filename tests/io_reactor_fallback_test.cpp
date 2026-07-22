@@ -95,14 +95,16 @@ namespace
 		{
 			return {
 				.is_valid = [this] { return true; },
-				.submit_read = [this](int, void*, unsigned, off_t, uint64_t) {
-					submit_count_.fetch_add(1, std::memory_order_relaxed);
-					return false;
-				},
-				.submit_write = [this](int, const void*, unsigned, off_t, uint64_t) {
-					submit_count_.fetch_add(1, std::memory_order_relaxed);
-					return false;
-				},
+				.submit_read =
+				    [this](int, void*, unsigned, off_t, uint64_t) {
+				        submit_count_.fetch_add(1, std::memory_order_relaxed);
+				        return false;
+				    },
+				.submit_write =
+				    [this](int, const void*, unsigned, off_t, uint64_t) {
+				        submit_count_.fetch_add(1, std::memory_order_relaxed);
+				        return false;
+				    },
 				.submit_noop = [](uint64_t) { return false; },
 				.wait_completion = [](uint64_t*, int*) { return 0; },
 			};
@@ -121,34 +123,38 @@ namespace
 		{
 			return {
 				.is_valid = [this] { return true; },
-				.submit_read = [this](int, void* buf, unsigned nbytes, off_t, uint64_t user_data) {
-					std::lock_guard lock(mutex_);
-					std::memset(buf, static_cast<int>('0' + user_data), nbytes);
-					completions_.push_back(Completion{ user_data, static_cast<int>(nbytes) });
-					return true;
-				},
-				.submit_write = [this](int, const void*, unsigned nbytes, off_t, uint64_t user_data) {
-					std::lock_guard lock(mutex_);
-					completions_.push_back(Completion{ user_data, static_cast<int>(nbytes) });
-					return true;
-				},
-				.submit_noop = [this](uint64_t user_data) {
-					std::lock_guard lock(mutex_);
-					completions_.push_back(Completion{ user_data, 0 });
-					return true;
-				},
-				.wait_completion = [this](uint64_t* user_data, int* res) {
-					std::lock_guard lock(mutex_);
-					if (completions_.empty())
-					{
-						return 0;
-					}
-					const auto completion = completions_.back();
-					completions_.pop_back();
-					*user_data = completion.user_data;
-					*res = completion.result;
-					return 1;
-				},
+				.submit_read =
+				    [this](int, void* buf, unsigned nbytes, off_t, uint64_t user_data) {
+				        std::lock_guard lock(mutex_);
+				        std::memset(buf, static_cast<int>('0' + user_data), nbytes);
+				        completions_.push_back(Completion{ user_data, static_cast<int>(nbytes) });
+				        return true;
+				    },
+				.submit_write =
+				    [this](int, const void*, unsigned nbytes, off_t, uint64_t user_data) {
+				        std::lock_guard lock(mutex_);
+				        completions_.push_back(Completion{ user_data, static_cast<int>(nbytes) });
+				        return true;
+				    },
+				.submit_noop =
+				    [this](uint64_t user_data) {
+				        std::lock_guard lock(mutex_);
+				        completions_.push_back(Completion{ user_data, 0 });
+				        return true;
+				    },
+				.wait_completion =
+				    [this](uint64_t* user_data, int* res) {
+				        std::lock_guard lock(mutex_);
+				        if (completions_.empty())
+				        {
+					        return 0;
+				        }
+				        const auto completion = completions_.back();
+				        completions_.pop_back();
+				        *user_data = completion.user_data;
+				        *res = completion.result;
+				        return 1;
+				    },
 			};
 		}
 
@@ -222,8 +228,7 @@ namespace
 		mutable std::binary_semaphore release_{ 0 };
 	};
 
-	Task<bool> ReadAtStringAndReportCpuResume(
-	    AsyncRandomAccessFile* async_file, CpuThreadPool* scheduler, std::string contents)
+	Task<bool> ReadAtStringAndReportCpuResume(AsyncRandomAccessFile* async_file, CpuThreadPool* scheduler, std::string contents)
 	{
 		auto read_result = co_await async_file->ReadAtStringAsync(0, contents.size());
 		if (!read_result.has_value() || read_result.value() != contents)
@@ -284,7 +289,7 @@ namespace
 TEST_F(IoReactorFallbackTest, ProbeReturnsUnavailableWhenIoUringNotSupported)
 {
 	BlockingExecutor executor;
-	IoDispatcher dispatcher(executor, IoCapability::kUnavailable, IoDispatcher::TestReactor{});
+	IoDispatcher dispatcher(executor, IoCapability::kUnavailable, IoDispatcher::TestReactor{ });
 
 	const std::string contents = "fallback-from-probe";
 	const auto test_dir = UniqueTestDir();
@@ -306,16 +311,11 @@ TEST_F(IoReactorFallbackTest, ProbeReturnsUnavailableWhenIoUringNotSupported)
 	std::atomic<uint64_t> user_data{ 0 };
 	std::atomic<int> result{ -1 };
 
-	dispatcher.SubmitRead(read_fd.get(),
-	    buffer.data(),
-	    contents.size(),
-	    0,
-	    7,
-	    [&](uint64_t completed_user_data, int completed_result) {
-			user_data.store(completed_user_data, std::memory_order_release);
-			result.store(completed_result, std::memory_order_release);
-			done.release();
-	    });
+	dispatcher.SubmitRead(read_fd.get(), buffer.data(), contents.size(), 0, 7, [&](uint64_t completed_user_data, int completed_result) {
+		user_data.store(completed_user_data, std::memory_order_release);
+		result.store(completed_result, std::memory_order_release);
+		done.release();
+	});
 
 	ASSERT_TRUE(done.try_acquire_for(5s));
 	EXPECT_EQ(user_data.load(std::memory_order_acquire), 7u);
@@ -363,16 +363,11 @@ TEST_F(IoReactorFallbackTest, FallbackToBlockingExecutorForReads)
 	std::atomic<uint64_t> user_data{ 0 };
 	std::atomic<int> result{ -1 };
 
-	dispatcher.SubmitRead(read_fd.get(),
-	    buffer.data(),
-	    contents.size(),
-	    0,
-	    13,
-	    [&](uint64_t completed_user_data, int completed_result) {
-			user_data.store(completed_user_data, std::memory_order_release);
-			result.store(completed_result, std::memory_order_release);
-			done.release();
-	    });
+	dispatcher.SubmitRead(read_fd.get(), buffer.data(), contents.size(), 0, 13, [&](uint64_t completed_user_data, int completed_result) {
+		user_data.store(completed_user_data, std::memory_order_release);
+		result.store(completed_result, std::memory_order_release);
+		done.release();
+	});
 
 	ASSERT_TRUE(done.try_acquire_for(5s));
 	EXPECT_EQ(reactor_factory.submit_count(), 1);
@@ -387,7 +382,7 @@ TEST_F(IoReactorFallbackTest, FallbackToBlockingExecutorForReads)
 TEST_F(IoReactorFallbackTest, FallbackToBlockingExecutorForFsync)
 {
 	BlockingExecutor executor;
-	IoDispatcher dispatcher(executor, IoCapability::kUnavailable, IoDispatcher::TestReactor{});
+	IoDispatcher dispatcher(executor, IoCapability::kUnavailable, IoDispatcher::TestReactor{ });
 
 	const auto test_dir = UniqueTestDir();
 	const ScopedRemoveAll cleanup(test_dir);
@@ -431,24 +426,26 @@ TEST_F(IoReactorFallbackTest, ReactorPathSubmitsFsync)
 		.submit_read = [](int, void*, unsigned, off_t, uint64_t) { return false; },
 		.submit_write = [](int, const void*, unsigned, off_t, uint64_t) { return false; },
 		.submit_noop = [](uint64_t) { return false; },
-		.submit_fsync = [&](int, uint64_t user_data) {
-			submit_fsync_count.fetch_add(1, std::memory_order_relaxed);
-			std::lock_guard lock(mutex);
-			completions.push_back(Completion{ user_data, 0 });
-			return true;
-		},
-		.wait_completion = [&](uint64_t* user_data, int* res) {
-			std::lock_guard lock(mutex);
-			if (completions.empty())
-			{
-				return 0;
-			}
-			const Completion completion = completions.front();
-			completions.pop_front();
-			*user_data = completion.user_data;
-			*res = completion.result;
-			return 1;
-		},
+		.submit_fsync =
+		    [&](int, uint64_t user_data) {
+		        submit_fsync_count.fetch_add(1, std::memory_order_relaxed);
+		        std::lock_guard lock(mutex);
+		        completions.push_back(Completion{ user_data, 0 });
+		        return true;
+		    },
+		.wait_completion =
+		    [&](uint64_t* user_data, int* res) {
+		        std::lock_guard lock(mutex);
+		        if (completions.empty())
+		        {
+			        return 0;
+		        }
+		        const Completion completion = completions.front();
+		        completions.pop_front();
+		        *user_data = completion.user_data;
+		        *res = completion.result;
+		        return 1;
+		    },
 	};
 
 	IoDispatcher dispatcher(executor, IoCapability::kSupported, std::move(reactor));

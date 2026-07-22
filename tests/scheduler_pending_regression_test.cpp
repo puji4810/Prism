@@ -398,7 +398,8 @@ TEST(SchedulerPendingRegressionTest, MixedPriorityLazyWakeupProgress)
 	}
 	for (int i = 0; i < kPriority; ++i)
 	{
-		scheduler.SubmitWithPriority([&counter]() { counter.fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 5 + 1));
+		scheduler.SubmitWithPriority(
+		    [&counter]() { counter.fetch_add(1, std::memory_order_relaxed); }, static_cast<std::size_t>(i % 5 + 1));
 	}
 	auto past = std::chrono::steady_clock::now() - 1s;
 	for (int i = 0; i < kDelayed; ++i)

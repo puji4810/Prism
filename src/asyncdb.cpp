@@ -47,8 +47,7 @@ namespace prism
 		std::size_t RefOperation()
 		{
 			static std::atomic<std::size_t> next_shard{ 0 };
-			static thread_local const std::size_t shard_index
-			    = next_shard.fetch_add(1, std::memory_order_relaxed) % kReadRefShardCount;
+			static thread_local const std::size_t shard_index = next_shard.fetch_add(1, std::memory_order_relaxed) % kReadRefShardCount;
 			const uint32_t previous = read_refs_[shard_index].state.fetch_add(1, std::memory_order_relaxed);
 			assert((previous & kReadRefReleased) == 0);
 			assert((previous & kReadRefCountMask) != kReadRefCountMask);
@@ -81,8 +80,7 @@ namespace prism
 		void ReleaseReadShard(ReadRefShard& shard)
 		{
 			uint32_t expected = 0;
-			if (shard.state.compare_exchange_strong(
-			        expected, kReadRefReleased, std::memory_order_acq_rel, std::memory_order_acquire))
+			if (shard.state.compare_exchange_strong(expected, kReadRefReleased, std::memory_order_acq_rel, std::memory_order_acquire))
 			{
 				Unref();
 			}
@@ -149,19 +147,17 @@ namespace prism
 			{
 				auto runtime = owner->runtime_;
 				auto* impl = owner->db_.impl_.get();
-				impl->GetAsyncCallback(
-				    *runtime, std::move(options), std::move(key), [self](Result<std::string> get_result) mutable {
+				impl->GetAsyncCallback(*runtime, std::move(options), std::move(key), [self](Result<std::string> get_result) mutable {
 #ifdef PRISM_RUNTIME_METRICS
-					    auto db_elapsed_us = static_cast<uint64_t>(
-					        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - self->db_start)
-					            .count());
-					    auto& rm = RuntimeMetrics::Instance();
-					    rm.get_async_db_op_total_us.fetch_add(db_elapsed_us, std::memory_order_relaxed);
-					    rm.get_async_db_op_count.fetch_add(1, std::memory_order_relaxed);
+					auto db_elapsed_us = static_cast<uint64_t>(
+					    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - self->db_start).count());
+					auto& rm = RuntimeMetrics::Instance();
+					rm.get_async_db_op_total_us.fetch_add(db_elapsed_us, std::memory_order_relaxed);
+					rm.get_async_db_op_count.fetch_add(1, std::memory_order_relaxed);
 #endif
-					    self->result = std::move(get_result);
-					    self->Finish();
-				    });
+					self->result = std::move(get_result);
+					self->Finish();
+				});
 			}
 			catch (...)
 			{
@@ -194,10 +190,7 @@ namespace prism
 	AsyncGetOp& AsyncGetOp::operator=(AsyncGetOp&&) noexcept = default;
 	AsyncGetOp::Awaiter::~Awaiter() = default;
 
-	bool AsyncGetOp::Awaiter::await_ready() const noexcept
-	{
-		return state->status.load(std::memory_order_acquire) == State::kCompleted;
-	}
+	bool AsyncGetOp::Awaiter::await_ready() const noexcept { return state->status.load(std::memory_order_acquire) == State::kCompleted; }
 
 	bool AsyncGetOp::Awaiter::await_suspend(std::coroutine_handle<> handle) const
 	{

@@ -263,21 +263,15 @@ namespace prism
 		return s;
 	}
 
-	void Table::InternalGetAsyncCallback(AsyncRuntime& runtime,
-	    RandomAccessFile& file,
-	    ReadOptions options,
-	    std::string key,
-	    void* arg,
-	    HandleResult handle_result,
-	    AsyncGetCallback completion)
+	void Table::InternalGetAsyncCallback(AsyncRuntime& runtime, RandomAccessFile& file, ReadOptions options, std::string key, void* arg,
+	    HandleResult handle_result, AsyncGetCallback completion)
 	{
 		Status s;
 		BlockHandle handle;
 		Slice key_slice(key);
 		Slice handle_value;
 		bool index_entry_found = false;
-		s = rep_->index_block->Seek(
-		    rep_->options.comparator, key_slice, &handle_value, &SaveSeekValue, &index_entry_found);
+		s = rep_->index_block->Seek(rep_->options.comparator, key_slice, &handle_value, &SaveSeekValue, &index_entry_found);
 		if (!s.ok() || !index_entry_found)
 		{
 			completion(s);
@@ -322,8 +316,7 @@ namespace prism
 			if (result.ok())
 			{
 				bool block_entry_found = false;
-				result = data_block->Seek(
-				    rep_->options.comparator, Slice(key), arg, handle_result, &block_entry_found);
+				result = data_block->Seek(rep_->options.comparator, Slice(key), arg, handle_result, &block_entry_found);
 			}
 			if (data_cache_handle != nullptr)
 			{
@@ -342,27 +335,24 @@ namespace prism
 			return;
 		}
 
-		ReadBlockAsyncCallback(runtime, file, options, handle, [block_cache,
-		                                          cache_key_string = cache_key.ToString(),
-		                                          options,
-		                                          finish_with_block = std::move(finish_with_block)](
-		                                             Result<BlockContents> contents) mutable {
-			if (!contents.has_value())
-			{
-				finish_with_block(nullptr, nullptr, contents.error());
-				return;
-			}
+		ReadBlockAsyncCallback(runtime, file, options, handle,
+		    [block_cache, cache_key_string = cache_key.ToString(), options, finish_with_block = std::move(finish_with_block)](
+		        Result<BlockContents> contents) mutable {
+			    if (!contents.has_value())
+			    {
+				    finish_with_block(nullptr, nullptr, contents.error());
+				    return;
+			    }
 
-			Block* loaded_block = new Block(contents.value());
-			Cache::Handle* loaded_handle = nullptr;
-			if (block_cache != nullptr && contents.value().cachable && options.fill_cache)
-			{
-				loaded_handle = block_cache->Insert(Slice(cache_key_string), loaded_block, loaded_block->size(), &DeleteCachedBlock);
-			}
-			finish_with_block(loaded_block, loaded_handle, Status::OK());
-		});
+			    Block* loaded_block = new Block(contents.value());
+			    Cache::Handle* loaded_handle = nullptr;
+			    if (block_cache != nullptr && contents.value().cachable && options.fill_cache)
+			    {
+				    loaded_handle = block_cache->Insert(Slice(cache_key_string), loaded_block, loaded_block->size(), &DeleteCachedBlock);
+			    }
+			    finish_with_block(loaded_block, loaded_handle, Status::OK());
+		    });
 	}
-
 
 	Iterator* Table::NewIterator(const ReadOptions& options) const
 	{

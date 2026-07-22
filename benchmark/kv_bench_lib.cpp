@@ -446,8 +446,7 @@ namespace prism::bench
 
 		bool TrackInflightStats(const Config& cfg) { return !cfg.no_latency; }
 
-		void RecordInflightEnter(
-		    bool enabled, std::atomic<std::size_t>& inflight, std::atomic<std::size_t>& max_inflight)
+		void RecordInflightEnter(bool enabled, std::atomic<std::size_t>& inflight, std::atomic<std::size_t>& max_inflight)
 		{
 			if (!enabled)
 			{
@@ -475,8 +474,8 @@ namespace prism::bench
 			return static_cast<std::size_t>(cfg.clients) * ConfiguredClientInflight(cfg, effective_inflight);
 		}
 
-		void FinishInflightStats(Stats& out, const Config& cfg, int effective_inflight,
-		    const std::atomic<std::size_t>& global_max_inflight, const std::atomic<std::size_t>* client_max_inflight)
+		void FinishInflightStats(Stats& out, const Config& cfg, int effective_inflight, const std::atomic<std::size_t>& global_max_inflight,
+		    const std::atomic<std::size_t>* client_max_inflight)
 		{
 			if (!TrackInflightStats(cfg))
 			{
@@ -680,8 +679,7 @@ namespace prism::bench
 		return out;
 	}
 
-	Stats RunAsyncDiskRead(
-	    AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
+	Stats RunAsyncDiskRead(AsyncDB& db, CpuThreadPool& scheduler, const Config& cfg, const std::vector<std::vector<std::string>>& keys)
 	{
 		Stats out;
 		StartGate gate;

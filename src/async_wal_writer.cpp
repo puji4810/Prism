@@ -135,12 +135,8 @@ namespace prism
 #ifdef PRISM_RUNTIME_METRICS
 		state->append_start_time = std::chrono::steady_clock::now();
 #endif
-		runtime_->Io().SubmitWrite(fd,
-		    state->bytes.data(),
-		    static_cast<unsigned>(state->bytes.size()),
-		    static_cast<off_t>(offset),
-		    state->append_user_data,
-		    [state, fd](uint64_t, int result) {
+		runtime_->Io().SubmitWrite(fd, state->bytes.data(), static_cast<unsigned>(state->bytes.size()), static_cast<off_t>(offset),
+		    state->append_user_data, [state, fd](uint64_t, int result) {
 #ifdef PRISM_RUNTIME_METRICS
 			    RuntimeMetrics::Instance().wal_append_latency_total_us.fetch_add(
 			        ElapsedUs(state->append_start_time), std::memory_order_relaxed);

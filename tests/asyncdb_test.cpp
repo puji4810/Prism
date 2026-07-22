@@ -25,10 +25,7 @@ namespace
 			return file_->Read(offset, n, result, scratch);
 		}
 
-		Result<std::size_t> ReadAt(uint64_t offset, std::span<std::byte> dst) const override
-		{
-			return file_->ReadAt(offset, dst);
-		}
+		Result<std::size_t> ReadAt(uint64_t offset, std::span<std::byte> dst) const override { return file_->ReadAt(offset, dst); }
 
 	private:
 		std::unique_ptr<RandomAccessFile> file_;
@@ -206,7 +203,7 @@ TEST_F(AsyncDBTest, GetAsyncResumesInlineOnCompletingReadWorker)
 			}
 			EXPECT_EQ(get.value(), "fast-value");
 			*resumed_on_read_worker = runtime.DbReadExecutor().IsCurrentWorker();
-			}(runtime, options, &resumed_on_read_worker));
+		}(runtime, options, &resumed_on_read_worker));
 
 		task->SyncWait();
 	}
@@ -288,36 +285,36 @@ TEST_F(AsyncDBTest, GetAsyncResumesAfterAsynchronousSstRead)
 		options.block_size = 256;
 
 		task.emplace([](AsyncRuntime& runtime, CpuThreadPool& scheduler, Options options) -> Task<void> {
-		auto db_result = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
-		if (!db_result.has_value())
-		{
-			ADD_FAILURE() << "Open failed: " << db_result.error().ToString();
-			co_return;
-		}
-		auto db = std::move(db_result.value());
-		const std::string payload(1024, 'a');
-		for (int i = 0; i < 32; ++i)
-		{
-			Status put = co_await db.PutAsync(WriteOptions(), "async_sst_" + std::to_string(i), payload);
-			if (!put.ok())
+			auto db_result = co_await AsyncDB::OpenAsync(runtime, options, "test_async_db");
+			if (!db_result.has_value())
 			{
-				ADD_FAILURE() << "Put failed: " << put.ToString();
+				ADD_FAILURE() << "Open failed: " << db_result.error().ToString();
 				co_return;
 			}
-		}
+			auto db = std::move(db_result.value());
+			const std::string payload(1024, 'a');
+			for (int i = 0; i < 32; ++i)
+			{
+				Status put = co_await db.PutAsync(WriteOptions(), "async_sst_" + std::to_string(i), payload);
+				if (!put.ok())
+				{
+					ADD_FAILURE() << "Put failed: " << put.ToString();
+					co_return;
+				}
+			}
 
-		ReadOptions read_options;
-		read_options.fill_cache = false;
-		auto get = co_await db.GetAsync(read_options, "async_sst_0");
-		if (!get.has_value())
-		{
-			ADD_FAILURE() << "Get failed: " << get.error().ToString();
+			ReadOptions read_options;
+			read_options.fill_cache = false;
+			auto get = co_await db.GetAsync(read_options, "async_sst_0");
+			if (!get.has_value())
+			{
+				ADD_FAILURE() << "Get failed: " << get.error().ToString();
+				co_return;
+			}
+			EXPECT_EQ(get.value(), payload);
+			EXPECT_TRUE(scheduler.CaptureContext().IsValid());
+			EXPECT_FALSE(runtime.DbReadExecutor().IsCurrentWorker());
 			co_return;
-		}
-		EXPECT_EQ(get.value(), payload);
-		EXPECT_TRUE(scheduler.CaptureContext().IsValid());
-		EXPECT_FALSE(runtime.DbReadExecutor().IsCurrentWorker());
-		co_return;
 		}(runtime, scheduler, options));
 		task->SyncWait();
 	}

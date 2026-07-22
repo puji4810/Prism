@@ -42,15 +42,9 @@ namespace
 	}
 }
 
-TEST(LogWriterTest, SharedEncoderMatchesWriterForEmptyRecord)
-{
-	ExpectEncoderMatchesWriter("", 0);
-}
+TEST(LogWriterTest, SharedEncoderMatchesWriterForEmptyRecord) { ExpectEncoderMatchesWriter("", 0); }
 
-TEST(LogWriterTest, SharedEncoderMatchesWriterForSmallFullRecord)
-{
-	ExpectEncoderMatchesWriter("small wal record", 0);
-}
+TEST(LogWriterTest, SharedEncoderMatchesWriterForSmallFullRecord) { ExpectEncoderMatchesWriter("small wal record", 0); }
 
 TEST(LogWriterTest, SharedEncoderMatchesWriterForRecordEndingAtBlockBoundary)
 {
@@ -79,7 +73,4 @@ TEST(LogWriterTest, SharedEncoderMatchesWriterForFragmentedRecord)
 	ExpectEncoderMatchesWriter(std::string(kBlockSize * 2 + 123, 'f'), 0);
 }
 
-TEST(LogWriterTest, SharedEncoderMatchesWriterForShortBlockTail)
-{
-	ExpectEncoderMatchesWriter("tail rollover", kBlockSize - 3);
-}
+TEST(LogWriterTest, SharedEncoderMatchesWriterForShortBlockTail) { ExpectEncoderMatchesWriter("tail rollover", kBlockSize - 3); }
