@@ -65,10 +65,22 @@ namespace prism
 		std::atomic<uint64_t> write_groups_completed{ 0 };
 		std::atomic<uint64_t> write_group_requests_total{ 0 };
 		std::atomic<uint64_t> write_group_bytes_total{ 0 };
+		std::atomic<uint64_t> write_plan_mutex_wait_total_us{ 0 };
+		std::atomic<uint64_t> write_make_room_total_us{ 0 };
 		std::atomic<uint64_t> write_plan_mutex_total_us{ 0 };
 		std::atomic<uint64_t> write_plan_mutex_count{ 0 };
+		std::atomic<uint64_t> write_imm_wait_total_us{ 0 };
+		std::atomic<uint64_t> write_imm_wait_count{ 0 };
+		std::atomic<uint64_t> write_imm_wait_max_us{ 0 };
+		std::atomic<uint64_t> write_l0_wait_total_us{ 0 };
+		std::atomic<uint64_t> write_l0_wait_count{ 0 };
+		std::atomic<uint64_t> write_slowdown_total_us{ 0 };
+		std::atomic<uint64_t> write_slowdown_count{ 0 };
+		std::atomic<uint64_t> write_memtable_rotation_total_us{ 0 };
+		std::atomic<uint64_t> write_memtable_rotation_count{ 0 };
 		std::atomic<uint64_t> write_apply_total_us{ 0 };
 		std::atomic<uint64_t> write_apply_count{ 0 };
+		std::atomic<uint64_t> write_apply_batch_iterations_total{ 0 };
 		std::atomic<uint64_t> write_publish_mutex_total_us{ 0 };
 		std::atomic<uint64_t> write_publish_mutex_count{ 0 };
 		std::atomic<uint64_t> write_commit_total_us{ 0 };
@@ -78,6 +90,15 @@ namespace prism
 		// scheduled/completed by CompactionController.
 		std::atomic<uint64_t> compaction_jobs_submitted{ 0 };
 		std::atomic<uint64_t> compaction_jobs_completed{ 0 };
+		std::atomic<uint64_t> compaction_memtable_flush_count{ 0 };
+		std::atomic<uint64_t> compaction_memtable_flush_total_us{ 0 };
+		std::atomic<uint64_t> compaction_memtable_flush_max_us{ 0 };
+		std::atomic<uint64_t> compaction_level_count{ 0 };
+		std::atomic<uint64_t> compaction_level_total_us{ 0 };
+		std::atomic<uint64_t> compaction_level_max_us{ 0 };
+		std::atomic<uint64_t> compaction_trivial_move_count{ 0 };
+		std::atomic<uint64_t> compaction_in_job_flush_count{ 0 };
+		std::atomic<uint64_t> compaction_in_job_flush_total_us{ 0 };
 
 		// Scheduler-aware counters. Updates are compiled only with
 		// PRISM_RUNTIME_METRICS so the default scheduler hot path is uninstrumented.

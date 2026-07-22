@@ -79,6 +79,15 @@ namespace prism
 			return static_cast<uint64_t>(
 			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
 		}
+
+		void RecordMax(std::atomic<uint64_t>& target, uint64_t candidate)
+		{
+			uint64_t observed = target.load(std::memory_order_relaxed);
+			while (candidate > observed
+			    && !target.compare_exchange_weak(observed, candidate, std::memory_order_relaxed, std::memory_order_relaxed))
+			{
+			}
+		}
 #endif
 
 		Status BuildTable(const std::string& dbname, Env* env, const Options& options, TableCache* table_cache, uint64_t file_number,
@@ -825,6 +834,7 @@ namespace prism
 		writer = std::exchange(other.writer, nullptr);
 		file = std::exchange(other.file, nullptr);
 		commit_target = std::exchange(other.commit_target, nullptr);
+		commit_batch = std::move(other.commit_batch);
 		sync = std::exchange(other.sync, false);
 		visible_sequence = std::exchange(other.visible_sequence, 0);
 	}
@@ -837,6 +847,7 @@ namespace prism
 			writer = std::exchange(other.writer, nullptr);
 			file = std::exchange(other.file, nullptr);
 			commit_target = std::exchange(other.commit_target, nullptr);
+			commit_batch = std::move(other.commit_batch);
 			sync = std::exchange(other.sync, false);
 			visible_sequence = std::exchange(other.visible_sequence, 0);
 		}
@@ -1479,6 +1490,49 @@ namespace prism
 			total_output_bytes = 0;
 		};
 
+		// The compaction executor is deliberately single-lane so MANIFEST edits
+		// remain serialized. A level compaction can nevertheless yield at a key
+		// boundary and flush imm_ on the same lane, keeping writers from waiting
+		// for the entire level job. Obsolete-file removal is deferred because
+		// completed outputs in |outputs| are not installed in a Version yet.
+		auto flush_immutable_if_requested = [&]() -> Status {
+			if (!immutable_flush_requested_.load(std::memory_order_acquire))
+			{
+				return Status::OK();
+			}
+
+			mutex_.lock();
+			Status flush_status = Status::OK();
+			if (imm_ == nullptr)
+			{
+				// The request was satisfied before this checkpoint.
+				immutable_flush_requested_.store(false, std::memory_order_release);
+			}
+			else if (!bg_error_.ok())
+			{
+				flush_status = bg_error_;
+			}
+			else if (!shutting_down_.load(std::memory_order_acquire) && !stop_token.StopRequested())
+			{
+#ifdef PRISM_RUNTIME_METRICS
+				const auto flush_start = std::chrono::steady_clock::now();
+#endif
+				CompactMemTable(false);
+				flush_status = bg_error_;
+#ifdef PRISM_RUNTIME_METRICS
+				const uint64_t flush_us = ElapsedUs(flush_start);
+				auto& metrics = RuntimeMetrics::Instance();
+				metrics.compaction_memtable_flush_count.fetch_add(1, std::memory_order_relaxed);
+				metrics.compaction_memtable_flush_total_us.fetch_add(flush_us, std::memory_order_relaxed);
+				RecordMax(metrics.compaction_memtable_flush_max_us, flush_us);
+				metrics.compaction_in_job_flush_count.fetch_add(1, std::memory_order_relaxed);
+				metrics.compaction_in_job_flush_total_us.fetch_add(flush_us, std::memory_order_relaxed);
+#endif
+			}
+			mutex_.unlock();
+			return flush_status;
+		};
+
 		// Per-key tracking state for oldest-live-snapshot-aware drop decisions.
 		std::string current_user_key;
 		bool has_current_user_key = false;
@@ -1491,6 +1545,14 @@ namespace prism
 			{
 				stopped = true;
 				break;
+			}
+
+			status = flush_immutable_if_requested();
+			if (!status.ok())
+			{
+				cancel_outputs();
+				mutex_.lock();
+				return status;
 			}
 
 			if (compaction->ShouldStopBefore(input->key()) && output.IsOpen())
@@ -1638,7 +1700,7 @@ namespace prism
 		return status;
 	}
 
-	void DBImpl::CompactMemTable()
+	void DBImpl::CompactMemTable(bool remove_obsolete_files)
 	{
 		assert(imm_ != nullptr);
 		VersionEdit edit;
@@ -1664,8 +1726,16 @@ namespace prism
 		{
 			imm_->Unref();
 			imm_ = nullptr;
+			immutable_flush_requested_.store(false, std::memory_order_release);
 			InstallSuperVersion();
-			RemoveObsoleteFiles();
+			// Let a blocked writer rotate its full mutable memtable as soon as the
+			// flushed SST is visible. RemoveObsoleteFiles may release mutex_, so the
+			// notification must precede it.
+			background_work_finished_signal_.notify_all();
+			if (remove_obsolete_files)
+			{
+				RemoveObsoleteFiles();
+			}
 		}
 		else
 		{
@@ -1716,7 +1786,17 @@ namespace prism
 			{
 				return;
 			}
+#ifdef PRISM_RUNTIME_METRICS
+			const auto flush_start = std::chrono::steady_clock::now();
+#endif
 			CompactMemTable();
+#ifdef PRISM_RUNTIME_METRICS
+			const uint64_t flush_us = ElapsedUs(flush_start);
+			auto& metrics = RuntimeMetrics::Instance();
+			metrics.compaction_memtable_flush_count.fetch_add(1, std::memory_order_relaxed);
+			metrics.compaction_memtable_flush_total_us.fetch_add(flush_us, std::memory_order_relaxed);
+			RecordMax(metrics.compaction_memtable_flush_max_us, flush_us);
+#endif
 			return;
 		}
 
@@ -1726,9 +1806,15 @@ namespace prism
 			return;
 		}
 
+#ifdef PRISM_RUNTIME_METRICS
+		const auto level_start = std::chrono::steady_clock::now();
+#endif
 		Status s;
 		if (compaction->IsTrivialMove())
 		{
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().compaction_trivial_move_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 			if (stop_token.StopRequested())
 			{
 				compaction->ReleaseInputs();
@@ -1775,6 +1861,13 @@ namespace prism
 			}
 		}
 
+#ifdef PRISM_RUNTIME_METRICS
+		const uint64_t level_us = ElapsedUs(level_start);
+		auto& metrics = RuntimeMetrics::Instance();
+		metrics.compaction_level_count.fetch_add(1, std::memory_order_relaxed);
+		metrics.compaction_level_total_us.fetch_add(level_us, std::memory_order_relaxed);
+		RecordMax(metrics.compaction_level_max_us, level_us);
+#endif
 		compaction->ReleaseInputs();
 		if (!s.ok())
 		{
@@ -1810,18 +1903,42 @@ namespace prism
 			}
 			if (allow_delay && static_cast<int>(versions_->current()->files(0).size()) >= config::kL0_SlowdownWritesTrigger)
 			{
+#ifdef PRISM_RUNTIME_METRICS
+				const auto wait_start = std::chrono::steady_clock::now();
+#endif
 				lock.unlock();
 				env_->SleepForMicroseconds(1000);
 				allow_delay = false;
 				lock.lock();
+#ifdef PRISM_RUNTIME_METRICS
+				RuntimeMetrics::Instance().write_slowdown_total_us.fetch_add(ElapsedUs(wait_start), std::memory_order_relaxed);
+				RuntimeMetrics::Instance().write_slowdown_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 			}
 			else if (imm_ != nullptr)
 			{
+#ifdef PRISM_RUNTIME_METRICS
+				const auto wait_start = std::chrono::steady_clock::now();
+#endif
 				background_work_finished_signal_.wait(lock);
+#ifdef PRISM_RUNTIME_METRICS
+				const uint64_t waited_us = ElapsedUs(wait_start);
+				auto& metrics = RuntimeMetrics::Instance();
+				metrics.write_imm_wait_total_us.fetch_add(waited_us, std::memory_order_relaxed);
+				RuntimeMetrics::Instance().write_imm_wait_count.fetch_add(1, std::memory_order_relaxed);
+				RecordMax(metrics.write_imm_wait_max_us, waited_us);
+#endif
 			}
 			else if (static_cast<int>(versions_->current()->files(0).size()) >= config::kL0_StopWritesTrigger)
 			{
+#ifdef PRISM_RUNTIME_METRICS
+				const auto wait_start = std::chrono::steady_clock::now();
+#endif
 				background_work_finished_signal_.wait(lock);
+#ifdef PRISM_RUNTIME_METRICS
+				RuntimeMetrics::Instance().write_l0_wait_total_us.fetch_add(ElapsedUs(wait_start), std::memory_order_relaxed);
+				RuntimeMetrics::Instance().write_l0_wait_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 			}
 			else if (!force && mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)
 			{
@@ -1829,6 +1946,9 @@ namespace prism
 			}
 			else
 			{
+#ifdef PRISM_RUNTIME_METRICS
+				const auto rotation_start = std::chrono::steady_clock::now();
+#endif
 				// TODO(wal-rotation): WAL rotation will publish new epoch under mutex, then hand
 				//   old LogFileGuard to a background close path. The invariant is: at most one
 				//   retired recovery-live WAL exists at any time (single-imm model).
@@ -1859,11 +1979,17 @@ namespace prism
 				}
 
 				imm_ = mem_;
+				immutable_flush_requested_.store(true, std::memory_order_release);
 				mem_ = new MemTable(internal_comparator_);
 				mem_->Ref();
 				InstallSuperVersion();
 				force = false;
 				MaybeScheduleCompaction();
+#ifdef PRISM_RUNTIME_METRICS
+				RuntimeMetrics::Instance().write_memtable_rotation_total_us.fetch_add(
+				    ElapsedUs(rotation_start), std::memory_order_relaxed);
+				RuntimeMetrics::Instance().write_memtable_rotation_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 				break;
 			}
 		}
@@ -2358,22 +2484,34 @@ namespace prism
 		}
 
 		{
+#ifdef PRISM_RUNTIME_METRICS
+			const auto mutex_wait_start = std::chrono::steady_clock::now();
+#endif
 			std::unique_lock<std::shared_mutex> lock(mutex_);
 #ifdef PRISM_RUNTIME_METRICS
-			const auto mutex_start = std::chrono::steady_clock::now();
+			RuntimeMetrics::Instance().write_plan_mutex_wait_total_us.fetch_add(
+			    ElapsedUs(mutex_wait_start), std::memory_order_relaxed);
+			const auto make_room_start = std::chrono::steady_clock::now();
 #endif
 
 			Status s = MakeRoomForWrite(false, lock);
 #ifdef PRISM_RUNTIME_METRICS
-			RuntimeMetrics::Instance().write_plan_mutex_total_us.fetch_add(ElapsedUs(mutex_start), std::memory_order_relaxed);
+			RuntimeMetrics::Instance().write_make_room_total_us.fetch_add(ElapsedUs(make_room_start), std::memory_order_relaxed);
 			RuntimeMetrics::Instance().write_plan_mutex_count.fetch_add(1, std::memory_order_relaxed);
+			const auto mutex_start = std::chrono::steady_clock::now();
 #endif
 			if (!s.ok())
 			{
+#ifdef PRISM_RUNTIME_METRICS
+				RuntimeMetrics::Instance().write_plan_mutex_total_us.fetch_add(ElapsedUs(mutex_start), std::memory_order_relaxed);
+#endif
 				return s;
 			}
 			if (log_file_guard_ == nullptr || log_file_guard_->writer() == nullptr || log_file_guard_->file() == nullptr)
 			{
+#ifdef PRISM_RUNTIME_METRICS
+				RuntimeMetrics::Instance().write_plan_mutex_total_us.fetch_add(ElapsedUs(mutex_start), std::memory_order_relaxed);
+#endif
 				return Status::InvalidArgument("log file not open");
 			}
 
@@ -2399,11 +2537,15 @@ namespace prism
 			plan->writer = log_file_guard_->writer();
 			plan->file = log_file_guard_->file();
 			plan->CaptureCommitTarget(mem_);
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().write_plan_mutex_total_us.fetch_add(ElapsedUs(mutex_start), std::memory_order_relaxed);
+#endif
 		}
+		plan->commit_batch = std::move(*merged);
 		return Status::OK();
 	}
 
-	void DBImpl::StartWritePlanForCoordinator(const WritePlan& plan, WriteBatch merged, std::function<void(Status)> completion)
+	void DBImpl::StartWritePlanForCoordinator(const WritePlan& plan, std::function<void(Status)> completion)
 	{
 		if (plan.writer == nullptr || plan.file == nullptr || async_wal_writer_ == nullptr)
 		{
@@ -2411,7 +2553,7 @@ namespace prism
 			return;
 		}
 
-		Slice record = WriteBatchInternal::Contents(&merged);
+		Slice record = WriteBatchInternal::Contents(&plan.commit_batch);
 		async_wal_writer_->Write(*plan.file, *plan.writer, record, plan.sync, std::move(completion));
 	}
 
@@ -2431,21 +2573,16 @@ namespace prism
 #ifdef PRISM_RUNTIME_METRICS
 			const auto apply_start = std::chrono::steady_clock::now();
 #endif
+			if (WriteBatchInternal::Count(&plan.commit_batch) != 0)
+			{
+#ifdef PRISM_RUNTIME_METRICS
+				RuntimeMetrics::Instance().write_apply_batch_iterations_total.fetch_add(1, std::memory_order_relaxed);
+#endif
+				apply_status = ApplyBatch(plan.commit_batch, plan.commit_target);
+			}
 			for (WriteRequestState* request : requests)
 			{
-				if (WriteBatchInternal::Count(&request->batch) == 0)
-				{
-					request->status = Status::OK();
-					continue;
-				}
-
-				Status s = ApplyBatch(request->batch, plan.commit_target);
-				request->status = s;
-				if (!s.ok())
-				{
-					apply_status = std::move(s);
-					break;
-				}
+				request->status = apply_status;
 			}
 #ifdef PRISM_RUNTIME_METRICS
 			RuntimeMetrics::Instance().write_apply_total_us.fetch_add(ElapsedUs(apply_start), std::memory_order_relaxed);

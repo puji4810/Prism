@@ -42,6 +42,7 @@ namespace prism
 				blocking_wait->done = true;
 			}
 			blocking_wait->cv.notify_one();
+			return;
 		}
 
 		int expected = kSubmitting;
@@ -248,21 +249,27 @@ namespace prism
 #ifdef PRISM_RUNTIME_METRICS
 		RuntimeMetrics::Instance().write_groups_completed.fetch_add(1, std::memory_order_relaxed);
 		RuntimeMetrics::Instance().write_group_requests_total.fetch_add(group.size(), std::memory_order_relaxed);
-		RuntimeMetrics::Instance().write_group_bytes_total.fetch_add(merged.ApproximateSize(), std::memory_order_relaxed);
+		RuntimeMetrics::Instance().write_group_bytes_total.fetch_add(plan.commit_batch.ApproximateSize(), std::memory_order_relaxed);
 #endif
 		if (!s.ok() || plan.visible_sequence == 0)
 		{
-			const bool should_continue = FinishGroup();
-			CompleteGroup(std::move(group), std::move(s));
-			if (should_continue)
-			{
-				Drain();
-			}
+			// Keep synchronous planning failures ordered behind the group whose
+			// completion is currently being published. This also lets Drain() be
+			// called below to start the next WAL before completing the prior group
+			// without allowing a later failed group to complete first.
+			executor_.Submit([this, group = std::move(group), status = std::move(s)]() mutable {
+				const bool should_continue = FinishGroup();
+				CompleteGroup(std::move(group), std::move(status));
+				if (should_continue)
+				{
+					Drain();
+				}
+			});
 			return;
 		}
 
 		auto plan_state = std::make_shared<DBImpl::WritePlan>(std::move(plan));
-		db_.StartWritePlanForCoordinator(*plan_state, std::move(merged), [this, group = std::move(group), plan_state](Status wal_status) mutable {
+		db_.StartWritePlanForCoordinator(*plan_state, [this, group = std::move(group), plan_state](Status wal_status) mutable {
 			executor_.Submit([this, group = std::move(group), plan_state, wal_status = std::move(wal_status)]() mutable {
 				Status group_status = std::move(wal_status);
 				if (group_status.ok())
@@ -274,11 +281,14 @@ namespace prism
 					db_.RecordWriteFailureForCoordinator(group_status);
 				}
 				const bool should_continue = FinishGroup();
-				CompleteGroup(std::move(group), std::move(group_status));
 				if (should_continue)
 				{
+					// Reserve and submit the next WAL group before resuming up to
+					// kMaxGroupRequests client coroutines. Their continuation work then
+					// overlaps the next append instead of leaving the WAL lane idle.
 					Drain();
 				}
+				CompleteGroup(std::move(group), std::move(group_status));
 			});
 		});
 	}

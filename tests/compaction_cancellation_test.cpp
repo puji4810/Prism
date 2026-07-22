@@ -188,6 +188,22 @@ namespace
 		AddTableFile(db, db->TEST_DBName(), 0, { TableEntry{ "c", 1, kTypeValue, "vc2" }, TableEntry{ "f", 1, kTypeValue, "vf2" } });
 		AddTableFile(db, db->TEST_DBName(), 0, { TableEntry{ "d", 0, kTypeValue, "vd3" }, TableEntry{ "g", 1, kTypeValue, "vg3" } });
 	}
+
+	void AddLargeCompactionInputs(DBImpl* db)
+	{
+		for (int file = 0; file < 4; ++file)
+		{
+			std::vector<TableEntry> entries;
+			entries.reserve(512);
+			for (int key = 0; key < 512; ++key)
+			{
+				entries.push_back(TableEntry{ "compaction_key_" + std::to_string(key),
+				    static_cast<SequenceNumber>(4 - file), kTypeValue,
+				    std::string(64, static_cast<char>('a' + file)) });
+			}
+			AddTableFile(db, db->TEST_DBName(), 0, entries);
+		}
+	}
 }
 
 class CompactionCancellationTest: public ::testing::Test
@@ -200,6 +216,7 @@ protected:
 		std::filesystem::remove_all("test_running_compaction_cancel", ec);
 		std::filesystem::remove_all("test_writer_release_after_cancel", ec);
 		std::filesystem::remove_all("test_shutdown_quiescence_running_compaction", ec);
+		std::filesystem::remove_all("test_priority_flush_during_level_compaction", ec);
 	}
 
 	void SetUp() override
@@ -294,6 +311,36 @@ TEST_F(CompactionCancellationTest, RunningCompactionStopsAtCheckpoint)
 		EXPECT_FALSE(value.value().empty());
 	}
 }
+
+#ifdef PRISM_RUNTIME_METRICS
+TEST_F(CompactionCancellationTest, FlushesImmutableInsideRunningLevelCompaction)
+{
+	BlockingTableFileEnv env(Env::Default());
+	Options options;
+	options.env = &env;
+	options.create_if_missing = true;
+	options.write_buffer_size = 256;
+	options.block_size = 128;
+	options.max_file_size = 64 * 1024 * 1024;
+
+	auto open = DBImpl::OpenInternal(options, "test_priority_flush_during_level_compaction");
+	ASSERT_TRUE(open.has_value()) << open.error().ToString();
+	auto db = std::move(open.value());
+	auto* impl = db.get();
+
+	AddLargeCompactionInputs(impl);
+	env.EnableAppendBlock();
+	impl->TEST_ScheduleCompaction();
+	ASSERT_TRUE(env.WaitForBlockedAppend(5s));
+
+	FillUntilImmutable(impl, "priority_flush_seed_");
+	ASSERT_TRUE(impl->TEST_HasImmutableMemTable());
+	env.ReleaseBlockedAppend();
+
+	ASSERT_TRUE(WaitUntil([impl] { return !impl->TEST_HasImmutableMemTable(); }, 5s));
+	EXPECT_GE(RuntimeMetrics::Instance().compaction_in_job_flush_count.load(std::memory_order_relaxed), 1u);
+}
+#endif
 
 TEST_F(CompactionCancellationTest, MakeRoomForWriteStopRequestedReturnsIoError)
 {

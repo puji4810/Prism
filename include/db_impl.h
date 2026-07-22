@@ -184,6 +184,7 @@ namespace prism
 			log::Writer* writer = nullptr;
 			WritableFile* file = nullptr;
 			MemTable* commit_target = nullptr;
+			WriteBatch commit_batch;
 			bool sync = false;
 			SequenceNumber visible_sequence = 0;
 		};
@@ -217,7 +218,7 @@ namespace prism
 		AsyncWriteOp WriteAsync(
 		    const WriteOptions& options, WriteBatch batch, void* keep_alive, void (*release_keep_alive)(void*));
 		Status PlanWriteGroupForCoordinator(std::span<WriteRequestState* const> requests, WriteBatch* merged, WritePlan* plan);
-		void StartWritePlanForCoordinator(const WritePlan& plan, WriteBatch merged, std::function<void(Status)> completion);
+		void StartWritePlanForCoordinator(const WritePlan& plan, std::function<void(Status)> completion);
 		Status CommitWriteGroupForCoordinator(std::span<WriteRequestState* const> requests, const WritePlan& plan);
 		void RecordWriteFailureForCoordinator(const Status& status);
 		Status Recover();
@@ -230,7 +231,7 @@ namespace prism
 		void RecordBackgroundError(const Status& status);
 		void BackgroundCompaction(StopToken stop_token);
 		Status InstallCompactionResults(Compaction* compaction, const std::vector<FileMetaData>& outputs, uint64_t total_bytes);
-		void CompactMemTable();
+		void CompactMemTable(bool remove_obsolete_files = true);
 		Iterator* MakeInputIterator(Compaction* compaction);
 		Status DoCompactionWork(Compaction* compaction, StopToken stop_token, CompactionWorkResult* result);
 		Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base);
@@ -266,6 +267,9 @@ namespace prism
 
 		MemTable* mem_;
 		MemTable* imm_ = nullptr;
+		// Published by memtable rotation so a running level compaction can
+		// service the immutable table without waiting for its whole job to end.
+		std::atomic<bool> immutable_flush_requested_{ false };
 		std::atomic<SuperVersion*> super_version_{ nullptr };
 		std::vector<SuperVersion*> retired_super_versions_[2];
 		int retired_index_ = 0;
