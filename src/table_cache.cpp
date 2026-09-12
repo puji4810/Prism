@@ -142,21 +142,19 @@ namespace prism
 				        handle_result, completion = std::move(completion)]() mutable {
 					    Cache::Handle* opened = nullptr;
 					    Status open_status = FindTable(file_number, file_size, &opened);
-					    if (opened != nullptr)
-					    {
-						    cache_->Release(opened);
-					    }
+					    // The handle stays held across the executor hop: releasing it
+					    // here and re-looking-up on the CPU lane would open the same
+					    // table again whenever the entry is evicted in between.
 					    runtime.CpuExecutor().Submit(
-					        [this, &runtime, open_status, options = std::move(options), file_number, file_size,
-					            key = std::move(key), arg, handle_result, completion = std::move(completion)]() mutable {
+					        [this, &runtime, open_status, opened, options = std::move(options), key = std::move(key), arg,
+					            handle_result, completion = std::move(completion)]() mutable {
 						        if (!open_status.ok())
 						        {
 							        completion(open_status);
 							        return;
 						        }
-						        GetAsyncCallback(
-						            runtime, std::move(options), file_number, file_size, std::move(key), arg, handle_result,
-						            std::move(completion));
+						        GetAsyncWithHandle(
+						            runtime, opened, std::move(options), std::move(key), arg, handle_result, std::move(completion));
 					        });
 				    });
 				return;
@@ -169,6 +167,12 @@ namespace prism
 			}
 		}
 
+		GetAsyncWithHandle(runtime, handle, std::move(options), std::move(key), arg, handle_result, std::move(completion));
+	}
+
+	void TableCache::GetAsyncWithHandle(AsyncRuntime& runtime, Cache::Handle* handle, ReadOptions options, std::string key,
+	    void* arg, prism::Table::HandleResult handle_result, std::move_only_function<void(Status)> completion)
+	{
 		auto* entry = reinterpret_cast<TableCacheEntry*>(cache_->Value(handle));
 		entry->table()->InternalGetAsyncCallback(runtime, *entry->file(), std::move(options), std::move(key), arg, handle_result,
 		    [this, handle, completion = std::move(completion)](Status s) mutable {

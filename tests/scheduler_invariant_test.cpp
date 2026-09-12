@@ -37,12 +37,31 @@ static bool PollUntil(Pred pred, std::chrono::milliseconds timeout = 5000ms)
 // ---------------------------------------------------------------------------
 // INVARIANT 1: SelfSubmitRunsOnOwnWorker
 //
-// With peers still in their initial sleep and only one child, Submit() retains
-// local routing without dispatcher mediation. Larger backlogs can migrate.
+// With every peer latched inside a blocking job, the owner is the only worker
+// that can run its self-submitted child, so local routing is deterministic.
+// Stealing is pull-only: a peer blocked in a job can never take the child,
+// while a free peer legitimately may under the best-effort contract.
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, SelfSubmitRunsOnOwnWorker)
 {
 	CpuThreadPool scheduler(4);
+
+	// Occupy all but one worker; the free worker then owns the outer job and
+	// its child whether it receives the outer directly or steals it.
+	constexpr int kLatchJobs = 3;
+	std::counting_semaphore<kLatchJobs> peers_held(0), release_peers(0);
+	for (int i = 0; i < kLatchJobs; ++i)
+	{
+		scheduler.Submit([&] {
+			peers_held.release();
+			release_peers.acquire();
+		});
+	}
+	bool held = true;
+	for (int i = 0; i < kLatchJobs; ++i)
+	{
+		held = peers_held.try_acquire_for(5s) && held;
+	}
 
 	std::atomic<bool> done{ false };
 	std::thread::id outer_tid;
@@ -57,7 +76,11 @@ TEST(SchedulerInvariantTest, SelfSubmitRunsOnOwnWorker)
 		});
 	});
 
-	ASSERT_TRUE(PollUntil([&] { return done.load(std::memory_order_acquire); })) << "Timed out waiting for self-submitted job";
+	const bool finished = PollUntil([&] { return done.load(std::memory_order_acquire); });
+	release_peers.release(kLatchJobs); // Always free the latched peers before asserting.
+
+	ASSERT_TRUE(held) << "latch jobs did not occupy the peer workers";
+	ASSERT_TRUE(finished) << "Timed out waiting for self-submitted job";
 
 	// The inner job must run on the same worker as the outer job.
 	EXPECT_EQ(outer_tid, inner_tid) << "Self-submit from worker must run on same worker thread (no dispatcher mediation)";
@@ -66,12 +89,28 @@ TEST(SchedulerInvariantTest, SelfSubmitRunsOnOwnWorker)
 // ---------------------------------------------------------------------------
 // INVARIANT 2: SubmitInPinnedTaskStaysOnWorker
 //
-// A small burst on a fresh pool retains local routing while peers sleep.
-// SubmitIn affinity is best effort; large backlogs may be shared or stolen.
+// With every peer latched inside a blocking job, a small SubmitIn burst stays
+// on the captured worker: peers blocked in jobs cannot steal, while free
+// peers legitimately could under the best-effort affinity contract.
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, SubmitInPinnedTaskStaysOnWorker)
 {
 	CpuThreadPool scheduler(4);
+
+	constexpr int kLatchJobs = 3;
+	std::counting_semaphore<kLatchJobs> peers_held(0), release_peers(0);
+	for (int i = 0; i < kLatchJobs; ++i)
+	{
+		scheduler.Submit([&] {
+			peers_held.release();
+			release_peers.acquire();
+		});
+	}
+	bool held = true;
+	for (int i = 0; i < kLatchJobs; ++i)
+	{
+		held = peers_held.try_acquire_for(5s) && held;
+	}
 
 	std::atomic<int> done_count{ 0 };
 	std::thread::id outer_tid;
@@ -97,8 +136,11 @@ TEST(SchedulerInvariantTest, SubmitInPinnedTaskStaysOnWorker)
 		}
 	});
 
-	ASSERT_TRUE(PollUntil([&] { return done_count.load(std::memory_order_acquire) == kAffinityJobs; }))
-	    << "Timed out waiting for affinity jobs";
+	const bool finished = PollUntil([&] { return done_count.load(std::memory_order_acquire) == kAffinityJobs; });
+	release_peers.release(kLatchJobs); // Always free the latched peers before asserting.
+
+	ASSERT_TRUE(held) << "latch jobs did not occupy the peer workers";
+	ASSERT_TRUE(finished) << "Timed out waiting for affinity jobs";
 
 	// Every single affinity job must have run on the same worker.
 	std::lock_guard lock(tids_mutex);
@@ -468,5 +510,41 @@ TEST(SchedulerInvariantTest, LocalBurstsRaceWithPeerSleepWithoutLosingWork)
 		const bool owner_returned = owner_done.try_acquire_for(2s);
 		ASSERT_TRUE(drained) << "burst " << round;
 		ASSERT_TRUE(owner_returned);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a worker that was never notified must still reach the idle
+// rescan loop. The single child stays below the share threshold, so only a
+// peer rescan can move it off the blocked owner's queue — previously a
+// never-woken peer blocked on its initial acquire forever.
+// ---------------------------------------------------------------------------
+TEST(SchedulerInvariantTest, NeverWokenPeerRescuesChildOfBlockedOwner)
+{
+	CpuThreadPool scheduler(4);
+
+	std::binary_semaphore owner_blocked(0), release_owner(0), child_done(0);
+	std::thread::id owner_tid;
+	std::thread::id child_tid;
+
+	scheduler.Submit([&] {
+		owner_tid = std::this_thread::get_id();
+		scheduler.Submit([&] {
+			child_tid = std::this_thread::get_id();
+			child_done.release();
+		});
+		owner_blocked.release();
+		release_owner.acquire();
+	});
+
+	ASSERT_TRUE(owner_blocked.try_acquire_for(5s));
+	// The owner cannot pop its own queue while blocked inside the job.
+	const bool rescued = child_done.try_acquire_for(2s);
+	release_owner.release(); // Unblock the owner even on failure, so a broken rescan fails rather than hangs.
+
+	EXPECT_TRUE(rescued) << "child stayed queued behind the blocked owner — a never-woken peer never reached the rescan loop";
+	if (rescued)
+	{
+		EXPECT_NE(child_tid, owner_tid) << "child ran on the blocked owner instead of migrating";
 	}
 }

@@ -304,6 +304,26 @@ namespace prism::tests
 		    << "compaction-lane work produced wrong result — possible lost wakeup or double-execution";
 	}
 
+// Regression: a worker that was never notified must still reach the idle
+// rescan loop. The lone child stays below the share threshold, so only a
+// peer rescan can move it off the blocked owner's queue — previously a
+// never-woken peer blocked on its initial acquire forever.
+TEST(RuntimeLaneTest, BlockingFreshPoolNeverWokenPeerRescuesStrandedChild)
+{
+	std::binary_semaphore owner_blocked(0), release_owner(0), child_done(0);
+	BlockingExecutor executor(4);
+	executor.Submit([&] {
+		executor.Submit([&] { child_done.release(); });
+		owner_blocked.release();
+		release_owner.acquire();
+	});
+	ASSERT_TRUE(owner_blocked.try_acquire_for(5s));
+	// The owner cannot drain its own shard while blocked inside the job.
+	const bool rescued = child_done.try_acquire_for(2s);
+	release_owner.release(); // Unblock the owner even on failure, so a broken rescan fails rather than hangs.
+	EXPECT_TRUE(rescued) << "child stayed queued behind the blocked owner — a never-woken peer never reached the rescan loop";
+}
+
 TEST(RuntimeLaneTest, BlockingFanoutWakesSleepingPeers)
 {
 	constexpr int kJobs = 1024;
@@ -371,6 +391,39 @@ TEST(RuntimeLaneTest, LaneThreadBudgetBelowMinimumKeepsMinimumLanes)
 	EXPECT_EQ(runtime.LaneThreadCount(), 5);
 	EXPECT_EQ(runtime.DbReadExecutor().WorkerCount(), 1);
 	EXPECT_EQ(runtime.BlockingIoExecutor().WorkerCount(), 1);
+}
+
+// Regression: a requested 0 still costs one worker (lanes clamp to a single
+// thread), so the budget comparison must use normalized counts — raw
+// 0+8+3=11>8 looks fine only if the request is left unnormalized, spawning
+// 1+8+3 threads. The scaled split must also keep read at one worker minimum
+// without exceeding the budget.
+TEST(RuntimeLaneTest, LaneThreadBudgetNormalizesZeroLaneRequests)
+{
+	CpuThreadPool scheduler(2);
+
+	{
+		AsyncRuntimeOptions options;
+		options.db_read_threads = 0;
+		options.blocking_io_threads = 8;
+		options.max_lane_threads = 8;
+		AsyncRuntime runtime(scheduler, options);
+
+		EXPECT_EQ(runtime.LaneThreadCount(), 8);
+		EXPECT_EQ(runtime.DbReadExecutor().WorkerCount(), 1);
+		EXPECT_EQ(runtime.BlockingIoExecutor().WorkerCount(), 4);
+	}
+	{
+		AsyncRuntimeOptions options;
+		options.db_read_threads = 0;
+		options.blocking_io_threads = 4;
+		options.max_lane_threads = 7;
+		AsyncRuntime runtime(scheduler, options);
+
+		EXPECT_EQ(runtime.LaneThreadCount(), 7);
+		EXPECT_EQ(runtime.DbReadExecutor().WorkerCount(), 1);
+		EXPECT_EQ(runtime.BlockingIoExecutor().WorkerCount(), 3);
+	}
 }
 
 } // namespace prism::tests

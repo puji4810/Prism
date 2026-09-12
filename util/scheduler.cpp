@@ -52,7 +52,7 @@ namespace prism
 
 	CpuThreadPool::CpuThreadPool(std::size_t num_threads)
 	    : work_threads_(DefaultThreadCount(num_threads))
-	    , idle_workers_(work_threads_.size())
+	    , idle_workers_(0)
 	{
 		for (std::size_t i = 0; i < work_threads_.size(); ++i)
 		{
@@ -488,8 +488,9 @@ namespace prism
 		current_worker_index_ = worker_index;
 		std::uint64_t rng_state = (static_cast<std::uint64_t>(worker_index) + 1) * 0x9e3779b97f4a7c15ull;
 
-		semaphore_.acquire();
-
+		// No initial acquire: the worker scans and registers itself before
+		// waiting, so a worker that was never notified still reaches the
+		// rescan loop instead of blocking on a token that may never come.
 		while (true)
 		{
 			QueuedJob queued;

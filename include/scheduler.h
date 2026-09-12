@@ -208,6 +208,10 @@ namespace prism
 		//   registers waiting_ under mutex_ before its final work scan; a
 		//   producer that observes waiting_ releases exactly one token. Wakeups
 		//   cost one release per sleep transition, not one token per queued job.
+		//   Workers start unregistered: the worker thread itself performs the
+		//   first scan before registering, so a worker that has never been
+		//   notified still reaches the rescan wait instead of blocking on a
+		//   token that may never come.
 		// - TakeBatchFrom moves a bounded batch between two locked shards and is
 		//   shared by work stealing and proactive backlog sharing.
 		template <typename Element>
@@ -216,7 +220,7 @@ namespace prism
 			std::mutex mutex_;
 			std::deque<Element> queue_;
 			std::atomic<std::size_t> load_{ 0 };
-			std::atomic<bool> waiting_{ true };
+			std::atomic<bool> waiting_{ false };
 			std::binary_semaphore semaphore_{ 0 };
 
 			std::size_t Load() const noexcept { return load_.load(std::memory_order_relaxed); }
@@ -668,8 +672,8 @@ namespace prism
 		}
 
 		std::vector<WorkThread> work_threads_;
-		// Initially every worker waits for its first notification. Updated only
-		// when waiting_ transitions under that worker's queue mutex.
+		// Workers currently registered for sleep. Updated only when waiting_
+		// transitions under that worker's queue mutex.
 		std::atomic<std::size_t> idle_workers_;
 		std::atomic<std::size_t> submit_cursor_{ 0 };
 

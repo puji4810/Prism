@@ -53,6 +53,10 @@ namespace prism
 		Status FindTable(uint64_t file_number, uint64_t file_size, Cache::Handle**);
 		// Cache-only lookup; returns nullptr on a miss without touching the filesystem.
 		Cache::Handle* LookupTable(uint64_t file_number);
+		// Runs the read with a cache handle that stays held until the read
+		// completes, so the entry can be evicted but never reopened mid-read.
+		void GetAsyncWithHandle(AsyncRuntime& runtime, Cache::Handle* handle, ReadOptions options, std::string key, void* arg,
+		    prism::Table::HandleResult handle_result, std::move_only_function<void(Status)> completion);
 
 		Env* const env_;
 		const std::string dbname_;

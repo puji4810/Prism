@@ -8,8 +8,13 @@
 #include "comparator.h"
 #include "iterator.h"
 #include "filename.h"
+#include "scheduler.h"
+#include "async_runtime.h"
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
+#include <semaphore>
 #include <vector>
 
 using namespace prism;
@@ -78,6 +83,25 @@ namespace
 			}
 			return false;
 		}
+	};
+
+	// Counts table-file opens so tests can assert a cold open happened exactly
+	// once even when the cached entry is evicted mid-read.
+	class CountingOpenEnv: public EnvWrapper
+	{
+	public:
+		explicit CountingOpenEnv(Env* target)
+		    : EnvWrapper(target)
+		{
+		}
+
+		Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& filename) override
+		{
+			opens.fetch_add(1, std::memory_order_relaxed);
+			return target()->NewRandomAccessFile(filename);
+		}
+
+		std::atomic<int> opens{ 0 };
 	};
 }
 
@@ -419,4 +443,66 @@ TEST_F(TableCacheOwnershipTest, IteratorKeepsTableAliveAfterEvict)
 	EXPECT_FALSE(iter->Valid());
 
 	// Iterator destruction will release the cache handle
+}
+
+// Regression: a cold-opened table handle must stay held across the
+// blocking-lane -> CPU-executor hop. Evicting the entry in that window must
+// not make the continuation miss the cache and open the same table again.
+TEST_F(TableCacheOwnershipTest, ColdOpenHandleSurvivesEvictionBeforeContinuation)
+{
+	using namespace std::chrono_literals;
+
+	CountingOpenEnv env(env_);
+	Options options;
+	options.comparator = BytewiseComparator();
+	options.env = &env;
+
+	CpuThreadPool scheduler(2);
+	AsyncRuntimeOptions runtime_options;
+	runtime_options.blocking_io_threads = 1; // One worker makes the fence below strictly ordered after the open job.
+	AsyncRuntime runtime(scheduler, runtime_options);
+	TableCache cache(dbname_.string(), options, 8);
+
+	// Hold every CPU worker so the post-open continuation cannot run yet.
+	std::counting_semaphore<2> cpu_held(0), release_cpu(0);
+	for (int i = 0; i < 2; ++i)
+	{
+		scheduler.Submit([&] {
+			cpu_held.release();
+			release_cpu.acquire();
+		});
+	}
+	bool held = true;
+	for (int i = 0; i < 2; ++i)
+	{
+		held = cpu_held.try_acquire_for(5s) && held;
+	}
+
+	std::binary_semaphore open_done(0), done(0);
+	std::string value;
+	Status status;
+	cache.GetAsyncCallback(runtime, ReadOptions(), file_number_, file_size_, "key2", &value,
+	    [](void* out, const Slice&, const Slice& v) {
+		    *static_cast<std::string*>(out) = v.ToString();
+		    return Status::OK();
+	    },
+	    [&](Status s) {
+		    status = s;
+		    done.release();
+	    });
+
+	// The single blocking-io worker runs this fence only after the open job
+	// has queued its CPU continuation — the eviction window under test.
+	runtime.BlockingIoExecutor().Submit([&] { open_done.release(); });
+	const bool opened = open_done.try_acquire_for(5s);
+	cache.Evict(file_number_);
+	release_cpu.release(2);
+	const bool finished = done.try_acquire_for(5s);
+
+	ASSERT_TRUE(held) << "latch jobs did not occupy the CPU workers";
+	ASSERT_TRUE(opened) << "cold open did not complete on the blocking lane";
+	ASSERT_TRUE(finished) << "async read did not complete";
+	EXPECT_TRUE(status.ok());
+	EXPECT_EQ(value, "value2");
+	EXPECT_EQ(env.opens.load(), 1) << "the table was reopened after eviction — the cold-open handle did not survive the executor hop";
 }

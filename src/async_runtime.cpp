@@ -86,14 +86,18 @@ namespace prism
 		// scaled down proportionally while the serial lanes stay dedicated.
 		std::pair<std::size_t, std::size_t> ResolveLaneThreads(const AsyncRuntimeOptions& options)
 		{
-			std::size_t read = options.db_read_threads != kDefaultLaneThreads ? options.db_read_threads : options.db_threads;
-			std::size_t io = options.blocking_io_threads;
+			// Lanes never run with zero workers (the executor clamps to one), so
+			// normalize before comparing against the budget — a requested 0 still
+			// costs a thread.
+			std::size_t read = std::max<std::size_t>(options.db_read_threads != kDefaultLaneThreads ? options.db_read_threads : options.db_threads, 1);
+			std::size_t io = std::max<std::size_t>(options.blocking_io_threads, 1);
 			if (options.max_lane_threads != 0 && read + io + kSerialLaneThreads > options.max_lane_threads)
 			{
 				const std::size_t parallel = std::max(options.max_lane_threads, kMinLaneThreads) - kSerialLaneThreads;
-				const std::size_t want = read + io;
-				io = want == 0 ? 1 : std::max<std::size_t>(1, (parallel * io) / want);
-				read = std::max<std::size_t>(1, parallel - io);
+				// The scaled io share is clamped into [1, parallel-1] so read
+				// keeps at least one worker and the pair never exceeds budget.
+				io = std::clamp<std::size_t>((parallel * io) / (read + io), 1, parallel - 1);
+				read = parallel - io;
 			}
 			return { read, io };
 		}
@@ -125,7 +129,6 @@ namespace prism
 		{
 			shards_.push_back(std::make_unique<Shard>());
 		}
-		idle_workers_.store(actual_threads, std::memory_order_relaxed);
 		workers_.reserve(actual_threads);
 		for (std::size_t i = 0; i < actual_threads; ++i)
 		{
@@ -352,7 +355,9 @@ namespace prism
 			}
 		};
 
-		shard.semaphore_.acquire();
+		// No initial acquire: the worker scans and registers itself before
+		// waiting, so a worker that was never notified still reaches the
+		// rescan loop instead of blocking on a token that may never come.
 		while (true)
 		{
 			Job job;
