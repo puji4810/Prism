@@ -45,6 +45,13 @@ namespace prism
 
 	TableCache::~TableCache() { delete cache_; }
 
+	Cache::Handle* TableCache::LookupTable(uint64_t file_number)
+	{
+		char buf[sizeof(file_number)];
+		EncodeFixed64(buf, file_number);
+		return cache_->Lookup(Slice(buf, sizeof(buf)));
+	}
+
 	Status TableCache::FindTable(uint64_t file_number, uint64_t file_size, Cache::Handle** handle)
 	{
 		Status s;
@@ -119,12 +126,47 @@ namespace prism
 	void TableCache::GetAsyncCallback(AsyncRuntime& runtime, ReadOptions options, uint64_t file_number, uint64_t file_size, std::string key,
 	    void* arg, prism::Table::HandleResult handle_result, std::move_only_function<void(Status)> completion)
 	{
-		Cache::Handle* handle = nullptr;
-		Status s = FindTable(file_number, file_size, &handle);
-		if (!s.ok())
+		Cache::Handle* handle = LookupTable(file_number);
+		if (handle == nullptr)
 		{
-			completion(s);
-			return;
+			// A cold open issues synchronous file open/metadata I/O. It may run
+			// inline on the blocking-tolerant lanes, but never on a CPU worker:
+			// hop to the blocking-I/O lane and resume the read on the CPU
+			// executor so per-table continuations stay on their own lane.
+			const bool on_blocking_lane
+			    = runtime.DbReadExecutor().IsCurrentWorker() || runtime.BlockingIoExecutor().IsCurrentWorker();
+			if (!on_blocking_lane)
+			{
+				runtime.BlockingIoExecutor().Submit(
+				    [this, &runtime, file_number, file_size, options = std::move(options), key = std::move(key), arg,
+				        handle_result, completion = std::move(completion)]() mutable {
+					    Cache::Handle* opened = nullptr;
+					    Status open_status = FindTable(file_number, file_size, &opened);
+					    if (opened != nullptr)
+					    {
+						    cache_->Release(opened);
+					    }
+					    runtime.CpuExecutor().Submit(
+					        [this, &runtime, open_status, options = std::move(options), file_number, file_size,
+					            key = std::move(key), arg, handle_result, completion = std::move(completion)]() mutable {
+						        if (!open_status.ok())
+						        {
+							        completion(open_status);
+							        return;
+						        }
+						        GetAsyncCallback(
+						            runtime, std::move(options), file_number, file_size, std::move(key), arg, handle_result,
+						            std::move(completion));
+					        });
+				    });
+				return;
+			}
+			const Status open_status = FindTable(file_number, file_size, &handle);
+			if (!open_status.ok())
+			{
+				completion(open_status);
+				return;
+			}
 		}
 
 		auto* entry = reinterpret_cast<TableCacheEntry*>(cache_->Value(handle));

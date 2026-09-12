@@ -76,7 +76,35 @@ namespace prism
 		}
 #endif
 
-		constexpr auto kStealBackoff = std::chrono::microseconds(100);
+			constexpr std::size_t kDefaultLaneThreads = 4;
+		// Serial lanes each own exactly one dedicated worker.
+		constexpr std::size_t kSerialLaneThreads = 3;
+		constexpr std::size_t kMinLaneThreads = kSerialLaneThreads + 2;
+
+		// Resolves db-read / blocking-io worker counts from options. When the
+		// requested lane total exceeds max_lane_threads, the parallel lanes are
+		// scaled down proportionally while the serial lanes stay dedicated.
+		std::pair<std::size_t, std::size_t> ResolveLaneThreads(const AsyncRuntimeOptions& options)
+		{
+			std::size_t read = options.db_read_threads != kDefaultLaneThreads ? options.db_read_threads : options.db_threads;
+			std::size_t io = options.blocking_io_threads;
+			if (options.max_lane_threads != 0 && read + io + kSerialLaneThreads > options.max_lane_threads)
+			{
+				const std::size_t parallel = std::max(options.max_lane_threads, kMinLaneThreads) - kSerialLaneThreads;
+				const std::size_t want = read + io;
+				io = want == 0 ? 1 : std::max<std::size_t>(1, (parallel * io) / want);
+				read = std::max<std::size_t>(1, parallel - io);
+			}
+			return { read, io };
+		}
+
+		// Sleeping workers rescan peers on these idle timeouts: a worker blocked
+		// inside a job cannot drain its own queue, so rescans bound how long
+		// queued work can sit behind it while every peer sleeps. The busy
+		// cadence applies while any worker is not registered for sleep; a fully
+		// idle pool cannot gain work without a wakeup and only gets the slow tick.
+		constexpr std::chrono::microseconds kBusyRescanInterval{ 20 };
+		constexpr std::chrono::milliseconds kIdleRescanInterval{ 4 };
 
 		std::uint64_t NextRandom(std::uint64_t& state) noexcept
 		{
@@ -97,6 +125,7 @@ namespace prism
 		{
 			shards_.push_back(std::make_unique<Shard>());
 		}
+		idle_workers_.store(actual_threads, std::memory_order_relaxed);
 		workers_.reserve(actual_threads);
 		for (std::size_t i = 0; i < actual_threads; ++i)
 		{
@@ -126,11 +155,9 @@ namespace prism
 
 		for (auto& shard : shards_)
 		{
-			while (!shard->queue.empty())
+			Job job;
+			while (shard->TryPop(job))
 			{
-				auto job = std::move(shard->queue.front());
-				shard->queue.pop_front();
-				shard->load.fetch_sub(1, std::memory_order_relaxed);
 				try
 				{
 					job();
@@ -161,39 +188,34 @@ namespace prism
 		}
 
 		auto& shard = *shards_[target_index];
+		auto wake = [this] { idle_workers_.fetch_sub(1, std::memory_order_relaxed); };
 #ifdef PRISM_RUNTIME_METRICS
 		auto submit_time = std::chrono::steady_clock::now();
-		std::size_t current_depth;
-		{
-			std::lock_guard lock(shard.mutex);
-			current_depth = shard.queue.size();
-			RecordRoleSubmit(role_, current_depth);
-			shard.queue.emplace_back([role = role_, submit_time, work = std::move(work)]() mutable {
-				auto exec_start = std::chrono::steady_clock::now();
-				auto wait_us
-				    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_start - submit_time).count());
-				work();
-				auto exec_end = std::chrono::steady_clock::now();
-				auto exec_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_end - exec_start).count());
-				RecordRoleCompletion(role, wait_us, exec_us);
-			});
-		}
+		Job instrumented = [role = role_, submit_time, work = std::move(work)]() mutable {
+			auto exec_start = std::chrono::steady_clock::now();
+			auto wait_us
+			    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_start - submit_time).count());
+			work();
+			auto exec_end = std::chrono::steady_clock::now();
+			auto exec_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(exec_end - exec_start).count());
+			RecordRoleCompletion(role, wait_us, exec_us);
+		};
+		const std::size_t depth = shard.Emplace(std::move(instrumented), wake);
+		RecordRoleSubmit(role_, depth);
 #else
-		{
-			std::lock_guard lock(shard.mutex);
-			shard.queue.push_back(std::move(work));
-		}
+		const std::size_t depth = shard.Emplace(std::move(work), wake);
 #endif
-		shard.load.fetch_add(1, std::memory_order_relaxed);
-		shard.semaphore.release();
+		if (depth >= kShareThreshold && idle_workers_.load(std::memory_order_relaxed) != 0)
+		{
+			ShareWork(target_index);
+		}
 	}
 
 	bool BlockingExecutor::Empty() const
 	{
 		for (const auto& shard : shards_)
 		{
-			std::lock_guard lock(shard->mutex);
-			if (!shard->queue.empty())
+			if (shard->Load() != 0)
 			{
 				return false;
 			}
@@ -203,20 +225,36 @@ namespace prism
 
 	bool BlockingExecutor::IsCurrentWorker() const noexcept { return tls_blocking_executor == this; }
 
-	bool BlockingExecutor::TryPopOwn(Shard& shard, Job& out)
+	void BlockingExecutor::ShareWork(std::size_t source_index)
 	{
-		std::lock_guard lock(shard.mutex);
-		if (shard.queue.empty())
+		if (!options_.enable_stealing)
 		{
-			return false;
+			return;
 		}
-		out = std::move(shard.queue.front());
-		shard.queue.pop_front();
-		shard.load.fetch_sub(1, std::memory_order_relaxed);
-		return true;
+		auto& source = *shards_[source_index];
+		for (std::size_t offset = 1; offset < shards_.size(); ++offset)
+		{
+			auto& peer = *shards_[(source_index + offset) % shards_.size()];
+			if (!peer.waiting_.load(std::memory_order_relaxed))
+			{
+				continue;
+			}
+			std::scoped_lock lock(source.mutex_, peer.mutex_);
+			if (source.queue_.size() < kShareThreshold)
+			{
+				return;
+			}
+			if (!peer.waiting_.load(std::memory_order_relaxed) || !peer.queue_.empty())
+			{
+				continue;
+			}
+			peer.TakeBatchFrom(source, kMaxStealBatch, [](Job&) {});
+			peer.NotifyWaiting([this] { idle_workers_.fetch_sub(1, std::memory_order_relaxed); });
+			return; // One useful wake per batch, never a broadcast.
+		}
 	}
 
-	bool BlockingExecutor::TrySteal(std::size_t self_index, std::uint64_t& rng_state, Job& out)
+	bool BlockingExecutor::TrySteal(std::size_t self_index, std::uint64_t& rng_state, bool before_sleep)
 	{
 		const std::size_t worker_count = shards_.size();
 		if (!options_.enable_stealing || worker_count <= 1)
@@ -238,73 +276,62 @@ namespace prism
 		}
 #endif
 
-		const std::size_t victim_index = NextVictim(self_index, worker_count, rng_state);
+		const std::size_t start = (self_index + 1 + NextRandom(rng_state) % (worker_count - 1)) % worker_count;
 		auto& self_shard = *shards_[self_index];
-		auto& victim = *shards_[victim_index];
-
-		std::scoped_lock lock(self_shard.mutex, victim.mutex);
-		if (!self_shard.queue.empty() || victim.queue.empty())
+		// While active, try one victim. After registering sleep, check every peer
+		// under its queue mutex: a producer either observes our registration or we
+		// observe its backlog. The full scan closes the missed-wake race.
+		for (std::size_t offset = 0; offset < (before_sleep ? worker_count : 1); ++offset)
 		{
-			return false;
-		}
-
-		const std::size_t steal_count = std::max<std::size_t>(1, victim.queue.size() / 2);
-		for (std::size_t i = 0; i < steal_count; ++i)
-		{
-			self_shard.queue.push_front(std::move(victim.queue.back()));
-			victim.queue.pop_back();
-		}
-		victim.load.fetch_sub(steal_count, std::memory_order_relaxed);
-		self_shard.load.fetch_add(steal_count, std::memory_order_relaxed);
-
-		out = std::move(self_shard.queue.front());
-		self_shard.queue.pop_front();
-		self_shard.load.fetch_sub(1, std::memory_order_relaxed);
+			const std::size_t victim_index = (start + offset) % worker_count;
+			if (victim_index == self_index)
+			{
+				continue;
+			}
+			auto& victim = *shards_[victim_index];
+			// Approximate-load filter: skip locking clearly-empty victims. A stale
+			// zero can only delay a steal, never lose it — the idle rescan retries.
+			if (victim.Load() == 0)
+			{
+				continue;
+			}
+			std::scoped_lock lock(self_shard.mutex_, victim.mutex_);
+			if (!self_shard.queue_.empty())
+			{
+				return false; // A producer supplied local work while we checked peers.
+			}
+			if (victim.queue_.empty())
+			{
+				continue;
+			}
+			self_shard.TakeBatchFrom(victim, kMaxStealBatch, [](Job&) {});
+			self_shard.NotifyWaiting([this] { idle_workers_.fetch_sub(1, std::memory_order_relaxed); });
 #ifdef PRISM_RUNTIME_METRICS
-		switch (role_)
-		{
-		case BlockingExecutorRole::kDbRead:
-			RuntimeMetrics::Instance().db_read_steal_successes.fetch_add(1, std::memory_order_relaxed);
-			break;
-		case BlockingExecutorRole::kBlockingIo:
-			RuntimeMetrics::Instance().blocking_io_steal_successes.fetch_add(1, std::memory_order_relaxed);
-			break;
-		case BlockingExecutorRole::kCompaction:
-		case BlockingExecutorRole::kGeneric:
-			break;
-		}
+			switch (role_)
+			{
+			case BlockingExecutorRole::kDbRead:
+				RuntimeMetrics::Instance().db_read_steal_successes.fetch_add(1, std::memory_order_relaxed);
+				break;
+			case BlockingExecutorRole::kBlockingIo:
+				RuntimeMetrics::Instance().blocking_io_steal_successes.fetch_add(1, std::memory_order_relaxed);
+				break;
+			case BlockingExecutorRole::kCompaction:
+			case BlockingExecutorRole::kGeneric:
+				break;
+			}
 #endif
-		return true;
-	}
-
-	std::size_t BlockingExecutor::NextVictim(std::size_t self_index, std::size_t worker_count, std::uint64_t& rng_state)
-	{
-		std::size_t victim = NextRandom(rng_state) % (worker_count - 1);
-		if (victim >= self_index)
-		{
-			++victim;
+			return true;
 		}
-		return victim;
+		return false;
 	}
 
 	void BlockingExecutor::WakeAll()
 	{
 		for (auto& shard : shards_)
 		{
-			shard->semaphore.release();
+			std::lock_guard lock(shard->mutex_);
+			shard->NotifyWaiting([this] { idle_workers_.fetch_sub(1, std::memory_order_relaxed); });
 		}
-	}
-
-	bool BlockingExecutor::AnyShardNonEmpty() const noexcept
-	{
-		for (const auto& shard : shards_)
-		{
-			if (shard->load.load(std::memory_order_relaxed) > 0)
-			{
-				return true;
-			}
-		}
-		return false;
 	}
 
 	void BlockingExecutor::WorkerLoop(std::size_t worker_index)
@@ -314,51 +341,76 @@ namespace prism
 		auto& shard = *shards_[worker_index];
 		std::uint64_t rng_state = (static_cast<std::uint64_t>(worker_index) + 1) * 0x9e3779b97f4a7c15ull;
 
+		auto run = [](Job& job) {
+			try
+			{
+				job();
+			}
+			catch (...)
+			{
+				std::terminate();
+			}
+		};
+
+		shard.semaphore_.acquire();
 		while (true)
 		{
-			shard.semaphore.acquire();
-
-			while (true)
+			Job job;
+			if (shard.TryPop(job))
 			{
-				Job job;
-				if (TryPopOwn(shard, job))
+				run(job);
+				continue;
+			}
+
+			if (TrySteal(worker_index, rng_state, false))
+			{
+				continue;
+			}
+			{
+				std::lock_guard lock(shard.mutex_);
+				// Queue publication, sleep registration and notification share this
+				// mutex. A submit either prevents sleeping or supplies its wake token.
+				if (!shard.queue_.empty())
 				{
-					try
-					{
-						job();
-					}
-					catch (...)
-					{
-						std::terminate();
-					}
 					continue;
 				}
-
-				if (TrySteal(worker_index, rng_state, job))
-				{
-					try
-					{
-						job();
-					}
-					catch (...)
-					{
-						std::terminate();
-					}
-					continue;
-				}
-
 				if (stopping_.load(std::memory_order_acquire))
 				{
 					break;
 				}
-
-				if (!shard.semaphore.try_acquire_for(kStealBackoff))
+				shard.MarkWaiting([this] { idle_workers_.fetch_add(1, std::memory_order_relaxed); });
+			}
+			TrySteal(worker_index, rng_state, true);
+			// Even a successful steal supplies a token through NotifyWaiting.
+			// Consume exactly one before processing jobs or registering sleep
+			// again. While any peer is not registered for sleep, rescan on the
+			// busy cadence: a worker blocked inside a job cannot drain its own
+			// queue, and sleeping peers never rescan, so without this a burst
+			// tail could sit queued while all peers sleep.
+			while (true)
+			{
+				const bool peers_active = idle_workers_.load(std::memory_order_relaxed) < shards_.size();
+				if (shard.semaphore_.try_acquire_for(peers_active ? kBusyRescanInterval : kIdleRescanInterval))
 				{
 					break;
 				}
+				if (peers_active)
+				{
+					TrySteal(worker_index, rng_state, true);
+				}
 			}
+		}
 
-			if (stopping_.load(std::memory_order_acquire) && !AnyShardNonEmpty())
+		// Shutdown drain: finish every job still reachable before exiting.
+		while (true)
+		{
+			Job job;
+			if (shard.TryPop(job))
+			{
+				run(job);
+				continue;
+			}
+			if (!TrySteal(worker_index, rng_state, true))
 			{
 				break;
 			}
@@ -439,10 +491,10 @@ namespace prism
 
 	AsyncRuntime::AsyncRuntime(CpuThreadPool& cpu_pool, AsyncRuntimeOptions options)
 	    : cpu_executor_(cpu_pool)
-	    , db_read_executor_(options.db_read_threads != 4 ? options.db_read_threads : options.db_threads, BlockingExecutorRole::kDbRead,
+	    , db_read_executor_(ResolveLaneThreads(options).first, BlockingExecutorRole::kDbRead,
 	          BlockingExecutorOptions{ .enable_stealing = true })
 	    , db_write_executor_()
-	    , blocking_io_executor_(options.blocking_io_threads, BlockingExecutorRole::kBlockingIo)
+	    , blocking_io_executor_(ResolveLaneThreads(options).second, BlockingExecutorRole::kBlockingIo)
 	    , io_dispatcher_(blocking_io_executor_)
 	    , compaction_executor_(1, BlockingExecutorRole::kCompaction, BlockingExecutorOptions{ .enable_stealing = false })
 	    , serial_file_executor_()

@@ -1,6 +1,7 @@
 #ifndef PRISM_SCHEDULER_H
 #define PRISM_SCHEDULER_H
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -178,6 +179,116 @@ namespace prism
 		void Submit(Job job) const { submit(executor, std::move(job)); }
 	};
 
+	namespace detail
+	{
+		// QueuedJob: queue element for worker shards. The stolen flag is only
+		// present under PRISM_RUNTIME_METRICS so the hot path stays identical.
+		struct QueuedJob
+		{
+			QueuedJob() = default;
+			template <typename F>
+			explicit QueuedJob(F&& fn)
+			    : job(std::forward<F>(fn))
+			{
+			}
+
+			InlineJob job;
+#ifdef PRISM_RUNTIME_METRICS
+			bool stolen{ false };
+#endif
+		};
+
+		// WorkerShard<Element>: the shared worker-queue mechanics used by
+		// CpuThreadPool::WorkThread and BlockingExecutor::Shard.
+		//
+		// - queue_ is protected by mutex_; load_ mirrors queue_.size() and is
+		//   published only while holding mutex_, so a concurrent pop can never
+		//   underflow a not-yet-published push.
+		// - waiting_/semaphore_ form a single-token sleep protocol: a worker
+		//   registers waiting_ under mutex_ before its final work scan; a
+		//   producer that observes waiting_ releases exactly one token. Wakeups
+		//   cost one release per sleep transition, not one token per queued job.
+		// - TakeBatchFrom moves a bounded batch between two locked shards and is
+		//   shared by work stealing and proactive backlog sharing.
+		template <typename Element>
+		struct alignas(64) WorkerShard
+		{
+			std::mutex mutex_;
+			std::deque<Element> queue_;
+			std::atomic<std::size_t> load_{ 0 };
+			std::atomic<bool> waiting_{ true };
+			std::binary_semaphore semaphore_{ 0 };
+
+			std::size_t Load() const noexcept { return load_.load(std::memory_order_relaxed); }
+
+			// Caller must hold mutex_. Wakes the worker iff it registered sleep;
+			// on_wake() runs between the flag transition and the token release.
+			template <typename OnWake>
+			void NotifyWaiting(OnWake&& on_wake)
+			{
+				if (waiting_.load(std::memory_order_relaxed))
+				{
+					waiting_.store(false, std::memory_order_relaxed);
+					static_cast<OnWake&&>(on_wake)();
+					semaphore_.release();
+				}
+			}
+
+			// Caller must hold mutex_. Registers intent to sleep; on_sleep()
+			// runs under the same lock for idle-count bookkeeping.
+			template <typename OnSleep>
+			void MarkWaiting(OnSleep&& on_sleep)
+			{
+				waiting_.store(true, std::memory_order_relaxed);
+				static_cast<OnSleep&&>(on_sleep)();
+			}
+
+			// Pushes a local job, publishes the queue depth and wakes the worker
+			// when it is sleeping. Returns the resulting queue depth.
+			template <typename F, typename OnWake>
+			std::size_t Emplace(F&& element, OnWake&& on_wake)
+			{
+				std::lock_guard lock(mutex_);
+				queue_.emplace_back(std::forward<F>(element));
+				const std::size_t depth = queue_.size();
+				load_.store(depth, std::memory_order_relaxed);
+				NotifyWaiting(std::forward<OnWake>(on_wake));
+				return depth;
+			}
+
+			bool TryPop(Element& out)
+			{
+				std::lock_guard lock(mutex_);
+				if (queue_.empty())
+				{
+					return false;
+				}
+				out = std::move(queue_.front());
+				queue_.pop_front();
+				load_.store(queue_.size(), std::memory_order_relaxed);
+				return true;
+			}
+
+			// Caller must hold both mutexes; this shard's queue must be empty.
+			// Moves up to max_batch elements (bounded by half the victim) from the
+			// victim's back to this front, preserving order within the batch.
+			template <typename MarkMoved>
+			void TakeBatchFrom(WorkerShard& victim, std::size_t max_batch, MarkMoved&& mark_moved)
+			{
+				assert(queue_.empty() && !victim.queue_.empty());
+				const std::size_t count = std::min(max_batch, std::max<std::size_t>(1, victim.queue_.size() / 2));
+				for (std::size_t i = 0; i < count; ++i)
+				{
+					queue_.push_front(std::move(victim.queue_.back()));
+					victim.queue_.pop_back();
+					mark_moved(queue_.front());
+				}
+				victim.load_.store(victim.queue_.size(), std::memory_order_relaxed);
+				load_.store(queue_.size(), std::memory_order_relaxed);
+			}
+		};
+	}
+
 	// CpuThreadPool: Worker-local thread pool with fallback priority and delayed task support.
 	//
 	// Architecture (split-role topology):
@@ -338,11 +449,15 @@ namespace prism
 	private:
 		// WorkThread: Worker with its own task queue.
 		// Consumes tasks from its queue and steals from peers under load.
-		class alignas(64) WorkThread
+		// Queue, sleep/wake and batch-transfer mechanics come from the shared
+		// detail::WorkerShard implementation.
+		class alignas(64) WorkThread: public detail::WorkerShard<detail::QueuedJob>
 		{
 			friend class CpuThreadPool;
 
 		public:
+			using QueuedJob = detail::QueuedJob;
+
 			WorkThread() = default;
 			~WorkThread() = default;
 
@@ -358,13 +473,9 @@ namespace prism
 			template <typename F>
 			std::size_t Emplace(CpuThreadPool& scheduler, F&& job)
 			{
-				std::lock_guard lock(mutex_);
-				queue_.emplace_back(std::forward<F>(job));
-				load_.store(queue_.size(), std::memory_order_relaxed);
-				NotifyWaitingWorker(scheduler);
-				return queue_.size();
+				return Shard::Emplace(
+				    std::forward<F>(job), [&scheduler] { scheduler.idle_workers_.fetch_sub(1, std::memory_order_relaxed); });
 			}
-			std::size_t Load() const noexcept;
 
 			// Wake: Signal semaphore (used during shutdown)
 			void Wake(CpuThreadPool& scheduler);
@@ -375,38 +486,18 @@ namespace prism
 			bool DrainRemaining() noexcept;
 
 		private:
-			struct QueuedJob
-			{
-				QueuedJob() = default;
-				template <typename F>
-				explicit QueuedJob(F&& fn)
-				    : job(std::forward<F>(fn))
-				{
-				}
-
-				Job job;
-#ifdef PRISM_RUNTIME_METRICS
-				bool stolen{ false };
-#endif
-			};
+			using Shard = detail::WorkerShard<QueuedJob>;
 
 			void Consume(CpuThreadPool& scheduler, std::size_t worker_index) noexcept;
 			bool TrySteal(CpuThreadPool& scheduler, std::size_t worker_index, std::uint64_t& rng_state, bool before_sleep);
 			// Both queue mutexes must be held; destination must be empty.
 			void TakeBatchFrom(WorkThread& victim);
-			bool TryDequeueJob(QueuedJob& out);
 			bool HandleJobCompletion(QueuedJob& job, CpuThreadPool& scheduler) noexcept;
 
 			// Called with mutex_ held. One notification per transition out of waiting,
 			// rather than one semaphore token per queued job.
 			void NotifyWaitingWorker(CpuThreadPool& scheduler);
-			// Atomic for peer selection hints; transitions still require mutex_.
-			std::atomic<bool> waiting_{ true };
-			std::binary_semaphore semaphore_{ 0 };
 			std::jthread thread_{ };
-			std::mutex mutex_;
-			std::deque<QueuedJob> queue_;
-			std::atomic<std::size_t> load_{ 0 };
 		};
 
 		struct PriorityTask

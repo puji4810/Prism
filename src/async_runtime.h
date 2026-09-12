@@ -34,18 +34,22 @@ namespace prism
 	// BlockingExecutor: sharded-queue + work-stealing thread pool.
 	//
 	// Architecture:
-	// - N worker threads, each owning a Shard (deque + mutex + semaphore + load counter).
+	// - N worker threads, each owning a Shard (the shared detail::WorkerShard
+	//   implementation: deque + mutex + load counter + single-token sleep/wake).
 	// - Submit() routes to a target shard:
 	//     * Re-entrant submit from a worker of this executor -> that worker's own shard
 	//       (preserves locality for recursive-submit / continuation patterns).
 	//     * External submit -> round-robin via atomic submit_cursor_.
-	// - WorkerLoop: pop from own shard; when empty, steal from peers (random victim,
-	//   steal up to half of victim's stealable jobs, LIFO-biased for cache locality);
-	//   when nothing stealable, block on the semaphore with a short try_acquire_for
-	//   backoff so shutdown stays responsive.
-	// - Shutdown: stopping_ is set, all shard semaphores are released; workers drain
-	//   remaining queued work (own + stealable from peers) before exiting. Destructor
-	//   joins all workers and then sequentially drains any residue (defensive).
+	// - WorkerLoop: pop from own shard; when empty, steal from a random peer
+	//   (bounded batch from the victim's back); before sleeping, the worker
+	//   registers waiting_ under its mutex and rescans every peer so a producer
+	//   either observes the registration or the worker observes the backlog.
+	// - Submit wakes a shard only when its worker registered sleep, and deep
+	//   backlogs proactively hand a bounded batch to a sleeping peer.
+	// - Shutdown: stopping_ is set, registered sleepers are woken; workers drain
+	//   remaining queued work (own + stealable from peers) before exiting.
+	//   Destructor joins all workers and then sequentially drains any residue
+	//   (defensive).
 	//
 	// Public API is identical to the prior single-deque implementation:
 	//   ctor(thread_count, role), dtor, Submit(Job), Empty(), IsCurrentWorker().
@@ -84,27 +88,35 @@ namespace prism
 		}
 		bool Empty() const;
 		bool IsCurrentWorker() const noexcept;
+		std::size_t WorkerCount() const noexcept { return shards_.size(); }
 
 	private:
-		struct alignas(64) Shard
+		struct Shard: detail::WorkerShard<Job>
 		{
-			std::mutex mutex;
-			std::deque<Job> queue;
-			std::counting_semaphore<> semaphore{ 0 };
-			std::atomic<std::size_t> load{ 0 };
 		};
 
 		void WorkerLoop(std::size_t worker_index);
-		bool TryPopOwn(Shard& shard, Job& out);
-		bool TrySteal(std::size_t self_index, std::uint64_t& rng_state, Job& out);
+		// Steals a bounded batch into the worker's own (empty) shard queue.
+		// With before_sleep, scans every peer; otherwise tries a single victim.
+		bool TrySteal(std::size_t self_index, std::uint64_t& rng_state, bool before_sleep);
+		// Moves part of a deep backlog to a sleeping peer and wakes it.
+		void ShareWork(std::size_t source_index);
 		void WakeAll();
-		bool AnyShardNonEmpty() const noexcept;
 		static std::size_t NextVictim(std::size_t self_index, std::size_t worker_count, std::uint64_t& rng_state);
+
+		// Backlog depth that triggers proactive sharing with a sleeping peer.
+		static constexpr std::size_t kShareThreshold = 128;
+		// Upper bound on one steal/share transfer, bounding lock hold time.
+		static constexpr std::size_t kMaxStealBatch = 128;
 
 		BlockingExecutorRole role_{ BlockingExecutorRole::kGeneric };
 		BlockingExecutorOptions options_;
 		std::atomic<bool> stopping_{ false };
-		std::atomic<std::size_t> submit_cursor_{ 0 };
+		// Hot counters get their own lines: submit hits the cursor on every call
+		// while workers update idle state on sleep transitions.
+		alignas(64) std::atomic<std::size_t> submit_cursor_{ 0 };
+		// Workers currently registered for sleep; lets ShareWork skip the scan.
+		alignas(64) std::atomic<std::size_t> idle_workers_{ 0 };
 		std::vector<std::unique_ptr<Shard>> shards_;
 		std::vector<std::jthread> workers_;
 	};
@@ -143,6 +155,14 @@ namespace prism
 		std::size_t db_read_threads = 4;
 		std::size_t db_threads = 4;
 		std::size_t blocking_io_threads = 4;
+		// Total budget for runtime-owned lane threads: db-read + blocking-io
+		// workers plus the three single-thread serial lanes (write, compaction,
+		// serial file). 0 = uncapped, the per-lane counts apply (11 threads by
+		// default). When the requested total exceeds the budget, the parallel
+		// lanes are scaled down proportionally with a minimum of one worker
+		// each; serial lanes stay dedicated. Effective minimum is 5. The
+		// caller-owned CPU pool and the optional reactor pump are not counted.
+		std::size_t max_lane_threads = 0;
 	};
 
 	class AsyncRuntime
@@ -166,6 +186,12 @@ namespace prism
 
 		const CpuThreadPool& CpuExecutor() const noexcept { return cpu_executor_; }
 		bool IsCurrentWorker() const noexcept;
+		// Number of threads owned by this runtime's lane executors
+		// (read + blocking-io + write + compaction + serial-file).
+		std::size_t LaneThreadCount() const noexcept
+		{
+			return db_read_executor_.WorkerCount() + blocking_io_executor_.WorkerCount() + compaction_executor_.WorkerCount() + 2;
+		}
 
 	private:
 		CpuThreadPool& cpu_executor_;

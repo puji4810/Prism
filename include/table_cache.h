@@ -51,6 +51,8 @@ namespace prism
 
 	private:
 		Status FindTable(uint64_t file_number, uint64_t file_size, Cache::Handle**);
+		// Cache-only lookup; returns nullptr on a miss without touching the filesystem.
+		Cache::Handle* LookupTable(uint64_t file_number);
 
 		Env* const env_;
 		const std::string dbname_;

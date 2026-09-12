@@ -2761,7 +2761,12 @@ namespace prism
 		std::lock_guard<std::shared_mutex> lock(mutex_);
 		VersionEdit edit;
 		edit.AddFile(level, number, file_size, smallest, largest);
-		return versions_->LogAndApply(&edit, &mutex_);
+		Status s = versions_->LogAndApply(&edit, &mutex_);
+		if (s.ok())
+		{
+			InstallSuperVersion();
+		}
+		return s;
 	}
 
 	Status DBImpl::TEST_RunPickedCompaction()

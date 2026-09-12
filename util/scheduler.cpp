@@ -15,6 +15,13 @@ namespace prism
 	{
 		constexpr std::size_t kMinThreads = 2;
 		constexpr std::size_t kLazyFallbackPriority = (std::numeric_limits<std::size_t>::max)();
+		// Sleeping workers rescan peers on these idle timeouts: a worker blocked
+		// inside a job cannot drain its own queue, so rescans bound how long
+		// queued work can sit behind it while every peer sleeps. The busy
+		// cadence applies while any worker is not registered for sleep; a fully
+		// idle pool cannot gain work without a wakeup and only gets the slow tick.
+		constexpr std::chrono::microseconds kBusyRescanInterval{ 100 };
+		constexpr std::chrono::milliseconds kIdleRescanInterval{ 4 };
 
 		std::size_t DefaultThreadCount(std::size_t requested)
 		{
@@ -365,16 +372,9 @@ namespace prism
 
 	std::thread::id CpuThreadPool::WorkThread::Id() const { return thread_.get_id(); }
 
-	std::size_t CpuThreadPool::WorkThread::Load() const noexcept { return load_.load(std::memory_order_relaxed); }
-
 	void CpuThreadPool::WorkThread::NotifyWaitingWorker(CpuThreadPool& scheduler)
 	{
-		if (waiting_.load(std::memory_order_relaxed))
-		{
-			waiting_.store(false, std::memory_order_relaxed);
-			scheduler.idle_workers_.fetch_sub(1, std::memory_order_relaxed);
-			semaphore_.release();
-		}
+		NotifyWaiting([&scheduler] { scheduler.idle_workers_.fetch_sub(1, std::memory_order_relaxed); });
 	}
 
 	void CpuThreadPool::WorkThread::Wake(CpuThreadPool& scheduler)
@@ -404,21 +404,15 @@ namespace prism
 
 	void CpuThreadPool::WorkThread::TakeBatchFrom(WorkThread& victim)
 	{
-		assert(queue_.empty() && !victim.queue_.empty());
 		// All jobs (including SubmitIn) are movable. Bound lock hold time and
 		// preserve order within the transferred batch without a temporary vector.
-		constexpr std::size_t kMaxStealBatch = kShareThreshold;
-		const auto count = std::min(kMaxStealBatch, std::max<std::size_t>(1, victim.queue_.size() / 2));
-		for (std::size_t i = 0; i < count; ++i)
-		{
-			queue_.push_front(std::move(victim.queue_.back()));
-			victim.queue_.pop_back();
+		Shard::TakeBatchFrom(victim, kShareThreshold, [](QueuedJob& moved) {
 #ifdef PRISM_RUNTIME_METRICS
-			queue_.front().stolen = true;
+			moved.stolen = true;
+#else
+			(void)moved;
 #endif
-		}
-		victim.load_.store(victim.queue_.size(), std::memory_order_relaxed);
-		load_.store(queue_.size(), std::memory_order_relaxed);
+		});
 	}
 
 	bool CpuThreadPool::WorkThread::TrySteal(
@@ -438,6 +432,10 @@ namespace prism
 			RuntimeMetrics::Instance().steal_attempts.fetch_add(1, std::memory_order_relaxed);
 #endif
 			auto& victim = scheduler.work_threads_[victim_index];
+			// Approximate-load filter: skip locking clearly-empty victims. A stale
+			// zero can only delay a steal, never lose it — the idle rescan retries.
+			if (victim.Load() == 0)
+				continue;
 			std::scoped_lock lock(mutex_, victim.mutex_);
 			if (!queue_.empty())
 				return false; // A producer supplied local work while we checked peers.
@@ -451,17 +449,6 @@ namespace prism
 			return true;
 		}
 		return false;
-	}
-
-	bool CpuThreadPool::WorkThread::TryDequeueJob(QueuedJob& out)
-	{
-		std::lock_guard lock(mutex_);
-		if (queue_.empty())
-			return false;
-		out = std::move(queue_.front());
-		queue_.pop_front();
-		load_.store(queue_.size(), std::memory_order_relaxed);
-		return true;
 	}
 
 	bool CpuThreadPool::WorkThread::HandleJobCompletion(QueuedJob& job, CpuThreadPool& scheduler) noexcept
@@ -506,7 +493,7 @@ namespace prism
 		while (true)
 		{
 			QueuedJob queued;
-			if (TryDequeueJob(queued))
+			if (TryPop(queued))
 			{
 				if (HandleJobCompletion(queued, scheduler))
 					break;
@@ -523,13 +510,28 @@ namespace prism
 					continue;
 				if (scheduler.IsExitRequested())
 					break;
-				waiting_.store(true, std::memory_order_relaxed);
-				scheduler.idle_workers_.fetch_add(1, std::memory_order_relaxed);
+				MarkWaiting([&scheduler] { scheduler.idle_workers_.fetch_add(1, std::memory_order_relaxed); });
 			}
 			TrySteal(scheduler, worker_index, rng_state, true);
 			// Even a successful steal supplies a token through NotifyWaitingWorker.
 			// Consume exactly one before processing jobs or registering sleep again.
-			semaphore_.acquire();
+			// While any peer is not registered for sleep, rescan on the busy
+			// cadence: a worker blocked inside a job cannot drain its own queue,
+			// and sleeping peers never rescan, so without this a burst tail could
+			// sit queued while all peers sleep.
+			while (true)
+			{
+				const bool peers_active
+				    = scheduler.idle_workers_.load(std::memory_order_relaxed) < scheduler.work_threads_.size();
+				if (semaphore_.try_acquire_for(peers_active ? kBusyRescanInterval : kIdleRescanInterval))
+				{
+					break;
+				}
+				if (peers_active)
+				{
+					TrySteal(scheduler, worker_index, rng_state, true);
+				}
+			}
 		}
 
 		// Clear thread-local state when worker exits.

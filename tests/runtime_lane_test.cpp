@@ -320,4 +320,57 @@ TEST(RuntimeLaneTest, BlockingFanoutWakesSleepingPeers)
 	EXPECT_TRUE(drained);
 }
 
+// ===========================================================================
+// Test 5: Overall Lane Thread Budget
+//
+// AsyncRuntimeOptions::max_lane_threads caps the total number of runtime-owned
+// lane threads. Without a budget the default is 4 read + 4 blocking-I/O +
+// 3 serial workers = 11; under a budget the parallel lanes scale down while
+// every lane keeps making progress.
+// ===========================================================================
+TEST(RuntimeLaneTest, DefaultLaneCountIsUncappedWithoutBudget)
+{
+	CpuThreadPool scheduler(2);
+	AsyncRuntime runtime(scheduler);
+
+	EXPECT_EQ(runtime.LaneThreadCount(), 11);
+	EXPECT_EQ(runtime.DbReadExecutor().WorkerCount(), 4);
+	EXPECT_EQ(runtime.BlockingIoExecutor().WorkerCount(), 4);
+	EXPECT_EQ(runtime.CompactionExecutor().WorkerCount(), 1);
+}
+
+TEST(RuntimeLaneTest, LaneThreadBudgetScalesParallelLanes)
+{
+	CpuThreadPool scheduler(2);
+	AsyncRuntimeOptions options;
+	options.max_lane_threads = 8;
+	AsyncRuntime runtime(scheduler, options);
+
+	// 8 total = 3 serial + 5 split between read and blocking-io.
+	EXPECT_EQ(runtime.LaneThreadCount(), 8);
+	EXPECT_EQ(runtime.DbReadExecutor().WorkerCount(), 3);
+	EXPECT_EQ(runtime.BlockingIoExecutor().WorkerCount(), 2);
+	EXPECT_EQ(runtime.CompactionExecutor().WorkerCount(), 1);
+
+	for (auto* executor : { &runtime.DbReadExecutor(), &runtime.BlockingIoExecutor(), &runtime.CompactionExecutor() })
+	{
+		std::binary_semaphore done(0);
+		executor->Submit([&done] { done.release(); });
+		EXPECT_TRUE(done.try_acquire_for(5s));
+	}
+}
+
+TEST(RuntimeLaneTest, LaneThreadBudgetBelowMinimumKeepsMinimumLanes)
+{
+	CpuThreadPool scheduler(2);
+	AsyncRuntimeOptions options;
+	options.max_lane_threads = 2;
+	AsyncRuntime runtime(scheduler, options);
+
+	// Serial lanes stay dedicated; each parallel lane keeps one worker.
+	EXPECT_EQ(runtime.LaneThreadCount(), 5);
+	EXPECT_EQ(runtime.DbReadExecutor().WorkerCount(), 1);
+	EXPECT_EQ(runtime.BlockingIoExecutor().WorkerCount(), 1);
+}
+
 } // namespace prism::tests
