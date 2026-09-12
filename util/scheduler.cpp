@@ -15,7 +15,6 @@ namespace prism
 	{
 		constexpr std::size_t kMinThreads = 2;
 		constexpr std::size_t kLazyFallbackPriority = (std::numeric_limits<std::size_t>::max)();
-		constexpr auto kStealBackoff = std::chrono::microseconds(100);
 
 		std::size_t DefaultThreadCount(std::size_t requested)
 		{
@@ -46,6 +45,7 @@ namespace prism
 
 	CpuThreadPool::CpuThreadPool(std::size_t num_threads)
 	    : work_threads_(DefaultThreadCount(num_threads))
+	    , idle_workers_(work_threads_.size())
 	{
 		for (std::size_t i = 0; i < work_threads_.size(); ++i)
 		{
@@ -75,7 +75,7 @@ namespace prism
 		PromoteLazyResidueToWorkers();
 		for (auto& t : work_threads_)
 		{
-			t.Wake();
+			t.Wake(*this);
 		}
 
 		// Step 3: workers drain their local queues (and may steal peer work) until empty.
@@ -116,7 +116,7 @@ namespace prism
 		priority_waiter_.release();
 		for (auto& t : work_threads_)
 		{
-			t.Wake();
+			t.Wake(*this);
 		}
 	}
 
@@ -153,24 +153,7 @@ namespace prism
 
 	void CpuThreadPool::SubmitIn(Context ctx, Job job) { SubmitInJob(ctx, std::move(job)); }
 
-	bool CpuThreadPool::TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable)
-	{
-		if (worker_index >= work_threads_.size())
-		{
-			return false;
-		}
-
-		auto& worker = work_threads_[worker_index];
-		if (dispatched)
-		{
-			worker.PushDispatched(std::move(job));
-		}
-		else
-		{
-			worker.Push(std::move(job), stealable);
-		}
-		return true;
-	}
+	bool CpuThreadPool::TryPushToWorker(Job job, std::size_t worker_index) { return TryEmplaceToWorker(std::move(job), worker_index); }
 
 	std::size_t CpuThreadPool::ChooseLeastLoadedWorker() const
 	{
@@ -201,7 +184,7 @@ namespace prism
 	void CpuThreadPool::DispatchExpiredTask(LazyTask&& task)
 	{
 		const auto worker_index = ChooseLeastLoadedWorker();
-		if (!TryPushToWorker(std::move(task.job), worker_index, true, true))
+		if (!TryPushToWorker(std::move(task.job), worker_index))
 		{
 			PushToPriorityQueue(std::move(task.job), kLazyFallbackPriority, /*wake=*/true);
 		}
@@ -213,7 +196,7 @@ namespace prism
 		{
 			auto task = std::move(const_cast<LazyTask&>(lazy_queue_.top()));
 			lazy_queue_.pop();
-			if (!TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), true, true))
+			if (!TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker()))
 			{
 				std::lock_guard lock(priority_mutex_);
 				priority_queue_.push(PriorityTask{ std::move(task.job), kLazyFallbackPriority });
@@ -227,7 +210,7 @@ namespace prism
 		{
 			auto task = std::move(const_cast<LazyTask&>(lazy_queue_.top()));
 			lazy_queue_.pop();
-			if (TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), false, true))
+			if (TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker()))
 			{
 				work_remains = true;
 				continue;
@@ -250,7 +233,7 @@ namespace prism
 		{
 			auto job = std::move(const_cast<Job&>(priority_queue_.top().job));
 			priority_queue_.pop();
-			if (TryPushToWorker(std::move(job), ChooseLeastLoadedWorker(), false, true))
+			if (TryPushToWorker(std::move(job), ChooseLeastLoadedWorker()))
 			{
 				work_remains = true;
 				continue;
@@ -300,7 +283,7 @@ namespace prism
 					priority_queue_.pop();
 				}
 
-				(void)TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker(), true, true);
+				(void)TryPushToWorker(std::move(task.job), ChooseLeastLoadedWorker());
 			}
 		}
 	}
@@ -366,7 +349,7 @@ namespace prism
 		{
 			auto job = std::move(queue_.front().job);
 			queue_.pop_front();
-			load_.fetch_sub(1, std::memory_order_relaxed);
+			load_.store(queue_.size(), std::memory_order_relaxed);
 			try
 			{
 				job();
@@ -382,109 +365,92 @@ namespace prism
 
 	std::thread::id CpuThreadPool::WorkThread::Id() const { return thread_.get_id(); }
 
-	void CpuThreadPool::WorkThread::Push(Job job)
-	{
-		{
-			std::lock_guard lock(mutex_);
-			queue_.push_back(QueuedJob{ std::move(job), true });
-			load_.fetch_add(1, std::memory_order_relaxed);
-		}
-		semaphore_.release();
-	}
-
-	void CpuThreadPool::WorkThread::Push(Job job, bool stealable)
-	{
-		{
-			std::lock_guard lock(mutex_);
-			queue_.push_back(QueuedJob{ std::move(job), stealable });
-			load_.fetch_add(1, std::memory_order_relaxed);
-		}
-		semaphore_.release();
-	}
-
-	void CpuThreadPool::WorkThread::PushDispatched(Job job)
-	{
-		{
-			std::lock_guard lock(mutex_);
-			queue_.push_back(QueuedJob{ std::move(job), true });
-			load_.fetch_add(1, std::memory_order_relaxed);
-		}
-		semaphore_.release();
-	}
-
 	std::size_t CpuThreadPool::WorkThread::Load() const noexcept { return load_.load(std::memory_order_relaxed); }
 
-	void CpuThreadPool::WorkThread::Wake() { semaphore_.release(); }
-
-	bool CpuThreadPool::WorkThread::TrySteal(CpuThreadPool& scheduler, std::size_t worker_index, std::uint64_t& rng_state)
+	void CpuThreadPool::WorkThread::NotifyWaitingWorker(CpuThreadPool& scheduler)
 	{
-#ifdef PRISM_RUNTIME_METRICS
-		RuntimeMetrics::Instance().steal_attempts.fetch_add(1, std::memory_order_relaxed);
-#endif
-
-		if (scheduler.work_threads_.size() <= 1)
+		if (waiting_.load(std::memory_order_relaxed))
 		{
-			return false;
+			waiting_.store(false, std::memory_order_relaxed);
+			scheduler.idle_workers_.fetch_sub(1, std::memory_order_relaxed);
+			semaphore_.release();
 		}
+	}
 
-		std::size_t victim_index = NextRandom(rng_state) % (scheduler.work_threads_.size() - 1);
-		if (victim_index >= worker_index)
-		{
-			++victim_index;
-		}
+	void CpuThreadPool::WorkThread::Wake(CpuThreadPool& scheduler)
+	{
+		std::lock_guard lock(mutex_);
+		NotifyWaitingWorker(scheduler);
+	}
 
-		auto& victim = scheduler.work_threads_[victim_index];
-		std::scoped_lock lock(mutex_, victim.mutex_);
-		if (!queue_.empty())
+	void CpuThreadPool::ShareWork(std::size_t worker_index)
+	{
+		auto& source = work_threads_[worker_index];
+		for (std::size_t offset = 1; offset < work_threads_.size(); ++offset)
 		{
-			return false;
-		}
-
-		std::size_t stealable_count = 0;
-		for (const auto& queued : victim.queue_)
-		{
-			if (queued.stealable)
-			{
-				++stealable_count;
-			}
-		}
-		if (stealable_count == 0)
-		{
-			return false;
-		}
-
-		const std::size_t steal_count = std::max<std::size_t>(1, stealable_count / 2);
-		std::vector<QueuedJob> stolen;
-		stolen.reserve(steal_count);
-		for (std::size_t i = victim.queue_.size(); i > 0 && stolen.size() < steal_count; --i)
-		{
-			auto& candidate = victim.queue_[i - 1];
-			if (!candidate.stealable)
-			{
+			auto& peer = work_threads_[(worker_index + offset) % work_threads_.size()];
+			if (!peer.waiting_.load(std::memory_order_relaxed))
 				continue;
-			}
-			stolen.push_back(std::move(candidate));
-			victim.queue_.erase(victim.queue_.begin() + static_cast<std::ptrdiff_t>(i - 1));
+			std::scoped_lock lock(source.mutex_, peer.mutex_);
+			if (source.queue_.size() < kShareThreshold)
+				return;
+			if (!peer.waiting_.load(std::memory_order_relaxed) || !peer.queue_.empty())
+				continue;
+			peer.TakeBatchFrom(source);
+			peer.NotifyWaitingWorker(*this);
+			return; // One useful wake per batch, never a broadcast.
 		}
-		if (stolen.empty())
-		{
-			return false;
-		}
+	}
 
-		for (auto& queued : stolen)
+	void CpuThreadPool::WorkThread::TakeBatchFrom(WorkThread& victim)
+	{
+		assert(queue_.empty() && !victim.queue_.empty());
+		// All jobs (including SubmitIn) are movable. Bound lock hold time and
+		// preserve order within the transferred batch without a temporary vector.
+		constexpr std::size_t kMaxStealBatch = kShareThreshold;
+		const auto count = std::min(kMaxStealBatch, std::max<std::size_t>(1, victim.queue_.size() / 2));
+		for (std::size_t i = 0; i < count; ++i)
 		{
+			queue_.push_front(std::move(victim.queue_.back()));
+			victim.queue_.pop_back();
 #ifdef PRISM_RUNTIME_METRICS
-			queued.stolen = true;
+			queue_.front().stolen = true;
 #endif
-			queue_.push_front(std::move(queued));
 		}
-		victim.load_.fetch_sub(stolen.size(), std::memory_order_relaxed);
-		load_.fetch_add(stolen.size(), std::memory_order_relaxed);
+		victim.load_.store(victim.queue_.size(), std::memory_order_relaxed);
+		load_.store(queue_.size(), std::memory_order_relaxed);
+	}
 
+	bool CpuThreadPool::WorkThread::TrySteal(
+	    CpuThreadPool& scheduler, std::size_t worker_index, std::uint64_t& rng_state, bool before_sleep)
+	{
+		const auto count = scheduler.work_threads_.size();
+		const auto start = (worker_index + 1 + NextRandom(rng_state) % (count - 1)) % count;
+		// First try one victim while active. After registering sleep, check every
+		// peer under its queue mutex: a producer either observes our registration
+		// or we observe its backlog. The full scan closes the missed-wake race.
+		for (std::size_t offset = 0; offset < (before_sleep ? count : 1); ++offset)
+		{
+			const auto victim_index = (start + offset) % count;
+			if (victim_index == worker_index)
+				continue;
 #ifdef PRISM_RUNTIME_METRICS
-		RuntimeMetrics::Instance().steal_successes.fetch_add(1, std::memory_order_relaxed);
+			RuntimeMetrics::Instance().steal_attempts.fetch_add(1, std::memory_order_relaxed);
 #endif
-		return true;
+			auto& victim = scheduler.work_threads_[victim_index];
+			std::scoped_lock lock(mutex_, victim.mutex_);
+			if (!queue_.empty())
+				return false; // A producer supplied local work while we checked peers.
+			if (victim.queue_.empty())
+				continue;
+			TakeBatchFrom(victim);
+			NotifyWaitingWorker(scheduler);
+#ifdef PRISM_RUNTIME_METRICS
+			RuntimeMetrics::Instance().steal_successes.fetch_add(1, std::memory_order_relaxed);
+#endif
+			return true;
+		}
+		return false;
 	}
 
 	bool CpuThreadPool::WorkThread::TryDequeueJob(QueuedJob& out)
@@ -494,7 +460,7 @@ namespace prism
 			return false;
 		out = std::move(queue_.front());
 		queue_.pop_front();
-		load_.fetch_sub(1, std::memory_order_relaxed);
+		load_.store(queue_.size(), std::memory_order_relaxed);
 		return true;
 	}
 
@@ -535,45 +501,35 @@ namespace prism
 		current_worker_index_ = worker_index;
 		std::uint64_t rng_state = (static_cast<std::uint64_t>(worker_index) + 1) * 0x9e3779b97f4a7c15ull;
 
+		semaphore_.acquire();
+
 		while (true)
 		{
-			semaphore_.acquire();
-
-			while (true)
+			QueuedJob queued;
+			if (TryDequeueJob(queued))
 			{
-				QueuedJob queued;
-
-				if (TryDequeueJob(queued))
-				{
-					if (HandleJobCompletion(queued, scheduler))
-						break;
-					continue;
-				}
-
-				if (TrySteal(scheduler, worker_index, rng_state))
-				{
-					continue;
-				}
-
-				if (scheduler.IsExitRequested())
-				{
+				if (HandleJobCompletion(queued, scheduler))
 					break;
-				}
-
-				if (!semaphore_.try_acquire_for(kStealBackoff))
-				{
-					break;
-				}
+				continue;
 			}
 
-			if (scheduler.IsExitRequested())
+			if (TrySteal(scheduler, worker_index, rng_state, false))
+				continue;
 			{
 				std::lock_guard lock(mutex_);
-				if (queue_.empty())
-				{
+				// Queue publication, sleep registration and notification share this
+				// mutex. A submit either prevents sleeping or supplies its wake token.
+				if (!queue_.empty())
+					continue;
+				if (scheduler.IsExitRequested())
 					break;
-				}
+				waiting_.store(true, std::memory_order_relaxed);
+				scheduler.idle_workers_.fetch_add(1, std::memory_order_relaxed);
 			}
+			TrySteal(scheduler, worker_index, rng_state, true);
+			// Even a successful steal supplies a token through NotifyWaitingWorker.
+			// Consume exactly one before processing jobs or registering sleep again.
+			semaphore_.acquire();
 		}
 
 		// Clear thread-local state when worker exits.

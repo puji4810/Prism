@@ -3,6 +3,12 @@ local common_includedirs = {"$(builddir)/generated", "$(projectdir)/include", "$
 
 add_packages("crc32c")
 
+target("scheduler_bench")
+    set_kind("binary")
+    add_files("$(projectdir)/benchmark/scheduler_bench.cpp")
+    add_files("$(projectdir)/util/scheduler.cpp", "$(projectdir)/src/runtime_metrics.cpp")
+    add_includedirs(common_includedirs)
+
 target("kv_bench")
     set_kind("binary")
     add_files(common_files)

@@ -1,8 +1,11 @@
 #include "asyncdb.h"
 #include "../src/async_runtime.h"
 #include "db_impl.h"
+#include "filename.h"
+#include "table/table_builder.h"
 
 #include <filesystem>
+#include <functional>
 #include <gtest/gtest.h>
 
 #include "coro_task.h"
@@ -41,6 +44,8 @@ namespace
 
 		Result<std::unique_ptr<RandomAccessFile>> NewRandomAccessFile(const std::string& filename) override
 		{
+			if (before_open)
+				before_open(filename);
 			auto file = target()->NewRandomAccessFile(filename);
 			if (!file.has_value())
 			{
@@ -48,6 +53,8 @@ namespace
 			}
 			return std::unique_ptr<RandomAccessFile>(new NoViewRandomAccessFile(std::move(file.value())));
 		}
+
+		std::function<void(const std::string&)> before_open;
 	};
 
 	class AsyncDBTest: public ::testing::Test
@@ -319,6 +326,71 @@ TEST_F(AsyncDBTest, GetAsyncResumesAfterAsynchronousSstRead)
 		task->SyncWait();
 	}
 	task.reset();
+}
+
+TEST_F(AsyncDBTest, SecondColdTableAfterAsyncReadOpensOnBlockingIo)
+{
+	using namespace std::chrono_literals;
+	NoViewEnv env(Env::Default());
+	std::binary_semaphore cold_open_started(0), release_cold_open(0), done(0);
+	std::atomic<bool> opened_on_cpu{ false }, opened_on_io{ false };
+	std::optional<Result<std::string>> result;
+	CpuThreadPool scheduler(2);
+	AsyncRuntime runtime(scheduler);
+	Options options;
+	options.create_if_missing = true;
+	options.env = &env;
+	options.filter_policy = nullptr; // Force a data read for the missing key in the newer table.
+	auto opened = DBImpl::OpenInternal(options, "test_async_db", &runtime);
+	ASSERT_TRUE(opened.has_value());
+	auto db = std::move(opened.value());
+	ASSERT_TRUE(db->Put("seed", "value").ok()); // Publish sequence 1 for injected entries.
+	InternalKeyComparator comparator(BytewiseComparator());
+	Options table_options = options;
+	table_options.comparator = &comparator;
+	table_options.compression = CompressionType::kNoCompression;
+	std::string older_filename;
+	for (int table = 0; table < 2; ++table)
+	{
+		const auto number = db->TEST_NewFileNumber();
+		const auto filename = TableFileName(db->TEST_DBName(), number);
+		if (table == 0)
+			older_filename = filename;
+		auto file = env.NewWritableFile(filename);
+		ASSERT_TRUE(file.has_value());
+		TableBuilder builder(table_options, file->get());
+		builder.Add(InternalKey("a", 1, kTypeValue).Encode(), "a");
+		if (table == 0)
+			builder.Add(InternalKey("m", 1, kTypeValue).Encode(), "found-in-older-table");
+		builder.Add(InternalKey("z", 1, kTypeValue).Encode(), "z");
+		ASSERT_TRUE(builder.Finish().ok());
+		ASSERT_TRUE((*file)->Close().ok());
+		ASSERT_TRUE(db->TEST_AddFileToVersion(0, number, builder.FileSize(),
+		    InternalKey("a", 1, kTypeValue), InternalKey("z", 1, kTypeValue)).ok());
+	}
+	env.before_open = [&](const std::string& filename) {
+		if (filename != older_filename)
+			return;
+		opened_on_cpu.store(scheduler.CaptureContext().IsValid());
+		opened_on_io.store(runtime.BlockingIoExecutor().IsCurrentWorker());
+		cold_open_started.release();
+		release_cold_open.acquire();
+	};
+	runtime.DbReadExecutor().Submit([&] {
+		db->GetAsyncCallback(runtime, ReadOptions(), "m", [&](Result<std::string> value) {
+			result = std::move(value);
+			done.release();
+		});
+	});
+	const bool reached_second_table = cold_open_started.try_acquire_for(2s);
+	release_cold_open.release(); // Always release before assertions or DB shutdown.
+	const bool completed = done.try_acquire_for(5s);
+	EXPECT_TRUE(reached_second_table);
+	EXPECT_FALSE(opened_on_cpu.load());
+	EXPECT_TRUE(opened_on_io.load());
+	ASSERT_TRUE(completed);
+	ASSERT_TRUE(result->has_value()) << result->error().ToString();
+	EXPECT_EQ(result->value(), "found-in-older-table");
 }
 
 TEST_F(AsyncDBTest, OpenAsyncFailure)

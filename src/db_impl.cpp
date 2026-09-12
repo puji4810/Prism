@@ -728,6 +728,10 @@ namespace prism
 		{
 			std::unique_lock<std::shared_mutex> lock(impl->mutex_);
 			impl->InstallSuperVersion();
+			// Recovery may restore a compaction backlog or create L0 tables while
+			// replaying WALs. Start that work before a writer can wait at the L0
+			// stop threshold without any background job available to wake it.
+			impl->MaybeScheduleCompaction();
 		}
 		return impl;
 	}

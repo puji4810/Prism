@@ -305,18 +305,22 @@ namespace prism
 		std::lock_guard<std::mutex> guard(mutex_);
 
 		const std::size_t allocation_size = sizeof(LRUHandle) + (key.size() > 1 ? key.size() - 1 : 0);
+
 		LRUHandle* e = reinterpret_cast<LRUHandle*>(malloc(allocation_size));
-		std::construct_at(e);
-		e->value = value;
-		e->deleter = deleter;
-		e->next_hash = nullptr;
-		e->next = nullptr;
-		e->prev = nullptr;
-		e->charge = charge;
-		e->key_length = key.size();
-		e->in_cache = false;
-		e->refs.store(1, std::memory_order_relaxed);
-		e->hash = hash;
+
+		::new (e) LRUHandle{
+			.value = value,
+			.deleter = deleter,
+			.next_hash = nullptr,
+			.next = nullptr,
+			.prev = nullptr,
+			.charge = charge,
+			.key_length = key.size(),
+			.in_cache = false,
+			.refs = std::atomic<uint32_t>{ 1 },
+			.hash = hash,
+		};
+
 		std::memcpy(e->key_data, key.data(), key.size());
 
 		if (capacity_ > 0)

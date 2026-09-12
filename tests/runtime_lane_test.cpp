@@ -304,4 +304,20 @@ namespace prism::tests
 		    << "compaction-lane work produced wrong result — possible lost wakeup or double-execution";
 	}
 
+TEST(RuntimeLaneTest, BlockingFanoutWakesSleepingPeers)
+{
+	constexpr int kJobs = 1024;
+	std::atomic<int> completed{ 0 };
+	std::binary_semaphore release_owner(0);
+	BlockingExecutor executor(4);
+	executor.Submit([&] {
+		for (int i = 0; i < kJobs; ++i)
+			executor.Submit([&] { completed.fetch_add(1, std::memory_order_release); });
+		release_owner.acquire();
+	});
+	const bool drained = WaitUntil([&] { return completed.load(std::memory_order_acquire) == kJobs; }, 2s);
+	release_owner.release();
+	EXPECT_TRUE(drained);
+}
+
 } // namespace prism::tests

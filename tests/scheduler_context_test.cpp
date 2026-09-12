@@ -97,9 +97,8 @@ TEST(SchedulerContextTest, DefaultContextIsInvalid)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, SubmitInSameThread)
 {
-	// Use a single-worker pool so the captured context unambiguously pins to that worker.
-	// kMinThreads is 2, so 2 workers — we still capture the exact worker and verify
-	// it self-submits back to the same thread.
+	// A fresh pool leaves the peer asleep. One child does not trigger sharing,
+	// so we can check the initial affinity route without concurrent stealing.
 	CpuThreadPool scheduler(2);
 
 	std::atomic<bool> done{ false };
@@ -120,7 +119,7 @@ TEST(SchedulerContextTest, SubmitInSameThread)
 
 	ASSERT_TRUE(PollUntil([&] { return done.load(std::memory_order_acquire); })) << "Timed out waiting for inner affinity task";
 
-	EXPECT_EQ(outer_tid, inner_tid) << "SubmitIn with valid context must pin the job to the same worker thread";
+	EXPECT_EQ(outer_tid, inner_tid) << "SubmitIn should retain the local route while the peer sleeps";
 }
 
 // ---------------------------------------------------------------------------
@@ -232,34 +231,41 @@ TEST(SchedulerContextTest, DistinctWorkerContextsNotEqual)
 // ---------------------------------------------------------------------------
 TEST(SchedulerContextTest, HighVolumeSubmitInAllComplete)
 {
-	CpuThreadPool scheduler(2);
-
 	std::atomic<int> done{ 0 };
 	constexpr int kNumJobs = 1000;
 	std::thread::id target_tid;
-	std::atomic<bool> tid_captured{ false };
 	std::atomic<int> wrong_thread{ 0 };
+	std::binary_semaphore peer_started(0), release_peer(0);
+	CpuThreadPool scheduler(2);
 
-	scheduler.Submit([&scheduler, &done, &target_tid, &tid_captured, &wrong_thread]() {
-		auto ctx = scheduler.CaptureContext();
-		ASSERT_TRUE(ctx.IsValid());
-		target_tid = std::this_thread::get_id();
-		tid_captured.store(true, std::memory_order_release);
-
-		for (int i = 0; i < kNumJobs; ++i)
-		{
-			scheduler.SubmitIn(ctx, [&done, &target_tid, &wrong_thread]() {
-				if (std::this_thread::get_id() != target_tid)
-					wrong_thread.fetch_add(1, std::memory_order_relaxed);
-				done.fetch_add(1, std::memory_order_release);
-			});
-		}
+	// Affinity selects the initial queue; it does not prohibit stealing.
+	// Occupy the peer to test that routing deterministically without migration.
+	scheduler.Submit([&] {
+		peer_started.release();
+		release_peer.acquire();
 	});
-
-	ASSERT_TRUE(PollUntil([&] { return done.load(std::memory_order_acquire) == kNumJobs; }, 10s))
-	    << "High-volume SubmitIn: only " << done.load() << "/" << kNumJobs << " completed";
-	EXPECT_EQ(done.load(), kNumJobs);
-	EXPECT_EQ(wrong_thread.load(), 0) << "SubmitIn affinity jobs ran on wrong worker thread (" << wrong_thread.load() << " times)";
+	const bool peer_busy = peer_started.try_acquire_for(5s);
+	if (peer_busy)
+	{
+		scheduler.Submit([&] {
+			const auto ctx = scheduler.CaptureContext();
+			EXPECT_TRUE(ctx.IsValid());
+			target_tid = std::this_thread::get_id();
+			for (int i = 0; i < kNumJobs; ++i)
+			{
+				scheduler.SubmitIn(ctx, [&] {
+					if (std::this_thread::get_id() != target_tid)
+						wrong_thread.fetch_add(1, std::memory_order_relaxed);
+					done.fetch_add(1, std::memory_order_release);
+				});
+			}
+		});
+	}
+	const bool all_done = peer_busy && PollUntil([&] { return done.load(std::memory_order_acquire) == kNumJobs; }, 5s);
+	release_peer.release();
+	EXPECT_TRUE(peer_busy);
+	EXPECT_TRUE(all_done);
+	EXPECT_EQ(wrong_thread.load(), 0) << "SubmitIn must select the captured worker when no peer can steal";
 }
 
 // ---------------------------------------------------------------------------

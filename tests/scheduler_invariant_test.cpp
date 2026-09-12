@@ -1,7 +1,7 @@
 // scheduler_invariant_test.cpp
 //
 // Targeted regression tests that freeze correctness invariants most at risk
-// during scheduler surgery: self-submit affinity, SubmitIn pinning, wakeup
+// during scheduler surgery: local routing, best-effort affinity, wakeup
 // correctness, and zero-wakeup edge cases.
 
 #include "scheduler.h"
@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <thread>
 #include <vector>
 
@@ -36,9 +37,8 @@ static bool PollUntil(Pred pred, std::chrono::milliseconds timeout = 5000ms)
 // ---------------------------------------------------------------------------
 // INVARIANT 1: SelfSubmitRunsOnOwnWorker
 //
-// A worker thread calling Submit() from within its own job must cause the
-// submitted job to run on the SAME worker thread (no dispatcher mediation).
-// This is the worker-local fast-path invariant that the redesign must preserve.
+// With peers still in their initial sleep and only one child, Submit() retains
+// local routing without dispatcher mediation. Larger backlogs can migrate.
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, SelfSubmitRunsOnOwnWorker)
 {
@@ -66,9 +66,8 @@ TEST(SchedulerInvariantTest, SelfSubmitRunsOnOwnWorker)
 // ---------------------------------------------------------------------------
 // INVARIANT 2: SubmitInPinnedTaskStaysOnWorker
 //
-// SubmitIn() with a valid context must pin ALL submitted jobs to the exact
-// worker that captured the context, even when multiple workers are idle.
-// This is the affinity-pinning invariant.
+// A small burst on a fresh pool retains local routing while peers sleep.
+// SubmitIn affinity is best effort; large backlogs may be shared or stolen.
 // ---------------------------------------------------------------------------
 TEST(SchedulerInvariantTest, SubmitInPinnedTaskStaysOnWorker)
 {
@@ -85,7 +84,7 @@ TEST(SchedulerInvariantTest, SubmitInPinnedTaskStaysOnWorker)
 		auto ctx = scheduler.CaptureContext();
 		ASSERT_TRUE(ctx.IsValid());
 
-		// Submit multiple affinity-pinned jobs.
+		// Submit a small burst through the captured context.
 		for (int i = 0; i < kAffinityJobs; ++i)
 		{
 			scheduler.SubmitIn(ctx, [&done_count, &inner_tids, &tids_mutex]() {
@@ -294,4 +293,180 @@ TEST(SchedulerInvariantTest, HighPriorityTasksProgressUnderConcurrentLoad)
 	ASSERT_TRUE(PollUntil([&] { return counter->load(std::memory_order_acquire) == expected; }, 15s))
 	    << "Mixed high/low priority tasks not all completed: " << counter->load() << "/" << expected;
 	EXPECT_EQ(counter->load(), expected);
+}
+
+TEST(SchedulerInvariantTest, BurstThenIdleThenSingleSubmitKeepsWaking)
+{
+	std::atomic<int> completed{ 0 };
+	CpuThreadPool scheduler(4);
+	int expected = 0;
+	for (int round = 0; round < 40; ++round)
+	{
+		for (int i = 0; i < 256; ++i)
+			scheduler.Submit([&] { completed.fetch_add(1, std::memory_order_release); });
+		expected += 256;
+		ASSERT_TRUE(PollUntil([&] { return completed.load(std::memory_order_acquire) == expected; }));
+		// Exercise both active-to-idle races and already sleeping workers.
+		if (round % 2 == 0)
+			std::this_thread::sleep_for(1ms);
+		scheduler.Submit([&] { completed.fetch_add(1, std::memory_order_release); });
+		++expected;
+		ASSERT_TRUE(PollUntil([&] { return completed.load(std::memory_order_acquire) == expected; }));
+	}
+}
+
+TEST(SchedulerInvariantTest, ConcurrentSubmissionsAndChildrenExecuteEachJobOnce)
+{
+	constexpr int kProducers = 4;
+	constexpr int kPerProducer = 1000;
+	std::vector<std::atomic<int>> visits(kProducers * kPerProducer * 2);
+	std::atomic<int> completed{ 0 };
+	{
+		CpuThreadPool scheduler(4);
+		std::vector<std::jthread> producers;
+		for (int p = 0; p < kProducers; ++p)
+		{
+			producers.emplace_back([&, p] {
+				for (int i = 0; i < kPerProducer; ++i)
+				{
+					const int id = (p * kPerProducer + i) * 2;
+					scheduler.Submit([&, id] {
+						visits[id].fetch_add(1, std::memory_order_relaxed);
+						scheduler.SubmitIn(scheduler.CaptureContext(), [&, id] {
+							visits[id + 1].fetch_add(1, std::memory_order_relaxed);
+							completed.fetch_add(1, std::memory_order_release);
+						});
+						completed.fetch_add(1, std::memory_order_release);
+					});
+				}
+			});
+		}
+		for (auto& producer : producers)
+			producer.join();
+		EXPECT_TRUE(PollUntil([&] { return completed.load(std::memory_order_acquire) == static_cast<int>(visits.size()); }));
+	}
+	for (std::size_t id = 0; id < visits.size(); ++id)
+		EXPECT_EQ(visits[id].load(), 1) << "job " << id;
+}
+
+TEST(SchedulerInvariantTest, PeerDrainsBusyOwnersBacklogIncludingSubmitIn)
+{
+	constexpr int kJobs = 4096;
+	std::vector<std::atomic<int>> visits(kJobs);
+	std::atomic<int> completed{ 0 };
+	std::binary_semaphore queued(0), release_owner(0);
+	{
+		CpuThreadPool scheduler(2);
+		scheduler.Submit([&] {
+			const auto ctx = scheduler.CaptureContext();
+			for (int i = 0; i < kJobs; ++i)
+			{
+				auto job = [&, id = std::make_unique<int>(i)] {
+					visits[*id].fetch_add(1, std::memory_order_relaxed);
+					completed.fetch_add(1, std::memory_order_release);
+				};
+				if (i % 2 == 0)
+					scheduler.Submit(std::move(job));
+				else
+					scheduler.SubmitIn(ctx, std::move(job));
+			}
+			queued.release();
+			release_owner.acquire();
+		});
+		const bool owner_queued = queued.try_acquire_for(5s);
+		if (owner_queued)
+		{
+			// The next external submission goes to the other worker. The owner
+			// cannot execute any child before the assertion below, so all must be stolen.
+			scheduler.Submit([] { });
+			EXPECT_TRUE(PollUntil([&] { return completed.load(std::memory_order_acquire) == kJobs; }));
+		}
+		// Release before asserting setup success so failures cannot strand the owner.
+		release_owner.release();
+		EXPECT_TRUE(owner_queued);
+	}
+	for (int id = 0; id < kJobs; ++id)
+		EXPECT_EQ(visits[id].load(), 1) << "job " << id;
+}
+
+TEST(SchedulerInvariantTest, LocalFanoutWakesSleepingPeersWithoutExternalSubmit)
+{
+	constexpr int kJobs = 1024;
+	std::vector<std::atomic<int>> visits(kJobs);
+	std::atomic<int> completed{ 0 };
+	std::binary_semaphore queued(0), release_owner(0);
+	{
+		CpuThreadPool scheduler(4);
+		scheduler.Submit([&] {
+			const auto ctx = scheduler.CaptureContext();
+			for (int i = 0; i < kJobs; ++i)
+			{
+				auto child = [&, i] {
+					visits[i].fetch_add(1, std::memory_order_relaxed);
+					completed.fetch_add(1, std::memory_order_release);
+				};
+				if (i % 2 == 0)
+					scheduler.Submit(std::move(child));
+				else
+					scheduler.SubmitIn(ctx, std::move(child));
+			}
+			queued.release();
+			release_owner.acquire();
+		});
+		const bool owner_queued = queued.try_acquire_for(2s);
+		const bool peers_drained = owner_queued && PollUntil([&] { return completed.load(std::memory_order_acquire) == kJobs; }, 2s);
+		// Unblock the owner even on failure, so a broken wake protocol fails rather than hangs.
+		release_owner.release();
+		EXPECT_TRUE(owner_queued);
+		EXPECT_TRUE(peers_drained) << "Local children remained queued while peers slept";
+	}
+	for (int i = 0; i < kJobs; ++i)
+		EXPECT_EQ(visits[i].load(), 1) << "job " << i;
+}
+
+TEST(SchedulerInvariantTest, LocalFanoutActivatesEveryIdlePeer)
+{
+	constexpr int kJobs = 256;
+	std::binary_semaphore release_owner(0);
+	std::counting_semaphore<kJobs> started(0), release_children(0);
+	CpuThreadPool scheduler(4);
+	scheduler.Submit([&] {
+		for (int i = 0; i < kJobs; ++i)
+			scheduler.Submit([&] {
+				started.release();
+				release_children.acquire();
+			});
+		release_owner.acquire();
+	});
+	// Each child blocks its worker, so three starts require all three peers.
+	int active_peers = 0;
+	while (active_peers < 3 && started.try_acquire_for(2s))
+		++active_peers;
+	release_children.release(kJobs);
+	release_owner.release();
+	EXPECT_EQ(active_peers, 3);
+}
+
+TEST(SchedulerInvariantTest, LocalBurstsRaceWithPeerSleepWithoutLosingWork)
+{
+	constexpr int kJobs = 256;
+	std::atomic<int> completed{ 0 };
+	std::binary_semaphore release_owner(0), owner_done(0);
+	CpuThreadPool scheduler(4);
+	for (int round = 0; round < 40; ++round)
+	{
+		if (round % 2 == 0)
+			std::this_thread::sleep_for(1ms);
+		scheduler.Submit([&] {
+			for (int i = 0; i < kJobs; ++i)
+				scheduler.Submit([&] { completed.fetch_add(1, std::memory_order_release); });
+			release_owner.acquire();
+			owner_done.release();
+		});
+		const bool drained = PollUntil([&] { return completed.load(std::memory_order_acquire) == (round + 1) * kJobs; }, 2s);
+		release_owner.release();
+		const bool owner_returned = owner_done.try_acquire_for(2s);
+		ASSERT_TRUE(drained) << "burst " << round;
+		ASSERT_TRUE(owner_returned);
+	}
 }

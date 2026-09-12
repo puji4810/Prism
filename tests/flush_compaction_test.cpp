@@ -41,9 +41,8 @@ namespace
 		std::atomic<int> sleep_calls_{ 0 };
 	};
 
-	void CreateLegacyL0Files(const std::string& dbname, int count, uint64_t first_number)
+	void InstallL0FilesWithoutScheduling(DBImpl& db, int count)
 	{
-		std::filesystem::create_directories(dbname);
 		Options table_options;
 		InternalKeyComparator icmp(BytewiseComparator());
 		table_options.comparator = &icmp;
@@ -51,7 +50,8 @@ namespace
 		table_options.compression = CompressionType::kNoCompression;
 		for (int i = 0; i < count; ++i)
 		{
-			const std::string filename = TableFileName(dbname, first_number + static_cast<uint64_t>(i));
+			const uint64_t number = db.TEST_NewFileNumber();
+			const std::string filename = TableFileName(db.TEST_DBName(), number);
 			auto writable = Env::Default()->NewWritableFile(filename);
 			ASSERT_TRUE(writable.has_value()) << writable.error().ToString();
 
@@ -60,6 +60,10 @@ namespace
 			builder.Add(InternalKey(user_key, 1, kTypeValue).Encode(), Slice("value"));
 			ASSERT_TRUE(builder.Finish().ok());
 			ASSERT_TRUE(writable.value()->Close().ok());
+			ASSERT_TRUE(
+			    db.TEST_AddFileToVersion(
+			          0, number, builder.FileSize(), InternalKey(user_key, 1, kTypeValue), InternalKey(user_key, 1, kTypeValue))
+			        .ok());
 		}
 	}
 
@@ -187,7 +191,6 @@ TEST_F(FlushCompactionTest, LevelZeroPressureTriggersStallPolicy)
 {
 	{
 		ControlledEnv env(Env::Default());
-		CreateLegacyL0Files("test_l0_slowdown", 8, 1000);
 
 		Options options;
 		options.env = &env;
@@ -196,6 +199,9 @@ TEST_F(FlushCompactionTest, LevelZeroPressureTriggersStallPolicy)
 		auto open = DBImpl::OpenInternal(options, "test_l0_slowdown");
 		ASSERT_TRUE(open.has_value()) << open.error().ToString();
 		auto db = std::move(open.value());
+		// Inject pressure after Open so startup compaction cannot race these
+		// stall-policy assertions. This test deliberately leaves work unscheduled.
+		InstallL0FilesWithoutScheduling(*db, config::kL0_SlowdownWritesTrigger);
 
 		Status s = db->Put("slow", "path");
 		EXPECT_TRUE(s.ok()) << s.ToString();
@@ -204,7 +210,6 @@ TEST_F(FlushCompactionTest, LevelZeroPressureTriggersStallPolicy)
 
 	{
 		ControlledEnv env(Env::Default());
-		CreateLegacyL0Files("test_l0_stop", 12, 2000);
 
 		Options options;
 		options.env = &env;
@@ -214,6 +219,7 @@ TEST_F(FlushCompactionTest, LevelZeroPressureTriggersStallPolicy)
 		ASSERT_TRUE(open.has_value()) << open.error().ToString();
 		auto db = std::move(open.value());
 		auto* impl = db.get();
+		InstallL0FilesWithoutScheduling(*db, config::kL0_StopWritesTrigger);
 
 		std::atomic<bool> writer_done{ false };
 		Status writer_status;
@@ -469,4 +475,63 @@ TEST_F(FlushCompactionTest, ReopenAfterPublishedStateRemainsClean)
 		ASSERT_TRUE(result.has_value()) << result.error().ToString();
 		EXPECT_EQ(std::string(64, 'v'), result.value());
 	}
+}
+
+TEST_F(FlushCompactionTest, WalRecoverySchedulesCompactionBeforeFirstWrite)
+{
+	Options options;
+	options.create_if_missing = true;
+	options.write_buffer_size = 4 * 1024 * 1024;
+	const std::string value(8192, 'r');
+	constexpr int kRecords = config::kL0_StopWritesTrigger;
+	{
+		auto open = DBImpl::OpenInternal(options, "test_flush_compaction");
+		ASSERT_TRUE(open.has_value()) << open.error().ToString();
+		auto db = std::move(open.value());
+		for (int i = 0; i < kRecords; ++i)
+			ASSERT_TRUE(db->Put("recovered_" + std::to_string(i), value).ok());
+		// Leave all records in the WAL. Reopening with a smaller buffer will
+		// create one L0 table per record before accepting any new writes.
+		ASSERT_EQ(db->TEST_NumLevelFiles(0), 0);
+	}
+
+	options.write_buffer_size = 4 * 1024;
+	auto reopen = DBImpl::OpenInternal(options, "test_flush_compaction");
+	ASSERT_TRUE(reopen.has_value()) << reopen.error().ToString();
+	auto db = std::move(reopen.value());
+	// Assert progress before issuing Put: on regression the test fails in two
+	// seconds instead of leaving a writer blocked indefinitely at the L0 limit.
+	ASSERT_TRUE(WaitUntil(
+	    [&] { return db->TEST_BackgroundCompactionStartCount() > 0 && db->TEST_NumLevelFiles(0) < config::kL0_StopWritesTrigger; },
+	    std::chrono::milliseconds(2000)))
+	    << "Recovered L0 backlog has no running compaction";
+	ASSERT_TRUE(db->Put("after_recovery", "written").ok());
+	for (int i = 0; i < kRecords; ++i)
+	{
+		auto result = db->Get("recovered_" + std::to_string(i));
+		ASSERT_TRUE(result.has_value()) << result.error().ToString();
+		EXPECT_EQ(*result, value);
+	}
+}
+
+TEST_F(FlushCompactionTest, ManifestRecoverySchedulesCompactionWithoutWrites)
+{
+	Options options;
+	options.create_if_missing = true;
+	{
+		auto open = DBImpl::OpenInternal(options, "test_flush_compaction");
+		ASSERT_TRUE(open.has_value()) << open.error().ToString();
+		auto db = std::move(open.value());
+		InstallL0FilesWithoutScheduling(*db, config::kL0_CompactionTrigger);
+		ASSERT_EQ(db->TEST_NumLevelFiles(0), config::kL0_CompactionTrigger);
+	}
+
+	auto reopen = DBImpl::OpenInternal(options, "test_flush_compaction");
+	ASSERT_TRUE(reopen.has_value()) << reopen.error().ToString();
+	auto db = std::move(reopen.value());
+	// Existing MANIFEST pressure must make progress even for a read-only caller,
+	// below the write-stop threshold and without another memtable rotation.
+	EXPECT_TRUE(WaitUntil(
+	    [&] { return db->TEST_BackgroundCompactionStartCount() > 0 && db->TEST_NumLevelFiles(0) < config::kL0_CompactionTrigger; },
+	    std::chrono::milliseconds(2000)));
 }

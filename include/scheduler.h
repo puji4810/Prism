@@ -67,8 +67,8 @@ namespace prism
 		using MoveFn = void (*)(void*, void*) noexcept;
 
 		template <typename Fn>
-		static constexpr bool kUseInlineStorage = sizeof(Fn) <= kInlineBytes && alignof(Fn) <= alignof(std::max_align_t)
-		    && std::is_nothrow_move_constructible_v<Fn>;
+		static constexpr bool kUseInlineStorage
+		    = sizeof(Fn) <= kInlineBytes && alignof(Fn) <= alignof(std::max_align_t) && std::is_nothrow_move_constructible_v<Fn>;
 
 		void* StoragePtr() noexcept { return static_cast<void*>(storage_); }
 		const void* StoragePtr() const noexcept { return static_cast<const void*>(storage_); }
@@ -79,9 +79,7 @@ namespace prism
 			invoke_ = [](void* ptr) { (*static_cast<Fn*>(ptr))(); };
 			destroy_ = [](void* ptr) noexcept { std::destroy_at(static_cast<Fn*>(ptr)); };
 			delete_ = [](void* ptr) noexcept { delete static_cast<Fn*>(ptr); };
-			move_ = [](void* src, void* dst) noexcept {
-				std::construct_at(static_cast<Fn*>(dst), std::move(*static_cast<Fn*>(src)));
-			};
+			move_ = [](void* src, void* dst) noexcept { std::construct_at(static_cast<Fn*>(dst), std::move(*static_cast<Fn*>(src))); };
 
 			if constexpr (kUseInlineStorage<Fn>)
 			{
@@ -191,7 +189,7 @@ namespace prism
 	// Task Submission Paths:
 	// 1. Submit(job): Immediate priority-0 execution
 	//    - throughput-first fast path to worker-local queue
-	//    - worker self-submit -> same worker queue
+	//    - worker self-submit -> same worker queue; large backlogs share with idle peers
 	//    - external submit -> round-robin worker queue
 	//
 	// 2. SubmitWithPriority(job, priority): Background/fallback execution
@@ -203,17 +201,19 @@ namespace prism
 	//    - LazyLoop wakes up at deadline, pushes directly to a worker when possible
 	//    - Falls back to priority queue (max priority) if direct routing is unsuitable
 	//
-	// 4. SubmitIn(ctx, job): Strict affinity to specific worker thread
+	// 4. SubmitIn(ctx, job): Best-effort affinity to a specific worker thread
 	//    - When ctx is valid for this scheduler: directly pushes to that worker's local queue
-	//    - Jobs remain stealable (work-stealing still applies even to affinity-pinned tasks)
+	//    - Jobs remain stealable (work-stealing still applies to affinity-submitted tasks)
 	//    - When ctx is invalid or belongs to a different scheduler: falls back to Submit()
-	//      (default priority-0 fast path with least-loaded-worker dispatch)
+	//      (default priority-0 fast path with round-robin dispatch)
 	//    - Used for continuation on same thread (cache locality)
 	//
 	// Fallback Dispatch:
 	// - Each worker has its own queue (mutex-protected deque)
 	// - Each worker tracks an approximate atomic load counter for fast external balancing
-	// - QueuedJob tracks pinning metadata for stealing and affinity
+	// - All queued jobs are movable; SubmitIn selects the initial destination
+	// - Large backlogs hand a bounded batch to one waiting peer before waking it
+	// - Workers register sleep before their final full peer scan to avoid missed work
 	//
 	// - Shutdown Protocol:
 	// - Exit() sets exit_flag_, wakes all threads.
@@ -312,16 +312,16 @@ namespace prism
 			SubmitAfter(std::chrono::steady_clock::now() + delay, std::forward<F>(job));
 		}
 
-		// Submit job with strict same-worker affinity (for cache locality).
+		// Submit job with best-effort same-worker affinity (for cache locality).
 		//
-		// Strict affinity: when ctx was captured from a worker of THIS scheduler instance,
+		// When ctx was captured from a worker of THIS scheduler instance,
 		// the job is pushed directly to that exact worker's local queue. The job remains
 		// stealable — other workers may steal it under load, but the affinity-push
 		// maximizes the chance the same-worker executes it.
 		//
 		// Fallback: when ctx is invalid, default-constructed, or captured from a different
 		// scheduler instance, the job is submitted via Submit() (priority-0 fast path with
-		// least-loaded-worker dispatch). This fallback guarantees progress; no job is lost.
+		// round-robin dispatch). This fallback guarantees progress; no job is lost.
 		//
 		// During shutdown: only worker re-entrant SubmitIn calls are accepted
 		// (identical to Submit/SubmitAfter policy — see ShouldAcceptSubmitDuringShutdown).
@@ -338,8 +338,10 @@ namespace prism
 	private:
 		// WorkThread: Worker with its own task queue.
 		// Consumes tasks from its queue and steals from peers under load.
-		class WorkThread
+		class alignas(64) WorkThread
 		{
+			friend class CpuThreadPool;
+
 		public:
 			WorkThread() = default;
 			~WorkThread() = default;
@@ -353,31 +355,19 @@ namespace prism
 			void Join();
 			std::thread::id Id() const;
 
-			// Push: Direct submission (used by SubmitIn for affinity)
-			void Push(Job job);
-			void Push(Job job, bool stealable);
-
-			// PushDispatched: Submission from dispatcher (marks job as dispatched=true)
-			void PushDispatched(Job job);
 			template <typename F>
-			void Emplace(F&& job, bool stealable)
+			std::size_t Emplace(CpuThreadPool& scheduler, F&& job)
 			{
-				{
-					std::lock_guard lock(mutex_);
-					queue_.emplace_back(std::forward<F>(job), stealable);
-					load_.fetch_add(1, std::memory_order_relaxed);
-				}
-				semaphore_.release();
-			}
-			template <typename F>
-			void EmplaceDispatched(F&& job)
-			{
-				Emplace(std::forward<F>(job), true);
+				std::lock_guard lock(mutex_);
+				queue_.emplace_back(std::forward<F>(job));
+				load_.store(queue_.size(), std::memory_order_relaxed);
+				NotifyWaitingWorker(scheduler);
+				return queue_.size();
 			}
 			std::size_t Load() const noexcept;
 
 			// Wake: Signal semaphore (used during shutdown)
-			void Wake();
+			void Wake(CpuThreadPool& scheduler);
 
 			// DrainRemaining: Execute all tasks left in queue after thread has stopped.
 			// Called from destructor after Join(), so no concurrency.
@@ -389,26 +379,31 @@ namespace prism
 			{
 				QueuedJob() = default;
 				template <typename F>
-				QueuedJob(F&& fn, bool is_stealable)
+				explicit QueuedJob(F&& fn)
 				    : job(std::forward<F>(fn))
-				    , stealable(is_stealable)
 				{
 				}
 
 				Job job;
-				bool stealable{ true };
 #ifdef PRISM_RUNTIME_METRICS
 				bool stolen{ false };
 #endif
 			};
 
 			void Consume(CpuThreadPool& scheduler, std::size_t worker_index) noexcept;
-			bool TrySteal(CpuThreadPool& scheduler, std::size_t worker_index, std::uint64_t& rng_state);
+			bool TrySteal(CpuThreadPool& scheduler, std::size_t worker_index, std::uint64_t& rng_state, bool before_sleep);
+			// Both queue mutexes must be held; destination must be empty.
+			void TakeBatchFrom(WorkThread& victim);
 			bool TryDequeueJob(QueuedJob& out);
 			bool HandleJobCompletion(QueuedJob& job, CpuThreadPool& scheduler) noexcept;
 
-			std::counting_semaphore<> semaphore_{ 0z };
-			std::jthread thread_{};
+			// Called with mutex_ held. One notification per transition out of waiting,
+			// rather than one semaphore token per queued job.
+			void NotifyWaitingWorker(CpuThreadPool& scheduler);
+			// Atomic for peer selection hints; transitions still require mutex_.
+			std::atomic<bool> waiting_{ true };
+			std::binary_semaphore semaphore_{ 0 };
+			std::jthread thread_{ };
 			std::mutex mutex_;
 			std::deque<QueuedJob> queue_;
 			std::atomic<std::size_t> load_{ 0 };
@@ -446,26 +441,23 @@ namespace prism
 			bool operator<(const LazyTask& rhs) const noexcept { return rhs.deadline < deadline; }
 		};
 
-		bool TryPushToWorker(Job job, std::size_t worker_index, bool dispatched, bool stealable);
+		bool TryPushToWorker(Job job, std::size_t worker_index);
 		template <typename F>
-		bool TryEmplaceToWorker(F&& job, std::size_t worker_index, bool dispatched, bool stealable)
+		bool TryEmplaceToWorker(F&& job, std::size_t worker_index)
 		{
 			if (worker_index >= work_threads_.size())
 			{
 				return false;
 			}
 
-			auto& worker = work_threads_[worker_index];
-			if (dispatched)
-			{
-				worker.EmplaceDispatched(std::forward<F>(job));
-			}
-			else
-			{
-				worker.Emplace(std::forward<F>(job), stealable);
-			}
+			const auto depth = work_threads_[worker_index].Emplace(*this, std::forward<F>(job));
+			if (depth >= kShareThreshold && idle_workers_.load(std::memory_order_relaxed) != 0)
+				ShareWork(worker_index);
 			return true;
 		}
+		// Amortize queue transfer and wake costs; small fan-outs retain locality.
+		static constexpr std::size_t kShareThreshold = 128;
+		void ShareWork(std::size_t worker_index);
 		std::size_t ChooseSubmissionWorker();
 		std::size_t ChooseLeastLoadedWorker() const;
 
@@ -500,9 +492,7 @@ namespace prism
 
 		// ShouldPromoteLazyTask: returns true when a delayed task's deadline
 		//   has expired, meaning it should be dispatched immediately.
-		static bool ShouldPromoteLazyTask(
-		    const LazyTask& task,
-		    std::chrono::steady_clock::time_point now) noexcept;
+		static bool ShouldPromoteLazyTask(const LazyTask& task, std::chrono::steady_clock::time_point now) noexcept;
 
 		// ── Mechanics helpers (queue/thread operations) ─────────────────
 		// PushToPriorityQueue: enqueue a job into priority_queue_ and
@@ -530,7 +520,7 @@ namespace prism
 			{
 				if (current_scheduler_ == this)
 				{
-					if (TryEmplaceToWorker(std::forward<F>(job), current_worker_index_, false, true))
+					if (TryEmplaceToWorker(std::forward<F>(job), current_worker_index_))
 					{
 #ifdef PRISM_RUNTIME_METRICS
 						RecordForegroundFastPathSubmit();
@@ -540,7 +530,7 @@ namespace prism
 				}
 
 				const auto worker_index = ChooseSubmissionWorker();
-				if (TryEmplaceToWorker(std::forward<F>(job), worker_index, false, true))
+				if (TryEmplaceToWorker(std::forward<F>(job), worker_index))
 				{
 #ifdef PRISM_RUNTIME_METRICS
 					RecordForegroundFastPathSubmit();
@@ -572,7 +562,7 @@ namespace prism
 		{
 			assert(ShouldAcceptSubmitDuringShutdown());
 
-			if (ctx.scheduler_ == this && TryEmplaceToWorker(std::forward<F>(job), ctx.worker_index_, false, true))
+			if (ctx.scheduler_ == this && TryEmplaceToWorker(std::forward<F>(job), ctx.worker_index_))
 			{
 				return;
 			}
@@ -587,6 +577,9 @@ namespace prism
 		}
 
 		std::vector<WorkThread> work_threads_;
+		// Initially every worker waits for its first notification. Updated only
+		// when waiting_ transitions under that worker's queue mutex.
+		std::atomic<std::size_t> idle_workers_;
 		std::atomic<std::size_t> submit_cursor_{ 0 };
 
 		std::priority_queue<LazyTask> lazy_queue_;
